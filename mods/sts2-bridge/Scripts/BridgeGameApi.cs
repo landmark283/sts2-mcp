@@ -15,6 +15,7 @@ using MegaCrit.Sts2.Core.Entities.Merchant;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Entities.RestSite;
 using MegaCrit.Sts2.Core.Events;
+using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.MonsterMoves.Intents;
@@ -618,6 +619,7 @@ internal static class BridgeGameApi
             !context.CombatManager.PlayerActionsDisabled)
         {
             AddCombatCardActions(actions, context);
+            AddCombatPotionActions(actions, context);
         }
 
         if (context.CombatManager?.IsInProgress == true &&
@@ -639,6 +641,8 @@ internal static class BridgeGameApi
                 Execute = () => InvokeButtonAction(context.EndTurnButton, "OnRelease", "CallReleaseLogic")
             });
         }
+
+        AddPotionDiscardActions(actions, context);
 
         if (IsTerminalRewardsProceedVisible(context))
         {
@@ -1477,6 +1481,124 @@ internal static class BridgeGameApi
         }
     }
 
+    private static void AddCombatPotionActions(List<BridgeResolvedAction> actions, BridgeWorldContext context)
+    {
+        if (context.CombatState is null)
+        {
+            return;
+        }
+
+        for (var playerIndex = 0; playerIndex < context.CombatState.Players.Count; playerIndex++)
+        {
+            var player = context.CombatState.Players[playerIndex];
+            var potionSlots = player.PotionSlots;
+            if (potionSlots is null)
+            {
+                continue;
+            }
+
+            for (var slotIndex = 0; slotIndex < potionSlots.Count; slotIndex++)
+            {
+                var potion = potionSlots[slotIndex];
+                if (potion is null || !CanUsePotion(potion))
+                {
+                    continue;
+                }
+
+                foreach (var resolvedTarget in ResolveUsablePotionTargets(context, player, potion))
+                {
+                    var actionId = $"use_potion:{playerIndex}:{slotIndex}";
+                    if (!string.IsNullOrEmpty(resolvedTarget.ActionSuffix))
+                    {
+                        actionId += $":{resolvedTarget.ActionSuffix}";
+                    }
+
+                    var targetLabel = string.IsNullOrEmpty(resolvedTarget.LabelSuffix)
+                        ? string.Empty
+                        : $" -> {resolvedTarget.LabelSuffix}";
+                    var potionTitle = TextOf(potion.Title);
+
+                    actions.Add(new BridgeResolvedAction
+                    {
+                        ActionId = actionId,
+                        Payload = new
+                        {
+                            action_id = actionId,
+                            kind = "use_potion",
+                            label = $"Use potion {slotIndex}: {potionTitle}{targetLabel}",
+                            player_index = playerIndex,
+                            player_net_id = player.NetId,
+                            slot_index = slotIndex,
+                            potion = BuildPotionPayload(potion),
+                            target = resolvedTarget.Target is null ? null : BuildCreaturePayload(resolvedTarget.Target),
+                            target_scope = potion.TargetType.ToString(),
+                            requires_target_selection = resolvedTarget.RequiresTargetSelection,
+                            screen = context.Screen
+                        },
+                        Execute = () => ExecutePotionUse(
+                            player,
+                            slotIndex,
+                            potion,
+                            resolvedTarget.Target,
+                            context.CombatManager?.IsInProgress == true)
+                    });
+                }
+            }
+        }
+    }
+
+    private static void AddPotionDiscardActions(List<BridgeResolvedAction> actions, BridgeWorldContext context)
+    {
+        if (IsCardSelectionVisible(context))
+        {
+            return;
+        }
+
+        var players = context.RunState?.Players ?? context.CombatState?.Players ?? Array.Empty<Player>();
+        for (var playerIndex = 0; playerIndex < players.Count; playerIndex++)
+        {
+            var player = players[playerIndex];
+            var potionSlots = player.PotionSlots;
+            if (potionSlots is null || !player.CanRemovePotions)
+            {
+                continue;
+            }
+
+            for (var slotIndex = 0; slotIndex < potionSlots.Count; slotIndex++)
+            {
+                var potion = potionSlots[slotIndex];
+                if (!CanDiscardPotion(player, potion))
+                {
+                    continue;
+                }
+
+                var actionId = $"discard_potion:{playerIndex}:{slotIndex}";
+                var potionTitle = TextOf(potion!.Title);
+                actions.Add(new BridgeResolvedAction
+                {
+                    ActionId = actionId,
+                    Payload = new
+                    {
+                        action_id = actionId,
+                        kind = "discard_potion",
+                        label = $"Discard potion {slotIndex}: {potionTitle}",
+                        player_index = playerIndex,
+                        player_net_id = player.NetId,
+                        slot_index = slotIndex,
+                        potion = BuildPotionPayload(potion),
+                        can_remove_potions = player.CanRemovePotions,
+                        screen = context.Screen
+                    },
+                    Execute = () => ExecutePotionDiscard(
+                        player,
+                        slotIndex,
+                        potion,
+                        context.CombatManager?.IsInProgress == true)
+                });
+            }
+        }
+    }
+
     private static IReadOnlyList<ResolvedCardTarget> ResolvePlayableCardTargets(
         BridgeWorldContext context,
         Player player,
@@ -1557,6 +1679,120 @@ internal static class BridgeGameApi
         return results;
     }
 
+    private static IReadOnlyList<ResolvedPotionTarget> ResolveUsablePotionTargets(
+        BridgeWorldContext context,
+        Player player,
+        PotionModel potion)
+    {
+        var results = new List<ResolvedPotionTarget>();
+        var selfCreature = player.Creature;
+        var canThrowAtAlly = SafeCanThrowPotionAtAlly(potion);
+
+        void AddResolvedTarget(Creature? target, string? actionSuffix, string? labelSuffix, bool requiresTargetSelection)
+        {
+            if (target is null)
+            {
+                if (!results.Any(static existing => existing.Target is null))
+                {
+                    results.Add(new ResolvedPotionTarget
+                    {
+                        ActionSuffix = actionSuffix,
+                        LabelSuffix = labelSuffix,
+                        Target = null,
+                        RequiresTargetSelection = requiresTargetSelection
+                    });
+                }
+
+                return;
+            }
+
+            if (results.Any(existing => ReferenceEquals(existing.Target, target)))
+            {
+                return;
+            }
+
+            results.Add(new ResolvedPotionTarget
+            {
+                ActionSuffix = actionSuffix,
+                LabelSuffix = labelSuffix,
+                Target = target,
+                RequiresTargetSelection = requiresTargetSelection
+            });
+        }
+
+        switch (potion.TargetType)
+        {
+            case TargetType.AnyEnemy:
+                foreach (var creature in context.CombatState?.Creatures ?? Array.Empty<Creature>())
+                {
+                    if (!creature.IsEnemy || !CanUsePotionTargeting(potion, creature))
+                    {
+                        continue;
+                    }
+
+                    AddResolvedTarget(
+                        creature,
+                        creature.CombatId.ToString(),
+                        DescribeCreatureTarget(creature),
+                        true);
+                }
+
+                if (canThrowAtAlly)
+                {
+                    foreach (var creature in context.CombatState?.PlayerCreatures ?? Array.Empty<Creature>())
+                    {
+                        if (!CanUsePotionTargeting(potion, creature))
+                        {
+                            continue;
+                        }
+
+                        AddResolvedTarget(
+                            creature,
+                            creature.CombatId.ToString(),
+                            DescribeCreatureTarget(creature),
+                            true);
+                    }
+                }
+                break;
+
+            case TargetType.AnyPlayer:
+            case TargetType.AnyAlly:
+                foreach (var creature in context.CombatState?.PlayerCreatures ?? Array.Empty<Creature>())
+                {
+                    if (!CanUsePotionTargeting(potion, creature))
+                    {
+                        continue;
+                    }
+
+                    AddResolvedTarget(
+                        creature,
+                        creature.CombatId.ToString(),
+                        DescribeCreatureTarget(creature),
+                        true);
+                }
+                break;
+
+            case TargetType.Self:
+                if (selfCreature is not null && CanUsePotionTargeting(potion, selfCreature))
+                {
+                    AddResolvedTarget(selfCreature, "self", "self", false);
+                }
+                break;
+
+            case TargetType.None:
+            case TargetType.AllEnemies:
+            case TargetType.RandomEnemy:
+            case TargetType.AllAllies:
+            case TargetType.TargetedNoCreature:
+            case TargetType.Osty:
+            default:
+                AddResolvedTarget(null, null, null, false);
+                break;
+        }
+
+        return results;
+    }
+
     private static void ExecuteCardPlay(CardModel card, Creature? target)
     {
         var executionTargets = BuildCardExecutionTargets(card, target);
@@ -1584,6 +1820,69 @@ internal static class BridgeGameApi
             HttpStatusCode.Conflict,
             "play_card_failed",
             $"Could not play card '{TextOf(card.Title)}' with the current bridge integration.");
+    }
+
+    private static void ExecutePotionUse(
+        Player player,
+        int slotIndex,
+        PotionModel potion,
+        Creature? target,
+        bool isCombatInProgress)
+    {
+        try
+        {
+            potion.EnqueueManualUse(target!);
+            return;
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            var action = new UsePotionAction(potion, target!, isCombatInProgress);
+            ExecuteGameActionSynchronously(action);
+            return;
+        }
+        catch
+        {
+        }
+
+        throw new BridgeRequestException(
+            HttpStatusCode.Conflict,
+            "use_potion_failed",
+            $"Could not use potion '{TextOf(potion.Title)}' from slot {slotIndex}.");
+    }
+
+    private static void ExecutePotionDiscard(
+        Player player,
+        int slotIndex,
+        PotionModel potion,
+        bool isCombatInProgress)
+    {
+        try
+        {
+            potion.Discard();
+            return;
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            var action = new DiscardPotionGameAction(player, (uint)slotIndex, isCombatInProgress);
+            ExecuteGameActionSynchronously(action);
+            return;
+        }
+        catch
+        {
+        }
+
+        throw new BridgeRequestException(
+            HttpStatusCode.Conflict,
+            "discard_potion_failed",
+            $"Could not discard potion '{TextOf(potion.Title)}' from slot {slotIndex}.");
     }
 
     private static IReadOnlyList<Creature?> BuildCardExecutionTargets(CardModel card, Creature? target)
@@ -1658,6 +1957,71 @@ internal static class BridgeGameApi
     private static bool IsCombatTargetAvailable(Creature creature)
     {
         return creature.IsAlive && SafeGetCreatureIsHittable(creature);
+    }
+
+    private static bool IsPotionTargetAvailable(Creature creature)
+    {
+        return creature.IsEnemy
+            ? creature.IsAlive && SafeGetCreatureIsHittable(creature)
+            : creature.IsAlive;
+    }
+
+    private static bool CanUsePotion(PotionModel? potion)
+    {
+        if (potion is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            return potion.Owner is not null &&
+                   !potion.HasBeenRemovedFromState &&
+                   !potion.IsQueued &&
+                   potion.PassesCustomUsabilityCheck;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool CanDiscardPotion(Player player, PotionModel? potion)
+    {
+        if (potion is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            return player.CanRemovePotions && !potion.HasBeenRemovedFromState;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool CanUsePotionTargeting(PotionModel potion, Creature target)
+    {
+        if (!IsPotionTargetAvailable(target))
+        {
+            return false;
+        }
+
+        if (TryInvokeBoolean(potion, "ShouldAllowTargeting", target) is bool shouldAllowTargeting)
+        {
+            return shouldAllowTargeting;
+        }
+
+        return potion.TargetType switch
+        {
+            TargetType.Self => ReferenceEquals(target, potion.Owner?.Creature),
+            TargetType.AnyEnemy => target.IsEnemy || (!target.IsEnemy && SafeCanThrowPotionAtAlly(potion)),
+            TargetType.AnyPlayer or TargetType.AnyAlly => !target.IsEnemy,
+            _ => true
+        };
     }
 
     private static bool CanPurchaseMerchantEntry(MerchantEntry? entry)
@@ -2681,7 +3045,11 @@ internal static class BridgeGameApi
             title = TextOf(potion.Title),
             description = TextOf(potion.Description),
             rarity = potion.Rarity.ToString(),
-            target_type = potion.TargetType.ToString()
+            target_type = potion.TargetType.ToString(),
+            selection_screen_prompt = TextOf(potion.SelectionScreenPrompt),
+            can_throw_at_ally = SafeCanThrowPotionAtAlly(potion),
+            is_usable = SafeGetPotionIsUsable(potion),
+            is_queued = SafeGetPotionIsQueued(potion)
         };
     }
 
@@ -3177,6 +3545,45 @@ internal static class BridgeGameApi
         }
     }
 
+    private static bool SafeCanThrowPotionAtAlly(PotionModel potion)
+    {
+        try
+        {
+            return potion.CanThrowAtAlly();
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool SafeGetPotionIsUsable(PotionModel potion)
+    {
+        try
+        {
+            return potion.Owner is not null &&
+                   !potion.HasBeenRemovedFromState &&
+                   !potion.IsQueued &&
+                   potion.PassesCustomUsabilityCheck;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool SafeGetPotionIsQueued(PotionModel potion)
+    {
+        try
+        {
+            return potion.IsQueued;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static List<T> FindVisibleDescendants<T>(Node? root) where T : Node
     {
         var result = new List<T>();
@@ -3604,6 +4011,21 @@ internal static class BridgeGameApi
 
         var method = FindMethod(target.GetType(), methodName, 0);
         return method?.Invoke(target, Array.Empty<object>());
+    }
+
+    private static void ExecuteGameActionSynchronously(object action)
+    {
+        var result = InvokeParameterless(action, "ExecuteAction");
+        if (result is Task task)
+        {
+            task.GetAwaiter().GetResult();
+            return;
+        }
+
+        throw new BridgeRequestException(
+            HttpStatusCode.Conflict,
+            "action_execution_failed",
+            $"Could not execute game action {action.GetType().FullName}.");
     }
 
     private static bool? TryInvokeBoolean(object? target, string methodName, params object?[] arguments)
@@ -4329,6 +4751,17 @@ internal static class BridgeGameApi
     }
 
     private sealed class ResolvedCardTarget
+    {
+        public string? ActionSuffix { get; init; }
+
+        public string? LabelSuffix { get; init; }
+
+        public Creature? Target { get; init; }
+
+        public required bool RequiresTargetSelection { get; init; }
+    }
+
+    private sealed class ResolvedPotionTarget
     {
         public string? ActionSuffix { get; init; }
 

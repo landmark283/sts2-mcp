@@ -3,7 +3,7 @@
   "name": "STS2 MCP Bridge",
   "author": "yidhar + Codex",
   "description": "Local bridge mod that exposes Slay the Spire 2 state to an external MCP server.",
-  "version": "0.7.6",
+  "version": "0.7.7",
   "has_pck": false,
   "has_dll": true,
   "dependencies": [],
