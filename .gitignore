@@ -1,0 +1,12 @@
+.godot/
+.mono/
+.vs/
+.vscode/
+**/bin/
+**/obj/
+*.user
+*.tmp
+*.log
+docs/
+README.md
+**/README.md

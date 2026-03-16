@@ -1,0 +1,12 @@
+; Engine configuration file.
+; Prefer editing this in the Godot editor once the local toolchain is installed.
+config_version=5
+
+[application]
+config/name="sts2-bridge"
+config/features=PackedStringArray("4.5", "C#")
+config/icon="res://icon.svg"
+
+[dotnet]
+project/assembly_name="sts2-bridge"
+
