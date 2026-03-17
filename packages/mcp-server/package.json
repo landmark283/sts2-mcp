@@ -1,9 +1,13 @@
 {
   "name": "sts2-mcp-server",
-  "version": "0.3.0",
+  "version": "0.4.11",
   "private": true,
-  "description": "Minimal MCP server for the Slay the Spire 2 bridge.",
+  "description": "Local MCP server for the Slay the Spire 2 bridge mod.",
+  "license": "MIT",
   "type": "commonjs",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node index.js",
     "smoke:test": "node smoke-test.js",

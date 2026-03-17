@@ -1,13 +1,31 @@
+# Build and editor artifacts
 .godot/
 .mono/
 .vs/
 .vscode/
+.idea/
 **/bin/
 **/obj/
 *.user
 *.tmp
 *.log
-docs/
-README.md
-**/README.md
 
+# OS noise
+Thumbs.db
+.DS_Store
+
+# Local Codex / MCP config
+.mcp.json
+.claude/
+
+# Local research and temporary files
+scratch/
+新建游戏项目/
+
+# Docs are intentionally excluded from the public code repo
+docs/
+schemas/
+packages/**/README.md
+mods/**/README.md
+!/README.md
+!/README.zh-CN.md

@@ -6,7 +6,7 @@ const path = require("path");
 const { setTimeout: delay } = require("timers/promises");
 
 const SERVER_NAME = "sts2";
-const SERVER_VERSION = "0.4.7";
+const SERVER_VERSION = "0.4.11";
 const FALLBACK_PROTOCOL_VERSION = "2025-03-26";
 const DEFAULT_LOG_FILE_NAME = "mcp-stdio.log";
 const MAX_LOG_PREVIEW = 600;
@@ -26,6 +26,9 @@ const COMBAT_ACTION_SETTLE_POLL_INTERVAL_MS = 200;
 const COMBAT_ACTION_STABLE_POLL_TARGET = 2;
 const ROOM_EXIT_SETTLE_TIMEOUT_MS = 5000;
 const ROOM_EXIT_SETTLE_POLL_INTERVAL_MS = 200;
+const MAP_ROUTE_SETTLE_TIMEOUT_MS = 4000;
+const MAP_ROUTE_SETTLE_POLL_INTERVAL_MS = 200;
+const MAP_ROUTE_STABLE_POLL_TARGET = 2;
 
 const TOOL_DEFINITIONS = [
   {
@@ -61,10 +64,15 @@ const TOOL_DEFINITIONS = [
   {
     name: "sts2_get_map_routes",
     description:
-      "Build a pruned future-only map route forest from the currently travelable frontier points, excluding the current node, past rows, and unreachable branches.",
+      "Build a pruned future-only map route forest from the currently travelable frontier points, excluding the current node, past rows, and unreachable branches. Defaults to summary mode; use detail=full to include the full reachable node table.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        detail: {
+          type: "string",
+          enum: ["summary", "full"]
+        }
+      },
       additionalProperties: false
     }
   },
@@ -89,6 +97,34 @@ const TOOL_DEFINITIONS = [
         }
       },
       required: ["action_id"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_play_card_sequence",
+    description:
+      "Execute multiple currently planned play_card actions in one tool call. Later steps are automatically rematched against the current hand and legal targets after each card resolves, so the caller does not need to manually rewrite hand indices after reordering or draws.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action_ids: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "string",
+            minLength: 1
+          }
+        },
+        expected_state_version: {
+          type: "integer"
+        },
+        wait_after_ms: {
+          type: "integer",
+          minimum: 0,
+          maximum: MAX_ACTION_WAIT_MS
+        }
+      },
+      required: ["action_ids"],
       additionalProperties: false
     }
   },
@@ -183,6 +219,60 @@ const TOOL_DEFINITIONS = [
         expected_max_select: {
           type: "integer",
           minimum: 0
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_resolve_shop_visit",
+    description:
+      "Resolve a shop visit in one tool call: optionally open the merchant, buy one or more planned shop items with automatic reindexing between purchases, optionally remove one card after buying card removal, then close and/or leave the shop.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        purchases: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              action_id: {
+                type: "string",
+                minLength: 1
+              },
+              title: {
+                type: "string",
+                minLength: 1
+              },
+              item_kind: {
+                type: "string",
+                enum: ["card", "relic", "potion", "card_removal"]
+              }
+            },
+            additionalProperties: false
+          }
+        },
+        remove_card_title: {
+          type: "string",
+          minLength: 1
+        },
+        remove_card_index: {
+          type: "integer",
+          minimum: 0
+        },
+        open_shop: {
+          type: "boolean"
+        },
+        close_inventory: {
+          type: "boolean"
+        },
+        leave_shop: {
+          type: "boolean"
+        },
+        wait_after_ms: {
+          type: "integer",
+          minimum: 0,
+          maximum: MAX_ACTION_WAIT_MS
         }
       },
       additionalProperties: false
@@ -387,9 +477,11 @@ async function handleToolCall(params) {
     case "sts2_list_actions":
       return await listActionsTool();
     case "sts2_get_map_routes":
-      return await getMapRoutesTool();
+      return await getMapRoutesTool(args);
     case "sts2_perform_action":
       return await performActionTool(args);
+    case "sts2_play_card_sequence":
+      return await playCardSequenceTool(args);
     case "sts2_end_turn":
       return await endTurnTool(args);
     case "sts2_resolve_room_rewards":
@@ -398,6 +490,8 @@ async function handleToolCall(params) {
       return await resolveRestSiteTool(args);
     case "sts2_resolve_card_selection":
       return await resolveCardSelectionTool(args);
+    case "sts2_resolve_shop_visit":
+      return await resolveShopVisitTool(args);
     case "sts2_wait_for_change":
       return await waitForChangeTool(args);
     default:
@@ -507,13 +601,23 @@ async function listActionsTool() {
   }
 }
 
-async function getMapRoutesTool() {
+async function getMapRoutesTool(args) {
   try {
+    const detail = normalizeMapRoutesDetail(args?.detail);
     const session = getLiveSession();
-    const response = await bridgeRequestJson(session, "state", {
-      method: "GET"
+    const settledSnapshot = await waitForStableMapRouteSnapshot(session);
+    const payload = buildMapRoutesPayload(settledSnapshot.state, {
+      detail,
+      snapshot_status: {
+        settled: settledSnapshot.settled,
+        reason: settledSnapshot.reason,
+        poll_count: settledSnapshot.poll_count,
+        frontier_action_match: settledSnapshot.frontier_action_match,
+        state_action_state_version_match:
+          settledSnapshot.state_action_state_version_match
+      }
     });
-    return asToolResult(buildMapRoutesPayload(response.payload), false);
+    return asToolResult(payload, false);
   } catch (error) {
     return asToolResult(toolErrorPayload(error), true);
   }
@@ -543,6 +647,174 @@ async function performActionTool(args) {
     );
 
     return asToolResult(attachInteractionHints(result), false);
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function playCardSequenceTool(args) {
+  try {
+    const finalize = (payload) => asToolResult(attachInteractionHints(payload), false);
+    const actionIds = requireNonEmptyStringArray(args.action_ids, "action_ids");
+    const expectedStateVersion = optionalInteger(
+      args.expected_state_version,
+      "expected_state_version"
+    );
+    const waitAfterMs = clampInteger(
+      args.wait_after_ms,
+      DEFAULT_ACTION_WAIT_MS,
+      0,
+      MAX_ACTION_WAIT_MS,
+      "wait_after_ms"
+    );
+
+    if (new Set(actionIds).size !== actionIds.length) {
+      throw new ToolPayloadError(
+        "invalid_arguments",
+        "action_ids cannot contain duplicates.",
+        {
+          field: "action_ids"
+        }
+      );
+    }
+
+    const session = getLiveSession();
+    let state = await getBridgeState(session);
+
+    if (
+      Number.isInteger(expectedStateVersion) &&
+      Number.isInteger(state?.state_version) &&
+      state.state_version !== expectedStateVersion
+    ) {
+      return asToolResult(
+        attachInteractionHints(
+        {
+          ok: false,
+          resolved: false,
+          reason: "state_version_mismatch",
+          expected_state_version: expectedStateVersion,
+          observed_state_version: state.state_version,
+          state
+        }),
+        false
+      );
+    }
+
+    const initialBlocker = getPlayCardSequenceContinuationBlocker(state);
+    if (initialBlocker) {
+      return finalize(
+        {
+          ok: false,
+          resolved: false,
+          ...initialBlocker,
+          requested_action_count: actionIds.length,
+          state
+        }
+      );
+    }
+
+    const initialPlayCardActions = getPlayableCardActions(state);
+    const sequencePlan = [];
+    for (let sequenceIndex = 0; sequenceIndex < actionIds.length; sequenceIndex += 1) {
+      const requestedActionId = actionIds[sequenceIndex];
+      const matchedAction = initialPlayCardActions.find(
+        (action) => action?.action_id === requestedActionId
+      );
+      if (!matchedAction) {
+        return finalize(
+          {
+            ok: false,
+            resolved: false,
+            reason: "requested_play_card_action_unavailable",
+            sequence_index: sequenceIndex,
+            requested_action_id: requestedActionId,
+            available_play_card_actions: initialPlayCardActions.map((action) =>
+              summarizeActionForAgent(action)
+            ),
+            state
+          }
+        );
+      }
+
+      sequencePlan.push(buildPlannedPlayCardSequenceStep(matchedAction, sequenceIndex));
+    }
+    const sequencePlanOutput = sequencePlan.map(summarizePlayCardSequencePlanStep);
+
+    const executedSteps = [];
+
+    for (let sequenceIndex = 0; sequenceIndex < sequencePlan.length; sequenceIndex += 1) {
+      const blocker = getPlayCardSequenceContinuationBlocker(state);
+      if (blocker) {
+        return finalize(
+          {
+            ok: true,
+            resolved: false,
+            reason: blocker.reason,
+            message: blocker.message,
+            requested_action_count: sequencePlan.length,
+            executed_count: executedSteps.length,
+            remaining_count: sequencePlan.length - executedSteps.length,
+            next_sequence_index: sequenceIndex,
+            sequence_plan: sequencePlanOutput,
+            executed_steps: executedSteps,
+            state
+          }
+        );
+      }
+
+      const planStep = sequencePlan[sequenceIndex];
+      const currentPlayCardActions = getPlayableCardActions(state);
+      const resolution = resolvePlannedPlayCardStep(planStep, currentPlayCardActions);
+      if (!resolution.action) {
+        return finalize(
+          {
+            ok: true,
+            resolved: false,
+            reason: "requested_play_card_action_unavailable_after_reindex",
+            requested_action_count: sequencePlan.length,
+            executed_count: executedSteps.length,
+            remaining_count: sequencePlan.length - executedSteps.length,
+            next_sequence_index: sequenceIndex,
+            failed_step: summarizePlayCardSequencePlanStep(planStep),
+            sequence_plan: sequencePlanOutput,
+            executed_steps: executedSteps,
+            available_play_card_actions: currentPlayCardActions.map((action) =>
+              summarizeActionForAgent(action)
+            ),
+            state
+          }
+        );
+      }
+
+      const result = await performBridgeAction(
+        session,
+        resolution.action.action_id,
+        waitAfterMs
+      );
+      executedSteps.push({
+        sequence_index: sequenceIndex,
+        requested_action_id: planStep.requested_action_id,
+        executed_action_id: resolution.action.action_id,
+        match_type: resolution.match_type,
+        compatible_candidate_count: resolution.compatible_candidate_count,
+        matched_action: summarizeActionForAgent(resolution.action),
+        execution: summarizeExecutedAction(result)
+      });
+      state = result.state;
+    }
+
+    return finalize(
+      {
+        ok: true,
+        resolved: true,
+        requested_action_count: sequencePlan.length,
+        executed_count: executedSteps.length,
+        remaining_count: 0,
+        sequence_plan: sequencePlanOutput,
+        executed_steps: executedSteps,
+        state
+      }
+    );
   } catch (error) {
     return asToolResult(toolErrorPayload(error), true);
   }
@@ -1341,11 +1613,441 @@ async function waitForChangeTool(args) {
   }
 }
 
+async function resolveShopVisitTool(args) {
+  try {
+    const finalize = (payload) => asToolResult(attachInteractionHints(payload), false);
+    const purchases = normalizeShopPurchaseRequests(args.purchases);
+    const removeCardTitle = optionalString(args.remove_card_title, "remove_card_title");
+    const removeCardIndex = optionalInteger(args.remove_card_index, "remove_card_index");
+    const openShop = optionalBoolean(args.open_shop, "open_shop") ?? true;
+    const closeInventory =
+      optionalBoolean(args.close_inventory, "close_inventory") ?? true;
+    const leaveShop = optionalBoolean(args.leave_shop, "leave_shop") ?? true;
+    const waitAfterMs = clampInteger(
+      args.wait_after_ms,
+      DEFAULT_ACTION_WAIT_MS,
+      0,
+      MAX_ACTION_WAIT_MS,
+      "wait_after_ms"
+    );
+
+    if (removeCardTitle !== undefined && removeCardIndex !== undefined) {
+      throw new ToolPayloadError(
+        "invalid_arguments",
+        "remove_card_title and remove_card_index cannot both be provided.",
+        {
+          fields: ["remove_card_title", "remove_card_index"]
+        }
+      );
+    }
+
+    const session = getLiveSession();
+    let state = await getBridgeState(session);
+    let shopBundle = buildShopBundle(state);
+    const initialShopBundle = shopBundle;
+    let cardSelectionBundle = buildCardSelectionBundle(state);
+
+    if (!shopBundle.in_shop_flow && !cardSelectionBundle.in_card_selection_flow) {
+      return finalize({
+        ok: false,
+        resolved: false,
+        reason: "not_in_shop_flow",
+        shop_bundle: initialShopBundle,
+        state
+      });
+    }
+
+    const executedActions = [];
+    const purchasedItems = [];
+    let removedCard = null;
+
+    if (cardSelectionBundle.in_card_selection_flow) {
+      const cardSelectionResolution = await maybeResolveShopCardRemovalSelection(
+        session,
+        state,
+        {
+          removeCardTitle,
+          removeCardIndex,
+          waitAfterMs
+        }
+      );
+      if (cardSelectionResolution.failed) {
+        return finalize({
+          ok: false,
+          resolved: false,
+          reason: cardSelectionResolution.reason,
+          message: cardSelectionResolution.message,
+          removed_card: removedCard,
+          executed_actions: executedActions,
+          card_selection_bundle: cardSelectionResolution.card_selection_bundle,
+          available_cards: cardSelectionResolution.available_cards,
+          state: cardSelectionResolution.state
+        });
+      }
+      if (cardSelectionResolution.required_but_missing) {
+        return finalize({
+          ok: true,
+          resolved: false,
+          reason: "shop_card_removal_choice_required",
+          removed_card: removedCard,
+          executed_actions: executedActions,
+          card_selection_bundle: cardSelectionResolution.card_selection_bundle,
+          state: cardSelectionResolution.state
+        });
+      }
+      if (cardSelectionResolution.performed) {
+        removedCard = cardSelectionResolution.removed_card;
+        executedActions.push(...cardSelectionResolution.executed_actions);
+        state = cardSelectionResolution.state;
+        shopBundle = buildShopBundle(state);
+        cardSelectionBundle = buildCardSelectionBundle(state);
+      }
+    }
+
+    if (openShop && shopBundle.shop.visible && shopBundle.shop.is_open !== true) {
+      if (!shopBundle.non_automation_action_ids.includes("shop:open")) {
+        return finalize({
+          ok: false,
+          resolved: false,
+          reason: "shop_open_action_unavailable",
+          shop_bundle: shopBundle,
+          state
+        });
+      }
+
+      const openResult = await performBridgeAction(session, "shop:open", waitAfterMs);
+      executedActions.push(summarizeExecutedAction(openResult));
+      state = openResult.state;
+      shopBundle = buildShopBundle(state);
+    }
+
+    const purchasePlan = [];
+    for (let sequenceIndex = 0; sequenceIndex < purchases.length; sequenceIndex += 1) {
+      const request = purchases[sequenceIndex];
+      const matchedAction = resolveInitialShopPurchaseRequest(request, state);
+      if (!matchedAction) {
+        return finalize({
+          ok: false,
+          resolved: false,
+          reason: "shop_purchase_request_unavailable",
+          sequence_index: sequenceIndex,
+          request,
+          shop_bundle: shopBundle,
+          available_shop_actions: getShopBuyActions(state).map(summarizeShopBuyActionForAgent),
+          state
+        });
+      }
+
+      purchasePlan.push(
+        buildPlannedShopPurchaseStep(matchedAction, request, sequenceIndex)
+      );
+    }
+    const purchasePlanOutput = purchasePlan.map(summarizeShopPurchasePlanStep);
+
+    for (let sequenceIndex = 0; sequenceIndex < purchasePlan.length; sequenceIndex += 1) {
+      shopBundle = buildShopBundle(state);
+      const blocker = getShopVisitContinuationBlocker(state);
+      if (blocker) {
+        return finalize({
+          ok: true,
+          resolved: false,
+          reason: blocker.reason,
+          message: blocker.message,
+          next_sequence_index: sequenceIndex,
+          purchase_plan: purchasePlanOutput,
+          purchased_items: purchasedItems,
+          removed_card: removedCard,
+          executed_actions: executedActions,
+          shop_bundle: shopBundle,
+          state
+        });
+      }
+
+      const planStep = purchasePlan[sequenceIndex];
+      const currentShopActions = getShopBuyActions(state);
+      const resolution = resolvePlannedShopPurchaseStep(planStep, currentShopActions);
+      if (!resolution.action) {
+        return finalize({
+          ok: true,
+          resolved: false,
+          reason: "shop_purchase_unavailable_after_reindex",
+          next_sequence_index: sequenceIndex,
+          failed_step: summarizeShopPurchasePlanStep(planStep),
+          purchase_plan: purchasePlanOutput,
+          purchased_items: purchasedItems,
+          removed_card: removedCard,
+          executed_actions: executedActions,
+          available_shop_actions: currentShopActions.map(summarizeShopBuyActionForAgent),
+          shop_bundle: shopBundle,
+          state
+        });
+      }
+
+      const purchaseResult = await performBridgeAction(
+        session,
+        resolution.action.action_id,
+        waitAfterMs
+      );
+      executedActions.push(summarizeExecutedAction(purchaseResult));
+      purchasedItems.push({
+        sequence_index: sequenceIndex,
+        request: summarizeShopPurchaseRequest(planStep.request),
+        requested_action_id: planStep.requested_action_id,
+        executed_action_id: resolution.action.action_id,
+        match_type: resolution.match_type,
+        compatible_candidate_count: resolution.compatible_candidate_count,
+        item: summarizeShopItemForAgent(resolution.action.item)
+      });
+      state = purchaseResult.state;
+
+      const cardSelectionResolution = await maybeResolveShopCardRemovalSelection(
+        session,
+        state,
+        {
+          removeCardTitle,
+          removeCardIndex,
+          waitAfterMs
+        }
+      );
+      if (cardSelectionResolution.required_but_missing) {
+        return finalize({
+          ok: true,
+          resolved: false,
+          reason: "shop_card_removal_choice_required",
+          purchase_plan: purchasePlanOutput,
+          purchased_items: purchasedItems,
+          removed_card: removedCard,
+          executed_actions: executedActions,
+          card_selection_bundle: cardSelectionResolution.card_selection_bundle,
+          state
+        });
+      }
+
+      if (cardSelectionResolution.failed) {
+        return finalize({
+          ok: false,
+          resolved: false,
+          reason: cardSelectionResolution.reason,
+          message: cardSelectionResolution.message,
+          purchase_plan: purchasePlanOutput,
+          purchased_items: purchasedItems,
+          removed_card: removedCard,
+          executed_actions: executedActions,
+          card_selection_bundle: cardSelectionResolution.card_selection_bundle,
+          available_cards: cardSelectionResolution.available_cards,
+          state: cardSelectionResolution.state
+        });
+      }
+
+      if (cardSelectionResolution.performed) {
+        removedCard = cardSelectionResolution.removed_card;
+        executedActions.push(...cardSelectionResolution.executed_actions);
+        state = cardSelectionResolution.state;
+      }
+    }
+
+    shopBundle = buildShopBundle(state);
+
+    if (closeInventory && shopBundle.shop.is_open === true) {
+      if (shopBundle.non_automation_action_ids.includes("shop:back")) {
+        const backResult = await performBridgeAction(session, "shop:back", waitAfterMs);
+        executedActions.push(summarizeExecutedAction(backResult));
+        state = backResult.state;
+        shopBundle = buildShopBundle(state);
+      }
+    }
+
+    if (leaveShop) {
+      if (shopBundle.non_automation_action_ids.includes("shop:leave")) {
+        const leaveResult = await performBridgeAction(session, "shop:leave", waitAfterMs);
+        executedActions.push(summarizeExecutedAction(leaveResult));
+        state = leaveResult.state;
+        shopBundle = buildShopBundle(state);
+      }
+    }
+
+    return finalize({
+      ok: true,
+      resolved: true,
+      purchase_plan: purchasePlanOutput,
+      purchased_items: purchasedItems,
+      removed_card: removedCard,
+      shop_bundle: initialShopBundle,
+      executed_actions: executedActions,
+      final_state: state
+    });
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
 async function getBridgeState(session) {
   const response = await bridgeRequestJson(session, "state", {
     method: "GET"
   });
   return response.payload;
+}
+
+async function getBridgeActions(session) {
+  const response = await bridgeRequestJson(session, "actions", {
+    method: "GET"
+  });
+  return response.payload;
+}
+
+async function waitForStableMapRouteSnapshot(session) {
+  let snapshot = await captureMapRouteSnapshot(session);
+  let previousFingerprint = snapshot.fingerprint;
+  let stablePolls = 0;
+
+  const initialVerdict = getMapRouteSnapshotVerdict(snapshot, stablePolls);
+  if (initialVerdict.settled) {
+    return {
+      ...initialVerdict,
+      state: snapshot.state,
+      frontier_action_match: snapshot.frontier_action_match,
+      state_action_state_version_match: snapshot.state_action_state_version_match
+    };
+  }
+
+  const startedAt = Date.now();
+  let pollCount = 0;
+  while (Date.now() - startedAt < MAP_ROUTE_SETTLE_TIMEOUT_MS) {
+    await delay(MAP_ROUTE_SETTLE_POLL_INTERVAL_MS);
+    pollCount += 1;
+    snapshot = await captureMapRouteSnapshot(session);
+
+    stablePolls =
+      snapshot.fingerprint === previousFingerprint ? stablePolls + 1 : 0;
+    previousFingerprint = snapshot.fingerprint;
+
+    const verdict = getMapRouteSnapshotVerdict(snapshot, stablePolls);
+    if (verdict.settled) {
+      return {
+        ...verdict,
+        poll_count: pollCount,
+        state: snapshot.state,
+        frontier_action_match: snapshot.frontier_action_match,
+        state_action_state_version_match:
+          snapshot.state_action_state_version_match
+      };
+    }
+  }
+
+  return {
+    settled: false,
+    reason: "timeout",
+    poll_count: pollCount,
+    state: snapshot.state,
+    frontier_action_match: snapshot.frontier_action_match,
+    state_action_state_version_match: snapshot.state_action_state_version_match
+  };
+}
+
+async function captureMapRouteSnapshot(session) {
+  const [state, actionsPayload] = await Promise.all([
+    getBridgeState(session),
+    getBridgeActions(session)
+  ]);
+  return buildMapRouteSnapshot(state, actionsPayload);
+}
+
+function buildMapRouteSnapshot(state, actionsPayload) {
+  const frontierKeys = extractTravelableMapKeysFromState(state);
+  const mapActionKeys = extractMapActionKeys(actionsPayload);
+  const currentCoord = extractMapCurrentCoord(state);
+  const currentCoordKey = toCoordKey(currentCoord);
+  const stateVersion = Number.isInteger(state?.state_version)
+    ? state.state_version
+    : null;
+  const actionStateVersion = Number.isInteger(actionsPayload?.state_version)
+    ? actionsPayload.state_version
+    : null;
+  const stateActionStateVersionMatch =
+    stateVersion === null ||
+    actionStateVersion === null ||
+    stateVersion === actionStateVersion;
+  const frontierActionMatch = areCoordKeySetsEqual(frontierKeys, mapActionKeys);
+  const fingerprint = JSON.stringify({
+    screen: typeof state?.screen === "string" ? state.screen : null,
+    map_open: state?.map?.is_open === true,
+    map_traveling: state?.map?.is_traveling === true,
+    current_coord_key: currentCoordKey,
+    frontier_keys: frontierKeys,
+    map_action_keys: mapActionKeys,
+    state_version: stateVersion,
+    action_state_version: actionStateVersion
+  });
+
+  return {
+    state,
+    actions_payload: actionsPayload,
+    frontierKeys,
+    mapActionKeys,
+    currentCoordKey,
+    frontier_action_match: frontierActionMatch,
+    state_action_state_version_match: stateActionStateVersionMatch,
+    fingerprint
+  };
+}
+
+function getMapRouteSnapshotVerdict(snapshot, stablePolls) {
+  const state = snapshot?.state;
+  if (!isPlainObject(state)) {
+    return {
+      settled: false,
+      reason: "missing_state"
+    };
+  }
+
+  const screen = typeof state.screen === "string" ? state.screen : null;
+  if (screen !== "MAP") {
+    return {
+      settled: false,
+      reason: `waiting_for_map_screen:${screen ?? "unknown"}`
+    };
+  }
+
+  if (state?.map?.is_open !== true) {
+    return {
+      settled: false,
+      reason: "waiting_for_map_open"
+    };
+  }
+
+  if (state?.map?.is_traveling === true) {
+    return {
+      settled: false,
+      reason: "waiting_for_map_travel_finish"
+    };
+  }
+
+  if (!snapshot.state_action_state_version_match) {
+    return {
+      settled: false,
+      reason: "waiting_for_state_action_version_match"
+    };
+  }
+
+  if (!snapshot.frontier_action_match) {
+    return {
+      settled: false,
+      reason: "waiting_for_frontier_action_match"
+    };
+  }
+
+  if (stablePolls < MAP_ROUTE_STABLE_POLL_TARGET) {
+    return {
+      settled: false,
+      reason: `waiting_for_stable_map_snapshot:${stablePolls}/${MAP_ROUTE_STABLE_POLL_TARGET}`
+    };
+  }
+
+  return {
+    settled: true,
+    reason: "map_snapshot_stable",
+    poll_count: 0
+  };
 }
 
 async function performBridgeAction(session, actionId, waitAfterMs, expectedStateVersion) {
@@ -1829,6 +2531,330 @@ function getNonAutomationActions(state) {
     : [];
 }
 
+function isPlayCardAction(action) {
+  return (
+    isPlainObject(action) &&
+    typeof action.action_id === "string" &&
+    action.action_id.startsWith("play_card:")
+  );
+}
+
+function getPlayableCardActions(state) {
+  return getNonAutomationActions(state).filter(isPlayCardAction);
+}
+
+function getPlayCardSequenceContinuationBlocker(state) {
+  if (!isPlainObject(state)) {
+    return {
+      reason: "missing_state",
+      message: "Bridge state was missing while resolving the play-card sequence."
+    };
+  }
+
+  const cardSelectionBundle = buildCardSelectionBundle(state);
+  if (cardSelectionBundle.in_card_selection_flow) {
+    return {
+      reason: "card_selection_ready",
+      message: "Card selection became visible before the requested play-card sequence finished."
+    };
+  }
+
+  const rewardBundle = buildRewardBundle(state);
+  if (rewardBundle.in_reward_flow) {
+    return {
+      reason: rewardBundle.card_reward_selection.visible
+        ? "reward_card_selection_ready"
+        : "reward_flow_ready",
+      message: "Combat transitioned into rewards before the requested play-card sequence finished."
+    };
+  }
+
+  const screen = typeof state.screen === "string" ? state.screen : null;
+  if (screen !== "COMBAT") {
+    return {
+      reason: `screen:${screen ?? "unknown"}`,
+      message: "The game is no longer on the combat screen."
+    };
+  }
+
+  const combat = isPlainObject(state.combat) ? state.combat : {};
+  if (combat.in_progress !== true) {
+    return {
+      reason: "combat_not_in_progress",
+      message: "Combat is no longer in progress."
+    };
+  }
+
+  if (combat.current_side !== "Player") {
+    return {
+      reason: "not_player_turn",
+      message: "It is no longer the player's turn."
+    };
+  }
+
+  if (combat.is_play_phase !== true) {
+    return {
+      reason: "not_play_phase",
+      message: "Combat is not currently in the play phase."
+    };
+  }
+
+  if (combat.player_actions_disabled === true) {
+    return {
+      reason: "player_actions_disabled",
+      message: "Player actions are currently disabled."
+    };
+  }
+
+  return null;
+}
+
+function buildPlannedPlayCardSequenceStep(action, sequenceIndex) {
+  const targetActionSuffix =
+    typeof action?.target_action_suffix === "string" ? action.target_action_suffix : null;
+  const targetCombatId = Number.isFinite(action?.target_combat_id)
+    ? action.target_combat_id
+    : null;
+  const targetSide = typeof action?.target_side === "string" ? action.target_side : null;
+  const targetName = normalizeAgentText(action?.target_name);
+
+  return {
+    sequence_index: sequenceIndex,
+    requested_action_id: action.action_id,
+    player_index: Number.isInteger(action?.player_index) ? action.player_index : null,
+    initial_hand_index: Number.isInteger(action?.hand_index) ? action.hand_index : null,
+    card: summarizeCardForAgent(action?.card),
+    target: {
+      action_suffix: targetActionSuffix,
+      combat_id: targetCombatId,
+      side: targetSide,
+      name: targetName
+    },
+    action_fingerprint: buildPlayCardActionFingerprint(action)
+  };
+}
+
+function summarizePlayCardSequencePlanStep(planStep) {
+  if (!isPlainObject(planStep)) {
+    return null;
+  }
+
+  return {
+    sequence_index: Number.isInteger(planStep.sequence_index) ? planStep.sequence_index : null,
+    requested_action_id:
+      typeof planStep.requested_action_id === "string" ? planStep.requested_action_id : null,
+    player_index: Number.isInteger(planStep.player_index) ? planStep.player_index : null,
+    initial_hand_index:
+      Number.isInteger(planStep.initial_hand_index) ? planStep.initial_hand_index : null,
+    card: isPlainObject(planStep.card) ? planStep.card : null,
+    target: isPlainObject(planStep.target) ? planStep.target : null
+  };
+}
+
+function resolvePlannedPlayCardStep(planStep, currentPlayCardActions) {
+  const actions = Array.isArray(currentPlayCardActions) ? currentPlayCardActions : [];
+  const exactMatch = actions.find(
+    (action) =>
+      action?.action_id === planStep?.requested_action_id &&
+      doesPlayCardActionMatchPlanStep(action, planStep)
+  );
+  if (exactMatch) {
+    return {
+      action: exactMatch,
+      match_type: "exact",
+      compatible_candidate_count: 1
+    };
+  }
+
+  const compatibleActions = actions.filter((action) =>
+    doesPlayCardActionMatchPlanStep(action, planStep)
+  );
+  if (compatibleActions.length <= 0) {
+    return {
+      action: null,
+      match_type: "unavailable",
+      compatible_candidate_count: 0
+    };
+  }
+
+  const rankedActions = compatibleActions
+    .map((action) => ({
+      action,
+      score: scorePlayCardActionAgainstPlanStep(action, planStep)
+    }))
+    .sort((left, right) => right.score - left.score);
+
+  return {
+    action: rankedActions[0].action,
+    match_type: compatibleActions.length === 1 ? "reindexed" : "reindexed_ambiguous",
+    compatible_candidate_count: compatibleActions.length
+  };
+}
+
+function doesPlayCardActionMatchPlanStep(action, planStep) {
+  if (!isPlayCardAction(action) || !isPlainObject(planStep)) {
+    return false;
+  }
+
+  if (
+    Number.isInteger(planStep.player_index) &&
+    Number.isInteger(action?.player_index) &&
+    action.player_index !== planStep.player_index
+  ) {
+    return false;
+  }
+
+  if (
+    buildPlayCardActionFingerprint(action) !== planStep.action_fingerprint
+  ) {
+    return false;
+  }
+
+  const planTargetSuffix =
+    typeof planStep?.target?.action_suffix === "string"
+      ? planStep.target.action_suffix
+      : null;
+  const actionTargetSuffix =
+    typeof action?.target_action_suffix === "string" ? action.target_action_suffix : null;
+  if (planTargetSuffix !== actionTargetSuffix) {
+    return false;
+  }
+
+  const planTargetCombatId = Number.isFinite(planStep?.target?.combat_id)
+    ? planStep.target.combat_id
+    : null;
+  const actionTargetCombatId = Number.isFinite(action?.target_combat_id)
+    ? action.target_combat_id
+    : null;
+  if (planTargetCombatId !== null && actionTargetCombatId !== planTargetCombatId) {
+    return false;
+  }
+
+  return true;
+}
+
+function scorePlayCardActionAgainstPlanStep(action, planStep) {
+  let score = 0;
+
+  const actionHandIndex = Number.isInteger(action?.hand_index) ? action.hand_index : null;
+  const planHandIndex = Number.isInteger(planStep?.initial_hand_index)
+    ? planStep.initial_hand_index
+    : null;
+  if (actionHandIndex !== null && planHandIndex !== null) {
+    score += 20 - Math.min(Math.abs(actionHandIndex - planHandIndex), 20);
+  }
+
+  if (
+    Number.isFinite(action?.target_combat_id) &&
+    Number.isFinite(planStep?.target?.combat_id) &&
+    action.target_combat_id === planStep.target.combat_id
+  ) {
+    score += 5;
+  }
+
+  if (
+    typeof action?.target_action_suffix === "string" &&
+    typeof planStep?.target?.action_suffix === "string" &&
+    action.target_action_suffix === planStep.target.action_suffix
+  ) {
+    score += 3;
+  }
+
+  return score;
+}
+
+function buildStableCardTextFingerprint(value) {
+  const normalized = normalizeAgentText(value);
+  if (typeof normalized !== "string" || !normalized.trim()) {
+    return null;
+  }
+
+  return normalized
+    .replace(/\d+(?:[.,]\d+)?/g, "#")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function compareNullableFingerprintNumbers(left, right) {
+  const leftNumber = Number.isFinite(left) ? left : null;
+  const rightNumber = Number.isFinite(right) ? right : null;
+
+  if (leftNumber === rightNumber) {
+    return 0;
+  }
+
+  if (leftNumber === null) {
+    return -1;
+  }
+
+  if (rightNumber === null) {
+    return 1;
+  }
+
+  return leftNumber - rightNumber;
+}
+
+function buildCardDynamicVarFingerprint(dynamicVars) {
+  if (!Array.isArray(dynamicVars) || dynamicVars.length <= 0) {
+    return [];
+  }
+
+  return dynamicVars
+    .filter(
+      (entry) => isPlainObject(entry) && typeof entry.name === "string" && entry.name.trim()
+    )
+    .map((entry) => ({
+      name: entry.name,
+      base_value: Number.isFinite(entry.base_value) ? entry.base_value : null,
+      enchanted_value: Number.isFinite(entry.enchanted_value) ? entry.enchanted_value : null
+    }))
+    .sort((left, right) => {
+      const nameComparison = left.name.localeCompare(right.name);
+      if (nameComparison !== 0) {
+        return nameComparison;
+      }
+
+      const baseComparison = compareNullableFingerprintNumbers(
+        left.base_value,
+        right.base_value
+      );
+      if (baseComparison !== 0) {
+        return baseComparison;
+      }
+
+      return compareNullableFingerprintNumbers(
+        left.enchanted_value,
+        right.enchanted_value
+      );
+    });
+}
+
+function buildPlayCardActionFingerprint(action) {
+  const card = isPlainObject(action?.card) ? action.card : {};
+
+  // Keep this fingerprint stable across target-state-dependent preview changes
+  // such as Vulnerable, Strength, or kill-trigger resource refunds. Dynamic
+  // preview values are useful for scoring decisions, but too unstable for
+  // same-card rematching after earlier sequence steps resolve.
+  return JSON.stringify({
+    card_id: typeof card.id === "string" ? card.id : null,
+    title: normalizeAgentText(card.title),
+    description_shape: buildStableCardTextFingerprint(card.description),
+    type: typeof card.type === "string" ? card.type : null,
+    rarity: typeof card.rarity === "string" ? card.rarity : null,
+    target_type: typeof card.target_type === "string" ? card.target_type : null,
+    canonical_energy_cost: Number.isInteger(card.canonical_energy_cost)
+      ? card.canonical_energy_cost
+      : null,
+    canonical_star_cost: Number.isInteger(card.canonical_star_cost)
+      ? card.canonical_star_cost
+      : null,
+    costs_x: card.costs_x === true,
+    has_star_cost_x: card.has_star_cost_x === true,
+    dynamic_vars: buildCardDynamicVarFingerprint(card.dynamic_vars)
+  });
+}
+
 function buildRewardBundle(state) {
   const rewards = Array.isArray(state?.rewards?.rewards)
     ? state.rewards.rewards.map((entry) => ({
@@ -1982,6 +3008,722 @@ function buildCardSelectionBundle(state) {
       options
     },
     non_automation_action_ids: nonAutomationActionIds
+  };
+}
+
+function buildShopBundle(state) {
+  const screen = typeof state?.screen === "string" ? state.screen : null;
+  const rawShop = isPlainObject(state?.shop) ? state.shop : {};
+  const items = Array.isArray(rawShop.items)
+    ? rawShop.items.map((item) => ({
+        index: Number.isInteger(item?.index) ? item.index : null,
+        item_kind: typeof item?.item_kind === "string" ? item.item_kind : null,
+        title: typeof item?.title === "string" ? item.title : null,
+        description: typeof item?.description === "string" ? item.description : null,
+        cost: Number.isFinite(item?.cost) ? item.cost : null,
+        is_affordable: item?.is_affordable === true,
+        used: typeof item?.used === "boolean" ? item.used : null,
+        card: item?.card ?? null,
+        relic: item?.relic ?? null,
+        potion: item?.potion ?? null
+      }))
+    : [];
+  const nonAutomationActionIds = getNonAutomationActions(state)
+    .map((action) => action?.action_id)
+    .filter((actionId) => typeof actionId === "string");
+
+  return {
+    in_shop_flow:
+      rawShop.visible === true ||
+      rawShop.is_open === true ||
+      screen === "SHOP" ||
+      nonAutomationActionIds.some((actionId) => actionId.startsWith("shop:")),
+    screen,
+    shop: {
+      visible: rawShop.visible === true,
+      is_open: rawShop.is_open === true,
+      gold: Number.isFinite(rawShop.gold) ? rawShop.gold : null,
+      merchant_button_visible: rawShop.merchant_button_visible === true,
+      back_button_visible: rawShop.back_button_visible === true,
+      proceed_visible: rawShop.proceed_visible === true,
+      items
+    },
+    non_automation_action_ids: nonAutomationActionIds
+  };
+}
+
+function normalizeShopPurchaseRequests(value) {
+  if (value === undefined) {
+    return [];
+  }
+
+  if (!Array.isArray(value)) {
+    throw new ToolPayloadError(
+      "invalid_arguments",
+      "purchases must be an array when provided.",
+      {
+        field: "purchases"
+      }
+    );
+  }
+
+  return value.map((entry, index) => {
+    if (!isPlainObject(entry)) {
+      throw new ToolPayloadError(
+        "invalid_arguments",
+        `purchases[${index}] must be an object.`,
+        {
+          field: `purchases[${index}]`
+        }
+      );
+    }
+
+    const actionId = optionalString(entry.action_id, `purchases[${index}].action_id`);
+    const title = optionalString(entry.title, `purchases[${index}].title`);
+    const itemKind = normalizeOptionalShopItemKind(
+      entry.item_kind,
+      `purchases[${index}].item_kind`
+    );
+
+    if (actionId === undefined && title === undefined) {
+      throw new ToolPayloadError(
+        "invalid_arguments",
+        `purchases[${index}] must provide action_id or title.`,
+        {
+          field: `purchases[${index}]`
+        }
+      );
+    }
+
+    return {
+      action_id: actionId,
+      title: title === undefined ? undefined : normalizeAgentText(title) ?? title.trim(),
+      item_kind: itemKind
+    };
+  });
+}
+
+function normalizeOptionalShopItemKind(value, fieldName) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (typeof value !== "string") {
+    throw new ToolPayloadError(
+      "invalid_arguments",
+      `${fieldName} must be a string when provided.`,
+      {
+        field: fieldName
+      }
+    );
+  }
+
+  const normalized = value.trim();
+  if (["card", "relic", "potion", "card_removal"].includes(normalized)) {
+    return normalized;
+  }
+
+  throw new ToolPayloadError(
+    "invalid_arguments",
+    `${fieldName} must be one of: card, relic, potion, card_removal.`,
+    {
+      field: fieldName
+    }
+  );
+}
+
+function normalizeTextComparisonKey(value) {
+  const normalized = normalizeAgentText(value);
+  if (typeof normalized !== "string" || !normalized.trim()) {
+    return null;
+  }
+
+  return normalized.trim().toLowerCase();
+}
+
+function isShopBuyAction(action) {
+  return (
+    isPlainObject(action) &&
+    typeof action.action_id === "string" &&
+    action.action_id.startsWith("shop:buy:")
+  );
+}
+
+function getShopBuyActions(state) {
+  return getNonAutomationActions(state).filter(isShopBuyAction);
+}
+
+function summarizeShopBuyActionForAgent(action) {
+  if (!isShopBuyAction(action)) {
+    return summarizeActionForAgent(action);
+  }
+
+  return {
+    action_id: action.action_id,
+    label: normalizeAgentText(action.label),
+    item: summarizeShopItemForAgent(action.item)
+  };
+}
+
+function getShopActionIndex(action) {
+  if (Number.isInteger(action?.index)) {
+    return action.index;
+  }
+
+  if (Number.isInteger(action?.item?.index)) {
+    return action.item.index;
+  }
+
+  return parseIndexedActionId(action?.action_id, "shop:buy:");
+}
+
+function parseIndexedActionId(actionId, prefix) {
+  if (typeof actionId !== "string" || typeof prefix !== "string") {
+    return null;
+  }
+
+  if (!actionId.startsWith(prefix)) {
+    return null;
+  }
+
+  const suffix = actionId.slice(prefix.length);
+  return /^\d+$/.test(suffix) ? Number.parseInt(suffix, 10) : null;
+}
+
+function getShopActionTitle(action) {
+  if (typeof action?.item?.title === "string" && action.item.title.trim()) {
+    return normalizeAgentText(action.item.title);
+  }
+
+  if (typeof action?.label === "string" && action.label.trim()) {
+    return normalizeAgentText(action.label);
+  }
+
+  return null;
+}
+
+function getShopActionItemKind(action) {
+  const itemKind =
+    typeof action?.item?.item_kind === "string" ? action.item.item_kind.trim() : null;
+  return itemKind && ["card", "relic", "potion", "card_removal"].includes(itemKind)
+    ? itemKind
+    : null;
+}
+
+function resolveInitialShopPurchaseRequest(request, state) {
+  const actions = getShopBuyActions(state);
+  if (actions.length <= 0 || !isPlainObject(request)) {
+    return null;
+  }
+
+  const requestTitleKey = normalizeTextComparisonKey(request.title);
+  const requestItemKind = normalizeOptionalShopItemKind(
+    request.item_kind,
+    "request.item_kind"
+  );
+  const hasDescriptor = requestTitleKey !== null || requestItemKind !== undefined;
+
+  if (!hasDescriptor) {
+    return typeof request.action_id === "string"
+      ? actions.find((action) => action.action_id === request.action_id) ?? null
+      : null;
+  }
+
+  const compatibleActions = actions.filter((action) => {
+    if (requestItemKind !== undefined && getShopActionItemKind(action) !== requestItemKind) {
+      return false;
+    }
+
+    if (requestTitleKey !== null && normalizeTextComparisonKey(getShopActionTitle(action)) !== requestTitleKey) {
+      return false;
+    }
+
+    return true;
+  });
+
+  if (compatibleActions.length <= 0) {
+    return null;
+  }
+
+  if (typeof request.action_id === "string") {
+    const exactAction = compatibleActions.find(
+      (action) => action.action_id === request.action_id
+    );
+    if (exactAction) {
+      return exactAction;
+    }
+  }
+
+  return compatibleActions
+    .map((action) => ({
+      action,
+      score: scoreShopBuyActionAgainstRequest(action, request)
+    }))
+    .sort((left, right) => right.score - left.score)[0].action;
+}
+
+function scoreShopBuyActionAgainstRequest(action, request) {
+  let score = 0;
+
+  if (typeof request?.action_id === "string") {
+    if (action?.action_id === request.action_id) {
+      score += 100;
+    }
+
+    const requestedIndex = parseIndexedActionId(request.action_id, "shop:buy:");
+    const actionIndex = getShopActionIndex(action);
+    if (requestedIndex !== null && actionIndex !== null) {
+      score += 20 - Math.min(Math.abs(actionIndex - requestedIndex), 20);
+    }
+  }
+
+  const requestTitleKey = normalizeTextComparisonKey(request?.title);
+  if (requestTitleKey !== null && normalizeTextComparisonKey(getShopActionTitle(action)) === requestTitleKey) {
+    score += 30;
+  }
+
+  if (
+    typeof request?.item_kind === "string" &&
+    getShopActionItemKind(action) === request.item_kind
+  ) {
+    score += 15;
+  }
+
+  return score;
+}
+
+function buildPlannedShopPurchaseStep(action, request, sequenceIndex) {
+  return {
+    sequence_index: sequenceIndex,
+    request: summarizeShopPurchaseRequest(request),
+    requested_action_id: typeof request?.action_id === "string" ? request.action_id : null,
+    initial_action_id: typeof action?.action_id === "string" ? action.action_id : null,
+    initial_shop_index: getShopActionIndex(action),
+    item: summarizeShopItemForAgent(action?.item),
+    action_fingerprint: buildShopBuyActionFingerprint(action)
+  };
+}
+
+function summarizeShopPurchasePlanStep(planStep) {
+  if (!isPlainObject(planStep)) {
+    return null;
+  }
+
+  return {
+    sequence_index: Number.isInteger(planStep.sequence_index) ? planStep.sequence_index : null,
+    request: summarizeShopPurchaseRequest(planStep.request),
+    requested_action_id:
+      typeof planStep.requested_action_id === "string" ? planStep.requested_action_id : null,
+    initial_action_id:
+      typeof planStep.initial_action_id === "string" ? planStep.initial_action_id : null,
+    initial_shop_index:
+      Number.isInteger(planStep.initial_shop_index) ? planStep.initial_shop_index : null,
+    item: summarizeShopItemForAgent(planStep.item)
+  };
+}
+
+function getShopVisitContinuationBlocker(state) {
+  if (!isPlainObject(state)) {
+    return {
+      reason: "missing_state",
+      message: "Bridge state was missing while resolving the shop visit."
+    };
+  }
+
+  const cardSelectionBundle = buildCardSelectionBundle(state);
+  if (cardSelectionBundle.in_card_selection_flow && cardSelectionBundle.card_selection.visible) {
+    return {
+      reason: "card_selection_ready",
+      message: "Card selection became visible before the requested shop visit finished."
+    };
+  }
+
+  const shopBundle = buildShopBundle(state);
+  if (!shopBundle.in_shop_flow) {
+    return {
+      reason: `screen:${typeof state.screen === "string" ? state.screen : "unknown"}`,
+      message: "The game is no longer in a shop-related flow."
+    };
+  }
+
+  if (shopBundle.shop.visible && shopBundle.shop.is_open !== true && getShopBuyActions(state).length <= 0) {
+    return {
+      reason: "shop_inventory_closed",
+      message: "Merchant inventory is not open."
+    };
+  }
+
+  return null;
+}
+
+function resolvePlannedShopPurchaseStep(planStep, currentShopActions) {
+  const actions = Array.isArray(currentShopActions) ? currentShopActions : [];
+  const exactCandidateIds = [
+    typeof planStep?.initial_action_id === "string" ? planStep.initial_action_id : null,
+    typeof planStep?.requested_action_id === "string" ? planStep.requested_action_id : null
+  ].filter((value, index, array) => typeof value === "string" && array.indexOf(value) === index);
+
+  const exactMatch = actions.find(
+    (action) =>
+      exactCandidateIds.includes(action?.action_id) &&
+      doesShopBuyActionMatchPlanStep(action, planStep)
+  );
+  if (exactMatch) {
+    return {
+      action: exactMatch,
+      match_type: "exact",
+      compatible_candidate_count: 1
+    };
+  }
+
+  const compatibleActions = actions.filter((action) =>
+    doesShopBuyActionMatchPlanStep(action, planStep)
+  );
+  if (compatibleActions.length <= 0) {
+    return {
+      action: null,
+      match_type: "unavailable",
+      compatible_candidate_count: 0
+    };
+  }
+
+  const rankedActions = compatibleActions
+    .map((action) => ({
+      action,
+      score: scoreShopBuyActionAgainstPlanStep(action, planStep)
+    }))
+    .sort((left, right) => right.score - left.score);
+
+  return {
+    action: rankedActions[0].action,
+    match_type: compatibleActions.length === 1 ? "reindexed" : "reindexed_ambiguous",
+    compatible_candidate_count: compatibleActions.length
+  };
+}
+
+function doesShopBuyActionMatchPlanStep(action, planStep) {
+  if (!isShopBuyAction(action) || !isPlainObject(planStep)) {
+    return false;
+  }
+
+  return buildShopBuyActionFingerprint(action) === planStep.action_fingerprint;
+}
+
+function scoreShopBuyActionAgainstPlanStep(action, planStep) {
+  let score = 0;
+
+  if (action?.action_id === planStep?.initial_action_id) {
+    score += 100;
+  }
+
+  if (action?.action_id === planStep?.requested_action_id) {
+    score += 80;
+  }
+
+  const actionIndex = getShopActionIndex(action);
+  const initialIndex = Number.isInteger(planStep?.initial_shop_index)
+    ? planStep.initial_shop_index
+    : parseIndexedActionId(planStep?.initial_action_id, "shop:buy:");
+  if (actionIndex !== null && initialIndex !== null) {
+    score += 20 - Math.min(Math.abs(actionIndex - initialIndex), 20);
+  }
+
+  const requestTitleKey = normalizeTextComparisonKey(planStep?.request?.title);
+  if (requestTitleKey !== null && normalizeTextComparisonKey(getShopActionTitle(action)) === requestTitleKey) {
+    score += 10;
+  }
+
+  if (
+    typeof planStep?.request?.item_kind === "string" &&
+    getShopActionItemKind(action) === planStep.request.item_kind
+  ) {
+    score += 5;
+  }
+
+  return score;
+}
+
+function buildShopBuyActionFingerprint(action) {
+  const item = isPlainObject(action?.item) ? action.item : {};
+  const card = isPlainObject(item.card) ? item.card : {};
+  const relic = isPlainObject(item.relic) ? item.relic : {};
+  const potion = isPlainObject(item.potion) ? item.potion : {};
+  const effectPreview = isPlainObject(card.effect_preview) ? card.effect_preview : {};
+
+  return JSON.stringify({
+    item_kind: getShopActionItemKind(action),
+    title: normalizeAgentText(item.title),
+    description: normalizeAgentText(item.description),
+    cost: Number.isFinite(item.cost) ? item.cost : null,
+    used: typeof item.used === "boolean" ? item.used : null,
+    card: {
+      id: typeof card.id === "string" ? card.id : null,
+      title: normalizeAgentText(card.title),
+      description: normalizeAgentText(card.description),
+      type: typeof card.type === "string" ? card.type : null,
+      target_type: typeof card.target_type === "string" ? card.target_type : null,
+      canonical_energy_cost: Number.isInteger(card.canonical_energy_cost)
+        ? card.canonical_energy_cost
+        : null,
+      resolved_energy_cost: Number.isInteger(card.resolved_energy_cost)
+        ? card.resolved_energy_cost
+        : null,
+      effect_preview: {
+        summary: normalizeAgentText(effectPreview.summary),
+        total_damage: Number.isFinite(effectPreview.total_damage)
+          ? effectPreview.total_damage
+          : null,
+        damage_per_hit: Number.isFinite(effectPreview.damage_per_hit)
+          ? effectPreview.damage_per_hit
+          : null,
+        hits: Number.isFinite(effectPreview.hits) ? effectPreview.hits : null,
+        total_block: Number.isFinite(effectPreview.total_block)
+          ? effectPreview.total_block
+          : null,
+        draw: Number.isFinite(effectPreview.draw) ? effectPreview.draw : null,
+        heal: Number.isFinite(effectPreview.heal) ? effectPreview.heal : null,
+        weak: Number.isFinite(effectPreview.weak) ? effectPreview.weak : null,
+        vulnerable: Number.isFinite(effectPreview.vulnerable)
+          ? effectPreview.vulnerable
+          : null,
+        strength: Number.isFinite(effectPreview.strength) ? effectPreview.strength : null,
+        dexterity: Number.isFinite(effectPreview.dexterity)
+          ? effectPreview.dexterity
+          : null,
+        x_cost_value: Number.isFinite(effectPreview.x_cost_value)
+          ? effectPreview.x_cost_value
+          : null,
+        x_cost_semantics:
+          typeof effectPreview.x_cost_semantics === "string"
+            ? effectPreview.x_cost_semantics
+            : null
+      }
+    },
+    relic: {
+      id: typeof relic.id === "string" ? relic.id : null,
+      title: normalizeAgentText(relic.title),
+      description: normalizeAgentText(relic.description),
+      rarity: typeof relic.rarity === "string" ? relic.rarity : null
+    },
+    potion: {
+      id: typeof potion.id === "string" ? potion.id : null,
+      title: normalizeAgentText(potion.title),
+      description: normalizeAgentText(potion.description),
+      rarity: typeof potion.rarity === "string" ? potion.rarity : null,
+      target_type: typeof potion.target_type === "string" ? potion.target_type : null
+    }
+  });
+}
+
+function summarizeShopPurchaseRequest(request) {
+  if (!isPlainObject(request)) {
+    return null;
+  }
+
+  return {
+    action_id: typeof request.action_id === "string" ? request.action_id : null,
+    title: normalizeAgentText(request.title),
+    item_kind: typeof request.item_kind === "string" ? request.item_kind : null
+  };
+}
+
+function summarizeCardSelectionOptionForAgent(option, fallbackIndex = null) {
+  if (!isPlainObject(option)) {
+    return null;
+  }
+
+  const optionIndex = Number.isInteger(option.index) ? option.index : fallbackIndex;
+  return {
+    index: Number.isInteger(optionIndex) ? optionIndex : null,
+    is_selected: option.is_selected === true,
+    card: summarizeCardForAgent(option.card)
+  };
+}
+
+function resolveShopCardRemovalOption(cardSelectionBundle, options) {
+  const visibleOptions = Array.isArray(cardSelectionBundle?.card_selection?.options)
+    ? cardSelectionBundle.card_selection.options
+    : [];
+  const normalizedOptions = visibleOptions.map((option, fallbackIndex) => ({
+    option,
+    option_index: Number.isInteger(option?.index) ? option.index : fallbackIndex,
+    title_key: normalizeTextComparisonKey(option?.card?.title)
+  }));
+
+  if (Number.isInteger(options?.removeCardIndex)) {
+    const indexedMatch = normalizedOptions.find(
+      (entry) => entry.option_index === options.removeCardIndex
+    );
+    if (!indexedMatch) {
+      return {
+        option: null,
+        reason: "shop_card_removal_index_unavailable",
+        message: `Card removal option ${options.removeCardIndex} is not available.`,
+        available_cards: normalizedOptions
+          .map((entry) => summarizeCardSelectionOptionForAgent(entry.option, entry.option_index))
+          .filter((entry) => entry !== null)
+      };
+    }
+
+    return {
+      option: {
+        ...indexedMatch.option,
+        index: indexedMatch.option_index
+      },
+      match_type: "index",
+      compatible_option_count: 1
+    };
+  }
+
+  const requestedTitleKey = normalizeTextComparisonKey(options?.removeCardTitle);
+  if (requestedTitleKey === null) {
+    return {
+      option: null,
+      reason: "shop_card_removal_target_missing",
+      message: "No card removal target was provided."
+    };
+  }
+
+  const titleMatches = normalizedOptions.filter(
+    (entry) => entry.title_key !== null && entry.title_key === requestedTitleKey
+  );
+  if (titleMatches.length <= 0) {
+    return {
+      option: null,
+      reason: "shop_card_removal_title_unavailable",
+      message: `No visible card removal option matched ${options.removeCardTitle}.`,
+      available_cards: normalizedOptions
+        .map((entry) => summarizeCardSelectionOptionForAgent(entry.option, entry.option_index))
+        .filter((entry) => entry !== null)
+    };
+  }
+
+  return {
+    option: {
+      ...titleMatches[0].option,
+      index: titleMatches[0].option_index
+    },
+    match_type: titleMatches.length === 1 ? "title" : "title_ambiguous",
+    compatible_option_count: titleMatches.length
+  };
+}
+
+async function maybeResolveShopCardRemovalSelection(session, state, options) {
+  const executedActions = [];
+  const cardSelectionBundle = buildCardSelectionBundle(state);
+  const summarizedBundle = summarizeCardSelectionBundleForAgent(cardSelectionBundle);
+
+  if (!cardSelectionBundle.in_card_selection_flow || !cardSelectionBundle.card_selection.visible) {
+    return {
+      performed: false,
+      required_but_missing: false,
+      failed: false,
+      executed_actions: executedActions,
+      card_selection_bundle: summarizedBundle,
+      state
+    };
+  }
+
+  if (options?.removeCardTitle === undefined && options?.removeCardIndex === undefined) {
+    return {
+      performed: false,
+      required_but_missing: true,
+      failed: false,
+      executed_actions: executedActions,
+      card_selection_bundle: summarizedBundle,
+      state
+    };
+  }
+
+  const selectionResolution = resolveShopCardRemovalOption(cardSelectionBundle, options);
+  if (!selectionResolution.option || !Number.isInteger(selectionResolution.option.index)) {
+    return {
+      performed: false,
+      required_but_missing: false,
+      failed: true,
+      reason: selectionResolution.reason ?? "shop_card_removal_target_unavailable",
+      message:
+        selectionResolution.message ??
+        "The requested card removal target is not available in the current selection.",
+      executed_actions: executedActions,
+      card_selection_bundle: summarizedBundle,
+      available_cards: selectionResolution.available_cards ?? [],
+      state
+    };
+  }
+
+  const selectActionId = `card_selection:select:${selectionResolution.option.index}`;
+  if (!cardSelectionBundle.non_automation_action_ids.includes(selectActionId)) {
+    return {
+      performed: false,
+      required_but_missing: false,
+      failed: true,
+      reason: "shop_card_removal_select_action_unavailable",
+      message: `The bridge did not expose ${selectActionId} for the current card selection.`,
+      executed_actions: executedActions,
+      card_selection_bundle: summarizedBundle,
+      available_cards:
+        selectionResolution.available_cards ??
+        cardSelectionBundle.card_selection.options
+          .map((option, fallbackIndex) =>
+            summarizeCardSelectionOptionForAgent(option, fallbackIndex)
+          )
+          .filter((entry) => entry !== null),
+      state
+    };
+  }
+
+  const selectedCardSummary = summarizeCardForAgent(selectionResolution.option.card);
+  const waitAfterMs = Number.isInteger(options?.waitAfterMs)
+    ? options.waitAfterMs
+    : DEFAULT_ACTION_WAIT_MS;
+
+  const selectResult = await performBridgeAction(session, selectActionId, waitAfterMs);
+  executedActions.push(summarizeExecutedAction(selectResult));
+  state = selectResult.state;
+
+  let finalBundle = buildCardSelectionBundle(state);
+  if (finalBundle.in_card_selection_flow && finalBundle.card_selection.visible) {
+    if (!finalBundle.non_automation_action_ids.includes("card_selection:confirm")) {
+      return {
+        performed: false,
+        required_but_missing: false,
+        failed: true,
+        reason: "shop_card_removal_confirmation_unavailable",
+        message: "Card removal selection stayed open, but confirm was not available.",
+        executed_actions: executedActions,
+        card_selection_bundle: summarizeCardSelectionBundleForAgent(finalBundle),
+        available_cards: finalBundle.card_selection.options
+          .map((option, fallbackIndex) =>
+            summarizeCardSelectionOptionForAgent(option, fallbackIndex)
+          )
+          .filter((entry) => entry !== null),
+        state
+      };
+    }
+
+    const confirmResult = await performBridgeAction(session, "card_selection:confirm", waitAfterMs);
+    executedActions.push(summarizeExecutedAction(confirmResult));
+    state = confirmResult.state;
+    finalBundle = buildCardSelectionBundle(state);
+  }
+
+  return {
+    performed: true,
+    required_but_missing: false,
+    failed: false,
+    removed_card: {
+      requested_title:
+        typeof options?.removeCardTitle === "string" ? normalizeAgentText(options.removeCardTitle) : null,
+      requested_index: Number.isInteger(options?.removeCardIndex) ? options.removeCardIndex : null,
+      selected_option_index: selectionResolution.option.index,
+      match_type: selectionResolution.match_type,
+      compatible_option_count: selectionResolution.compatible_option_count,
+      card: selectedCardSummary
+    },
+    executed_actions: executedActions,
+    card_selection_bundle: summarizeCardSelectionBundleForAgent(finalBundle),
+    state
   };
 }
 
@@ -2159,6 +3901,27 @@ function summarizeActionsForAgent(actions) {
     .filter((action) => action !== null);
 }
 
+function shouldIncludeCardDescriptionAlongsideEffect(description, effect) {
+  if (typeof description !== "string" || !description.trim()) {
+    return false;
+  }
+
+  if (typeof effect !== "string" || !effect.trim()) {
+    return true;
+  }
+
+  if (description.includes("\n")) {
+    return true;
+  }
+
+  const sentenceBreakCount = (description.match(/[。！？!?]/g) || []).length;
+  if (sentenceBreakCount >= 2) {
+    return true;
+  }
+
+  return description.length >= effect.length + 8;
+}
+
 function summarizeCardForAgent(card) {
   if (!isPlainObject(card)) {
     return null;
@@ -2172,6 +3935,9 @@ function summarizeCardForAgent(card) {
   const effect = typeof card?.effect_preview?.summary === "string"
     ? normalizeAgentText(card.effect_preview.summary)
     : null;
+  const description = typeof card.description === "string" && card.description.trim()
+    ? normalizeAgentText(card.description)
+    : null;
 
   if (typeof card.type === "string" && card.type.trim()) {
     summary.type = card.type;
@@ -2183,8 +3949,10 @@ function summarizeCardForAgent(card) {
 
   if (effect && effect.trim()) {
     summary.effect = effect;
-  } else if (typeof card.description === "string" && card.description.trim()) {
-    summary.description = normalizeAgentText(card.description);
+  }
+
+  if (shouldIncludeCardDescriptionAlongsideEffect(description, effect)) {
+    summary.description = description;
   }
 
   return summary;
@@ -2226,6 +3994,35 @@ function summarizeRelicForAgent(relic) {
   return {
     title: normalizeAgentText(relic.title)
   };
+}
+
+function summarizeShopItemForAgent(item) {
+  if (!isPlainObject(item)) {
+    return null;
+  }
+
+  const summary = {
+    index: Number.isInteger(item.index) ? item.index : null,
+    item_kind: typeof item.item_kind === "string" ? item.item_kind : null,
+    title: normalizeAgentText(item.title),
+    description: normalizeAgentText(item.description),
+    cost: Number.isFinite(item.cost) ? item.cost : null,
+    is_affordable: item.is_affordable === true
+  };
+
+  if (isPlainObject(item.card)) {
+    summary.card = summarizeCardForAgent(item.card);
+  }
+
+  if (isPlainObject(item.relic)) {
+    summary.relic = summarizeRelicForAgent(item.relic);
+  }
+
+  if (isPlainObject(item.potion)) {
+    summary.potion = summarizePotionForAgent(item.potion);
+  }
+
+  return summary;
 }
 
 function summarizeIntentForAgent(intent) {
@@ -2509,6 +4306,11 @@ function summarizeStateForAgent(state) {
       current_hp: Number.isFinite(playerCreature.current_hp) ? playerCreature.current_hp : null,
       max_hp: Number.isFinite(playerCreature.max_hp) ? playerCreature.max_hp : null,
       block: Number.isFinite(playerCreature.block) ? playerCreature.block : 0,
+      powers: Array.isArray(playerCreature.powers)
+        ? playerCreature.powers
+            .map(summarizePowerForAgent)
+            .filter((power) => power !== null)
+        : [],
       gold: Number.isFinite(player?.gold) ? player.gold : null,
       potions: Array.isArray(player?.potions)
         ? player.potions.map((potion) => (potion?.empty === true ? "[empty]" : potion?.title ?? null))
@@ -2604,13 +4406,9 @@ function summarizeStateForAgent(state) {
       is_open: shop.is_open === true,
       gold: Number.isFinite(shop.gold) ? shop.gold : null,
       items: Array.isArray(shop.items)
-        ? shop.items.map((item) => ({
-            index: Number.isInteger(item?.index) ? item.index : null,
-            title: normalizeAgentText(item?.title),
-            price: Number.isFinite(item?.price) ? item.price : null,
-            item_type: typeof item?.item_type === "string" ? item.item_type : null,
-            can_buy: item?.can_buy === true
-          }))
+        ? shop.items
+            .map((item) => summarizeShopItemForAgent(item))
+            .filter((item) => item !== null)
         : []
     };
   }
@@ -2665,7 +4463,7 @@ function summarizeStateForAgent(state) {
   return summary;
 }
 
-function buildMapRoutesPayload(state) {
+function buildMapRoutesPayload(state, options = {}) {
   if (!isPlainObject(state)) {
     return {
       ok: false,
@@ -2673,23 +4471,27 @@ function buildMapRoutesPayload(state) {
     };
   }
 
+  const detail = normalizeMapRoutesDetail(options.detail);
+  const snapshotStatus = isPlainObject(options.snapshot_status)
+    ? options.snapshot_status
+    : null;
   const map = isPlainObject(state.map) ? state.map : {};
-  const run = isPlainObject(state.run) ? state.run : {};
   if (map.is_open !== true || !Array.isArray(map.points) || map.points.length === 0) {
     return {
       ok: false,
       error: "map_not_open",
       screen: typeof state.screen === "string" ? state.screen : null,
-      map_open: map.is_open === true
+      map_open: map.is_open === true,
+      detail,
+      snapshot_settled: snapshotStatus?.settled ?? null,
+      snapshot_settle_reason: snapshotStatus?.reason ?? null,
+      snapshot_settle_polls: snapshotStatus?.poll_count ?? null
     };
   }
 
-  const currentCoord = isPlainObject(run.current_map_coord)
-    ? run.current_map_coord
-    : isPlainObject(map.current_coord)
-      ? map.current_coord
-      : null;
+  const currentCoord = extractMapCurrentCoord(state);
   const currentRow = Number.isFinite(currentCoord?.row) ? currentCoord.row : null;
+  const runContext = buildMapRunContext(state);
 
   const allPoints = map.points
     .filter((point) => isPlainObject(point) && isPlainObject(point.coord))
@@ -2733,15 +4535,20 @@ function buildMapRoutesPayload(state) {
         return null;
       }
 
+      const rootSummary = buildMapRouteRootSummary(key, pointByKey);
+
       return {
         key,
         point_type: point.point_type,
         child_keys: getReachableMapChildKeys(point, pointByKey, reachableKeys),
         reachable_node_count: countUniqueReachableMapNodesFromKey(key, pointByKey),
-        max_depth: getReachableMapDepthFromKey(key, pointByKey, depthMemo)
+        max_depth: getReachableMapDepthFromKey(key, pointByKey, depthMemo),
+        summary: rootSummary,
+        run_aware: buildMapRouteRootRunAware(rootSummary, runContext)
       };
     })
-    .filter((entry) => entry !== null);
+    .filter((entry) => entry !== null)
+    .sort(compareReachableMapNodeEntries);
 
   const routeNodes = Array.from(reachableKeys)
     .map((key) => {
@@ -2764,6 +4571,9 @@ function buildMapRoutesPayload(state) {
     screen: typeof state.screen === "string" ? state.screen : null,
     current_coord: currentCoord,
     current_row: currentRow,
+    run_context: runContext,
+    detail,
+    forced_route: routeRoots.length === 1,
     frontier_count: frontier.length,
     coord_key_format: "col,row",
     pruned_rules: [
@@ -2771,11 +4581,498 @@ function buildMapRoutesPayload(state) {
       "exclude_rows_at_or_before_current",
       "exclude_unreachable_nodes"
     ],
+    snapshot_settled: snapshotStatus?.settled ?? null,
+    snapshot_settle_reason: snapshotStatus?.reason ?? null,
+    snapshot_settle_polls: snapshotStatus?.poll_count ?? null,
+    frontier_action_match: snapshotStatus?.frontier_action_match ?? null,
+    state_action_state_version_match:
+      snapshotStatus?.state_action_state_version_match ?? null,
     route_root_count: routeRoots.length,
     route_node_count: routeNodes.length,
     route_roots: routeRoots,
-    route_nodes: routeNodes
+    route_nodes: detail === "full" ? routeNodes : undefined
   };
+}
+
+function buildMapRouteRootSummary(startKey, pointByKey) {
+  const pointTypeCounts = new Map();
+  const minStepsByType = new Map();
+  const visited = new Set();
+  const bestStepsByKey = new Map();
+  const pending = [
+    {
+      key: startKey,
+      stepsFromCurrent: 1
+    }
+  ];
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    const key = current?.key;
+    const stepsFromCurrent = current?.stepsFromCurrent;
+    if (typeof key !== "string" || !Number.isInteger(stepsFromCurrent)) {
+      continue;
+    }
+
+    const bestKnownSteps = bestStepsByKey.get(key);
+    if (bestKnownSteps !== undefined && bestKnownSteps <= stepsFromCurrent) {
+      continue;
+    }
+    bestStepsByKey.set(key, stepsFromCurrent);
+
+    const point = pointByKey.get(key);
+    if (!point) {
+      continue;
+    }
+
+    if (!visited.has(key)) {
+      visited.add(key);
+      if (typeof point.point_type === "string" && point.point_type.length > 0) {
+        pointTypeCounts.set(
+          point.point_type,
+          (pointTypeCounts.get(point.point_type) ?? 0) + 1
+        );
+      }
+    }
+
+    if (typeof point.point_type === "string" && point.point_type.length > 0) {
+      const previousMin = minStepsByType.get(point.point_type);
+      if (previousMin === undefined || stepsFromCurrent < previousMin) {
+        minStepsByType.set(point.point_type, stepsFromCurrent);
+      }
+    }
+
+    for (const childKey of getReachableMapChildKeys(point, pointByKey)) {
+      pending.push({
+        key: childKey,
+        stepsFromCurrent: stepsFromCurrent + 1
+      });
+    }
+  }
+
+  return {
+    forced_path_steps_before_branch: countForcedMapPathSteps(startKey, pointByKey),
+    reachable_point_type_counts: objectFromSortedMap(pointTypeCounts),
+    steps_from_current_to_next_point_type: objectFromSortedMap(minStepsByType),
+    can_reach_rest_site_before_elite: canReachTypeBeforeType(
+      startKey,
+      pointByKey,
+      "RestSite",
+      "Elite"
+    ),
+    can_reach_elite_then_rest_site: canReachEliteThenRestSite(startKey, pointByKey)
+  };
+}
+
+function buildMapRunContext(state) {
+  const run = isPlainObject(state?.run) ? state.run : {};
+  const player = state?.players?.[0];
+  const creature = isPlainObject(player?.creature) ? player.creature : {};
+  const potions = Array.isArray(player?.potions) ? player.potions : [];
+  const relics = Array.isArray(player?.relics) ? player.relics : [];
+  const deck = isPlainObject(player?.deck) ? player.deck : {};
+  const currentHp = Number.isFinite(creature.current_hp) ? creature.current_hp : null;
+  const maxHp = Number.isFinite(creature.max_hp) ? creature.max_hp : null;
+  const hpRatio =
+    currentHp !== null && maxHp !== null && maxHp > 0
+      ? Number((currentHp / maxHp).toFixed(3))
+      : null;
+  const emptyPotionSlots = potions.filter((potion) => potion?.empty === true).length;
+  const filledPotionSlots = potions.filter((potion) => potion?.empty !== true).length;
+  const nonStarterRelicCount = relics.filter(
+    (relic) => String(relic?.rarity ?? "") !== "Starter"
+  ).length;
+  const deckCardCount = Number.isFinite(deck.count)
+    ? deck.count
+    : Array.isArray(deck.cards)
+      ? deck.cards.length
+      : null;
+
+  return {
+    act_floor: Number.isFinite(run.act_floor) ? run.act_floor : null,
+    total_floor: Number.isFinite(run.total_floor) ? run.total_floor : null,
+    hp: {
+      current: currentHp,
+      max: maxHp,
+      ratio: hpRatio,
+      band: getHpBand(hpRatio)
+    },
+    gold: Number.isFinite(player?.gold) ? player.gold : null,
+    gold_band: getGoldBand(player?.gold),
+    potion_slots: {
+      total: potions.length,
+      filled: filledPotionSlots,
+      empty: emptyPotionSlots,
+      band: getPotionSlotBand(emptyPotionSlots, potions.length)
+    },
+    deck_card_count: deckCardCount,
+    relic_count: relics.length,
+    non_starter_relic_count: nonStarterRelicCount
+  };
+}
+
+function buildMapRouteRootRunAware(routeSummary, runContext) {
+  const stepIndex = isPlainObject(routeSummary?.steps_from_current_to_next_point_type)
+    ? routeSummary.steps_from_current_to_next_point_type
+    : {};
+  const nextEliteSteps = Number.isFinite(stepIndex.Elite) ? stepIndex.Elite : null;
+  const nextRestSteps = Number.isFinite(stepIndex.RestSite) ? stepIndex.RestSite : null;
+  const nextShopSteps = Number.isFinite(stepIndex.Shop) ? stepIndex.Shop : null;
+  const eliteViability = rateEliteViability(routeSummary, runContext);
+  const reasonTags = buildMapRouteReasonTags(routeSummary, runContext, eliteViability);
+
+  return {
+    rest_pressure: rateRestPressure(nextRestSteps, runContext),
+    shop_access_value: rateShopAccessValue(nextShopSteps, runContext),
+    potion_capacity_value: ratePotionCapacityValue(runContext),
+    elite_plan: {
+      next_elite_steps: nextEliteSteps,
+      can_reach_rest_site_before_elite:
+        routeSummary?.can_reach_rest_site_before_elite === true,
+      can_reach_elite_then_rest_site:
+        routeSummary?.can_reach_elite_then_rest_site === true,
+      viability: eliteViability.rating,
+      score: eliteViability.score
+    },
+    reason_tags: reasonTags
+  };
+}
+
+function countForcedMapPathSteps(startKey, pointByKey) {
+  let key = startKey;
+  let steps = 0;
+
+  while (typeof key === "string") {
+    const point = pointByKey.get(key);
+    if (!point) {
+      break;
+    }
+
+    steps += 1;
+    const childKeys = getReachableMapChildKeys(point, pointByKey);
+    if (childKeys.length !== 1) {
+      break;
+    }
+
+    key = childKeys[0];
+  }
+
+  return steps;
+}
+
+function canReachEliteThenRestSite(startKey, pointByKey) {
+  const memo = new Map();
+  return canReachEliteThenRestSiteRecursive(startKey, pointByKey, false, memo);
+}
+
+function canReachEliteThenRestSiteRecursive(startKey, pointByKey, seenElite, memo) {
+  if (typeof startKey !== "string") {
+    return false;
+  }
+
+  const memoKey = `${startKey}|${seenElite ? "1" : "0"}`;
+  if (memo.has(memoKey)) {
+    return memo.get(memoKey);
+  }
+
+  const point = pointByKey.get(startKey);
+  if (!point) {
+    memo.set(memoKey, false);
+    return false;
+  }
+
+  const nextSeenElite = seenElite || point.point_type === "Elite";
+  if (nextSeenElite && point.point_type === "RestSite") {
+    memo.set(memoKey, true);
+    return true;
+  }
+
+  const result = getReachableMapChildKeys(point, pointByKey).some((childKey) =>
+    canReachEliteThenRestSiteRecursive(childKey, pointByKey, nextSeenElite, memo)
+  );
+  memo.set(memoKey, result);
+  return result;
+}
+
+function canReachTypeBeforeType(startKey, pointByKey, desiredType, blockingType) {
+  const memo = new Map();
+  return canReachTypeBeforeTypeRecursive(
+    startKey,
+    pointByKey,
+    desiredType,
+    blockingType,
+    memo
+  );
+}
+
+function canReachTypeBeforeTypeRecursive(
+  startKey,
+  pointByKey,
+  desiredType,
+  blockingType,
+  memo
+) {
+  if (typeof startKey !== "string") {
+    return false;
+  }
+
+  const memoKey = `${startKey}|${desiredType}|${blockingType}`;
+  if (memo.has(memoKey)) {
+    return memo.get(memoKey);
+  }
+
+  const point = pointByKey.get(startKey);
+  if (!point) {
+    memo.set(memoKey, false);
+    return false;
+  }
+
+  if (point.point_type === desiredType) {
+    memo.set(memoKey, true);
+    return true;
+  }
+
+  if (point.point_type === blockingType) {
+    memo.set(memoKey, false);
+    return false;
+  }
+
+  const result = getReachableMapChildKeys(point, pointByKey).some((childKey) =>
+    canReachTypeBeforeTypeRecursive(
+      childKey,
+      pointByKey,
+      desiredType,
+      blockingType,
+      memo
+    )
+  );
+  memo.set(memoKey, result);
+  return result;
+}
+
+function getHpBand(hpRatio) {
+  if (!Number.isFinite(hpRatio)) {
+    return null;
+  }
+
+  if (hpRatio >= 0.75) {
+    return "healthy";
+  }
+
+  if (hpRatio >= 0.5) {
+    return "stable";
+  }
+
+  if (hpRatio >= 0.3) {
+    return "wounded";
+  }
+
+  return "critical";
+}
+
+function getGoldBand(gold) {
+  if (!Number.isFinite(gold)) {
+    return null;
+  }
+
+  if (gold >= 150) {
+    return "rich";
+  }
+
+  if (gold >= 75) {
+    return "shop_ready";
+  }
+
+  if (gold >= 40) {
+    return "limited";
+  }
+
+  return "low";
+}
+
+function getPotionSlotBand(emptySlots, totalSlots) {
+  if (!Number.isFinite(totalSlots) || totalSlots <= 0) {
+    return null;
+  }
+
+  if (!Number.isFinite(emptySlots) || emptySlots <= 0) {
+    return "full";
+  }
+
+  if (emptySlots >= 2) {
+    return "open";
+  }
+
+  return "tight";
+}
+
+function rateRestPressure(nextRestSteps, runContext) {
+  const hpRatio = Number.isFinite(runContext?.hp?.ratio) ? runContext.hp.ratio : null;
+  if (!Number.isFinite(hpRatio)) {
+    return "unknown";
+  }
+
+  if (hpRatio < 0.35) {
+    return "high";
+  }
+
+  if (hpRatio < 0.55 && (!Number.isFinite(nextRestSteps) || nextRestSteps > 3)) {
+    return "high";
+  }
+
+  if (hpRatio < 0.7 && (!Number.isFinite(nextRestSteps) || nextRestSteps > 4)) {
+    return "medium";
+  }
+
+  return "low";
+}
+
+function rateShopAccessValue(nextShopSteps, runContext) {
+  const gold = Number.isFinite(runContext?.gold) ? runContext.gold : null;
+  if (!Number.isFinite(nextShopSteps)) {
+    return "none";
+  }
+
+  if (!Number.isFinite(gold) || gold < 40) {
+    return "low";
+  }
+
+  if ((gold >= 75 && nextShopSteps <= 2) || (gold >= 150 && nextShopSteps <= 4)) {
+    return "high";
+  }
+
+  if ((gold >= 50 && nextShopSteps <= 3) || gold >= 100) {
+    return "medium";
+  }
+
+  return "low";
+}
+
+function ratePotionCapacityValue(runContext) {
+  const emptySlots = Number.isFinite(runContext?.potion_slots?.empty)
+    ? runContext.potion_slots.empty
+    : null;
+  const totalSlots = Number.isFinite(runContext?.potion_slots?.total)
+    ? runContext.potion_slots.total
+    : null;
+  if (!Number.isFinite(totalSlots) || totalSlots <= 0) {
+    return "unknown";
+  }
+
+  if (!Number.isFinite(emptySlots) || emptySlots <= 0) {
+    return "none";
+  }
+
+  if (emptySlots >= 2) {
+    return "high";
+  }
+
+  return "medium";
+}
+
+function rateEliteViability(routeSummary, runContext) {
+  const steps = isPlainObject(routeSummary?.steps_from_current_to_next_point_type)
+    ? routeSummary.steps_from_current_to_next_point_type
+    : {};
+  const nextEliteSteps = Number.isFinite(steps.Elite) ? steps.Elite : null;
+  if (!Number.isFinite(nextEliteSteps)) {
+    return {
+      rating: "none",
+      score: null
+    };
+  }
+
+  let score = 0;
+  const hpBand = runContext?.hp?.band;
+  if (hpBand === "healthy") {
+    score += 2;
+  } else if (hpBand === "stable") {
+    score += 1;
+  } else if (hpBand === "wounded") {
+    score -= 1;
+  } else if (hpBand === "critical") {
+    score -= 2;
+  }
+
+  const filledPotionSlots = Number.isFinite(runContext?.potion_slots?.filled)
+    ? runContext.potion_slots.filled
+    : 0;
+  if (filledPotionSlots >= 1) {
+    score += 1;
+  }
+
+  const nonStarterRelicCount = Number.isFinite(runContext?.non_starter_relic_count)
+    ? runContext.non_starter_relic_count
+    : 0;
+  if (nonStarterRelicCount >= 3) {
+    score += 1;
+  }
+
+  if (nextEliteSteps >= 5) {
+    score += 1;
+  } else if (nextEliteSteps <= 2) {
+    score -= 1;
+  }
+
+  if (routeSummary?.can_reach_rest_site_before_elite === true) {
+    score += 1;
+  }
+
+  if (routeSummary?.can_reach_elite_then_rest_site === true) {
+    score += 1;
+  }
+
+  if (score >= 4) {
+    return { rating: "strong", score };
+  }
+
+  if (score >= 2) {
+    return { rating: "okay", score };
+  }
+
+  if (score >= 0) {
+    return { rating: "risky", score };
+  }
+
+  return { rating: "poor", score };
+}
+
+function buildMapRouteReasonTags(routeSummary, runContext, eliteViability) {
+  const steps = isPlainObject(routeSummary?.steps_from_current_to_next_point_type)
+    ? routeSummary.steps_from_current_to_next_point_type
+    : {};
+  const nextShopSteps = Number.isFinite(steps.Shop) ? steps.Shop : null;
+  const tags = [];
+
+  if (typeof runContext?.hp?.band === "string") {
+    tags.push(`hp_${runContext.hp.band}`);
+  }
+
+  if (typeof runContext?.gold_band === "string") {
+    tags.push(`gold_${runContext.gold_band}`);
+  }
+
+  if (typeof runContext?.potion_slots?.band === "string") {
+    tags.push(`potions_${runContext.potion_slots.band}`);
+  }
+
+  if (typeof eliteViability?.rating === "string" && eliteViability.rating !== "none") {
+    tags.push(`elite_${eliteViability.rating}`);
+  }
+
+  if (routeSummary?.can_reach_rest_site_before_elite === true) {
+    tags.push("elite_rest_before");
+  }
+
+  if (routeSummary?.can_reach_elite_then_rest_site === true) {
+    tags.push("elite_rest_after");
+  }
+
+  if (Number.isFinite(nextShopSteps)) {
+    tags.push(`shop_${Math.min(nextShopSteps, 6)}_steps`);
+  }
+
+  return tags.slice(0, 6);
 }
 
 function toCoordKey(coord) {
@@ -2790,6 +5087,78 @@ function toCoordKey(coord) {
   }
 
   return `${col},${row}`;
+}
+
+function extractMapCurrentCoord(state) {
+  if (!isPlainObject(state)) {
+    return null;
+  }
+
+  const run = isPlainObject(state.run) ? state.run : {};
+  const map = isPlainObject(state.map) ? state.map : {};
+  return isPlainObject(run.current_map_coord)
+    ? run.current_map_coord
+    : isPlainObject(map.current_coord)
+      ? map.current_coord
+      : null;
+}
+
+function extractTravelableMapKeysFromState(state) {
+  if (!isPlainObject(state?.map) || !Array.isArray(state.map.points)) {
+    return [];
+  }
+
+  return state.map.points
+    .filter(
+      (point) =>
+        isPlainObject(point) &&
+        isPlainObject(point.coord) &&
+        (point.is_travelable === true || point.state === "Travelable")
+    )
+    .map((point) => toCoordKey(point.coord))
+    .filter((key) => typeof key === "string")
+    .sort(compareCoordKeys);
+}
+
+function extractMapActionKeys(actionsPayload) {
+  if (!isPlainObject(actionsPayload) || !Array.isArray(actionsPayload.actions)) {
+    return [];
+  }
+
+  const keys = actionsPayload.actions
+    .filter(
+      (action) =>
+        isPlainObject(action) &&
+        typeof action.action_id === "string" &&
+        action.action_id.startsWith("map:") &&
+        !action.action_id.startsWith("automation:")
+    )
+    .map((action) => {
+      if (isPlainObject(action.coord)) {
+        return toCoordKey(action.coord);
+      }
+
+      return action.action_id.slice("map:".length);
+    })
+    .filter((key) => typeof key === "string" && parseCoordKey(key) !== null);
+
+  return [...new Set(keys)].sort(compareCoordKeys);
+}
+
+function areCoordKeySetsEqual(leftKeys, rightKeys) {
+  const left = Array.isArray(leftKeys) ? leftKeys : [];
+  const right = Array.isArray(rightKeys) ? rightKeys : [];
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function collectReachableMapKeys(frontier, pointByKey) {
@@ -2937,6 +5306,18 @@ function compareCoords(left, right) {
   const leftCol = Number.isFinite(left?.col) ? left.col : Number.POSITIVE_INFINITY;
   const rightCol = Number.isFinite(right?.col) ? right.col : Number.POSITIVE_INFINITY;
   return leftCol - rightCol;
+}
+
+function objectFromSortedMap(map) {
+  if (!(map instanceof Map) || map.size === 0) {
+    return {};
+  }
+
+  return Object.fromEntries(
+    Array.from(map.entries()).sort(([leftKey], [rightKey]) =>
+      String(leftKey).localeCompare(String(rightKey))
+    )
+  );
 }
 
 function isBridgeStatePayload(payload) {
@@ -3425,6 +5806,33 @@ function requireNonEmptyString(value, fieldName) {
   return value.trim();
 }
 
+function requireNonEmptyStringArray(value, fieldName) {
+  if (!Array.isArray(value) || value.length <= 0) {
+    throw new ToolPayloadError(
+      "invalid_arguments",
+      `${fieldName} must be a non-empty array of strings.`,
+      {
+        field: fieldName
+      }
+    );
+  }
+
+  return value.map((entry, index) => {
+    if (typeof entry !== "string" || entry.trim().length <= 0) {
+      throw new ToolPayloadError(
+        "invalid_arguments",
+        `${fieldName}[${index}] must be a non-empty string.`,
+        {
+          field: fieldName,
+          index
+        }
+      );
+    }
+
+    return entry.trim();
+  });
+}
+
 function optionalString(value, fieldName) {
   if (value === undefined || value === null) {
     return undefined;
@@ -3441,6 +5849,21 @@ function optionalString(value, fieldName) {
   }
 
   return value;
+}
+
+function normalizeMapRoutesDetail(value) {
+  const normalized = optionalString(value, "detail") ?? "summary";
+  if (normalized !== "summary" && normalized !== "full") {
+    throw new ToolPayloadError(
+      "invalid_arguments",
+      "detail must be either summary or full when provided.",
+      {
+        field: "detail"
+      }
+    );
+  }
+
+  return normalized;
 }
 
 function optionalBoolean(value, fieldName) {
@@ -3621,23 +6044,32 @@ function attachInteractionHints(payload) {
     return payload;
   }
 
-  const cardSelectionBundle = buildCardSelectionBundle(state);
-  if (!cardSelectionBundle.in_card_selection_flow) {
-    return payload;
+  const hints = {};
+  const playableCardActions = getPlayableCardActions(state);
+  if (playableCardActions.length >= 2) {
+    hints.play_card_sequence = {
+      play_card_action_count: playableCardActions.length,
+      recommended_tool: "sts2_play_card_sequence"
+    };
   }
 
-  return {
-    ...payload,
-    interaction_hints: {
-      card_selection: {
-        selected_count: cardSelectionBundle.card_selection.selected_count,
-        min_select: cardSelectionBundle.card_selection.min_select,
-        max_select: cardSelectionBundle.card_selection.max_select,
-        option_count: cardSelectionBundle.card_selection.options.length,
-        recommended_tool: "sts2_resolve_card_selection"
+  const cardSelectionBundle = buildCardSelectionBundle(state);
+  if (cardSelectionBundle.in_card_selection_flow) {
+    hints.card_selection = {
+      selected_count: cardSelectionBundle.card_selection.selected_count,
+      min_select: cardSelectionBundle.card_selection.min_select,
+      max_select: cardSelectionBundle.card_selection.max_select,
+      option_count: cardSelectionBundle.card_selection.options.length,
+      recommended_tool: "sts2_resolve_card_selection"
+    };
+  }
+
+  return Object.keys(hints).length > 0
+    ? {
+        ...payload,
+        interaction_hints: hints
       }
-    }
-  };
+    : payload;
 }
 
 function asToolResult(payload, isError) {

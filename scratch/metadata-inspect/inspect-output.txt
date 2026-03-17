@@ -1,1 +1,0 @@
-E:\game\project\sts2_mcp\scratch\metadata-inspect\Program.cs(4,1): error CS8802: 只有一个编译单元可具有顶级语句。 [E:\game\project\sts2_mcp\scratch\metadata-inspect\metadata-inspect.csproj]
