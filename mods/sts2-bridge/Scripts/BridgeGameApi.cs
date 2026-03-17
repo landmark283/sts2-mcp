@@ -16,6 +16,8 @@ using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Entities.RestSite;
 using MegaCrit.Sts2.Core.Events;
 using MegaCrit.Sts2.Core.GameActions;
+using MegaCrit.Sts2.Core.Localization;
+using MegaCrit.Sts2.Core.Localization.DynamicVars;
 using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.MonsterMoves.Intents;
@@ -34,6 +36,8 @@ using MegaCrit.Sts2.Core.Nodes.Screens.CharacterSelect;
 using MegaCrit.Sts2.Core.Nodes.Screens.CardSelection;
 using MegaCrit.Sts2.Core.Nodes.Screens.Map;
 using MegaCrit.Sts2.Core.Nodes.Screens.Shops;
+using MegaCrit.Sts2.Core.Nodes.Screens.TreasureRoomRelic;
+using MegaCrit.Sts2.Core.Nodes.TreasureRooms;
 using MegaCrit.Sts2.Core.Rewards;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
@@ -81,6 +85,10 @@ internal sealed class BridgeRequestException : Exception
 
 internal static class BridgeGameApi
 {
+    private const int PostActionSnapshotPumpTicks = 4;
+    private const int PostActionStablePollIntervalMs = 200;
+    private const int PostActionStableTimeoutMs = 5000;
+
     private static readonly JsonSerializerOptions HashJsonOptions = new()
     {
         WriteIndented = false
@@ -176,12 +184,10 @@ internal static class BridgeGameApi
         });
 
         var waitAfterMs = Math.Clamp(request.WaitAfterMs ?? 0, 0, 5000);
-        if (waitAfterMs > 0)
-        {
-            await Task.Delay(waitAfterMs, cancellationToken);
-        }
+        await WaitForSnapshotBarrierAsync(waitAfterMs, cancellationToken);
 
         var after = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
+        after = await MaybeWaitForStablePostActionSnapshotAsync(actionId, after, cancellationToken);
         var autoExecutedActions = new List<object>();
 
         if (IsRewardResolutionAction(actionId))
@@ -210,6 +216,176 @@ internal static class BridgeGameApi
             actions = after.ActionPayloads,
             state = after.StatePayload
         };
+    }
+
+    private static async Task WaitForSnapshotBarrierAsync(int waitAfterMs, CancellationToken cancellationToken)
+    {
+        if (waitAfterMs > 0)
+        {
+            await Task.Delay(waitAfterMs, cancellationToken);
+        }
+
+        await BridgeCoordinator.WaitForPumpTicksAsync(PostActionSnapshotPumpTicks, cancellationToken);
+    }
+
+    private static async Task<BridgeSnapshot> MaybeWaitForStablePostActionSnapshotAsync(
+        string actionId,
+        BridgeSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        if (!ShouldWaitForStablePostActionSnapshot(actionId) ||
+            IsStablePostActionSnapshot(actionId, snapshot))
+        {
+            return snapshot;
+        }
+
+        var startedAt = DateTime.UtcNow;
+        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < PostActionStableTimeoutMs)
+        {
+            await Task.Delay(PostActionStablePollIntervalMs, cancellationToken);
+            await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
+            snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
+
+            if (IsStablePostActionSnapshot(actionId, snapshot))
+            {
+                return snapshot;
+            }
+        }
+
+        return snapshot;
+    }
+
+    private static bool ShouldWaitForStablePostActionSnapshot(string actionId)
+    {
+        return actionId.Equals("main_menu:continue", StringComparison.Ordinal) ||
+               actionId.Equals("proceed", StringComparison.Ordinal) ||
+               actionId.StartsWith("map:", StringComparison.Ordinal) ||
+               actionId.StartsWith("treasure:", StringComparison.Ordinal) ||
+               actionId.StartsWith("treasure_relic:", StringComparison.Ordinal) ||
+               actionId.StartsWith("reward:", StringComparison.Ordinal) ||
+               actionId.StartsWith("card_reward:", StringComparison.Ordinal) ||
+               actionId.StartsWith("rest_site:", StringComparison.Ordinal) ||
+               actionId.StartsWith("deck_upgrade:", StringComparison.Ordinal);
+    }
+
+    private static bool IsStablePostActionSnapshot(string actionId, BridgeSnapshot snapshot)
+    {
+        if (snapshot.Fields.Screen.Equals("MAIN_MENU", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (snapshot.Fields.Screen.Equals("COMBAT", StringComparison.Ordinal))
+        {
+            return IsStableCombatTransitionSnapshot(actionId, snapshot);
+        }
+
+        if (IsBooleanPropertyTrue(snapshot.Fields.CardSelection, "visible") ||
+            IsBooleanPropertyTrue(snapshot.Fields.CardRewardSelection, "visible"))
+        {
+            return true;
+        }
+
+        if (IsBooleanPropertyTrue(snapshot.Fields.Rewards, "visible") ||
+            IsBooleanPropertyTrue(snapshot.Fields.Rewards, "terminal_proceed_visible"))
+        {
+            return true;
+        }
+
+        if (IsBooleanPropertyTrue(snapshot.Fields.RestSite, "visible") ||
+            IsBooleanPropertyTrue(snapshot.Fields.RestSite, "proceed_visible") ||
+            IsBooleanPropertyTrue(snapshot.Fields.DeckUpgradeSelection, "visible"))
+        {
+            return true;
+        }
+
+        if (IsBooleanPropertyTrue(snapshot.Fields.EventOptions, "visible"))
+        {
+            return true;
+        }
+
+        if (IsBooleanPropertyTrue(snapshot.Fields.Shop, "visible") ||
+            IsBooleanPropertyTrue(snapshot.Fields.Shop, "is_open"))
+        {
+            return true;
+        }
+
+        if (snapshot.Actions.Any(action =>
+                action.ActionId.StartsWith("treasure:", StringComparison.Ordinal) ||
+                action.ActionId.StartsWith("treasure_relic:", StringComparison.Ordinal)))
+        {
+            return true;
+        }
+
+        if (IsBooleanPropertyTrue(snapshot.Fields.Map, "is_open") ||
+            snapshot.Actions.Any(action => action.ActionId.StartsWith("map:", StringComparison.Ordinal)))
+        {
+            return true;
+        }
+
+        return snapshot.Actions.Count(action => !action.ActionId.StartsWith("automation:", StringComparison.Ordinal)) == 1 &&
+               snapshot.ActionLookup.ContainsKey("proceed");
+    }
+
+    private static bool IsStableCombatTransitionSnapshot(string actionId, BridgeSnapshot snapshot)
+    {
+        if (!ShouldRequireCombatTurnReady(actionId) ||
+            !IsBooleanPropertyTrue(snapshot.Fields.Combat, "in_progress") ||
+            !IsBooleanPropertyTrue(snapshot.Fields.Combat, "is_play_phase") ||
+            IsBooleanPropertyTrue(snapshot.Fields.Combat, "player_actions_disabled"))
+        {
+            return false;
+        }
+
+        var currentSide = GetHiddenPropertyObjectValue(snapshot.Fields.Combat, "current_side")?.ToString();
+        if (!string.Equals(currentSide, "Player", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var handCount = GetFirstPlayerCombatPileCount(snapshot, "hand");
+        var drawCount = GetFirstPlayerCombatPileCount(snapshot, "draw_pile");
+        var discardCount = GetFirstPlayerCombatPileCount(snapshot, "discard_pile");
+        var totalDrawableCount =
+            handCount.HasValue && drawCount.HasValue && discardCount.HasValue
+                ? handCount.Value + drawCount.Value + discardCount.Value
+                : (int?)null;
+        var targetHandCount = totalDrawableCount.HasValue
+            ? Math.Min(5, totalDrawableCount.Value)
+            : (int?)null;
+        var nonAutomationActions = snapshot.Actions
+            .Where(action => !action.ActionId.StartsWith("automation:", StringComparison.Ordinal))
+            .ToArray();
+        var hasMeaningfulCombatAction = nonAutomationActions.Any(action => action.ActionId != "end_turn");
+
+        return handCount.HasValue &&
+               targetHandCount.HasValue &&
+               handCount.Value >= targetHandCount.Value &&
+               (hasMeaningfulCombatAction || nonAutomationActions.Length > 0);
+    }
+
+    private static bool ShouldRequireCombatTurnReady(string actionId)
+    {
+        return actionId.Equals("main_menu:continue", StringComparison.Ordinal) ||
+               actionId.Equals("proceed", StringComparison.Ordinal) ||
+               actionId.StartsWith("map:", StringComparison.Ordinal);
+    }
+
+    private static bool IsBooleanPropertyTrue(object? target, string propertyName)
+    {
+        return GetHiddenPropertyValue<bool>(target, propertyName) ?? false;
+    }
+
+    private static int? GetFirstPlayerCombatPileCount(BridgeSnapshot snapshot, string pilePropertyName)
+    {
+        if (snapshot.Fields.Players.Length == 0)
+        {
+            return null;
+        }
+
+        var playerCombat = GetHiddenPropertyObjectValue(snapshot.Fields.Players[0], "combat");
+        var pile = GetHiddenPropertyObjectValue(playerCombat, pilePropertyName);
+        return GetHiddenPropertyValue<int>(pile, "count");
     }
 
     private static BridgeSnapshot CaptureSnapshot()
@@ -267,6 +443,16 @@ internal static class BridgeGameApi
         var merchantButton = merchantRoom?.MerchantButton;
         var merchantProceedButton = merchantRoom?.ProceedButton;
         var merchantBackButton = GetHiddenFieldValue(merchantInventory, "_backButton") as NBackButton;
+        var treasureRoom = FindFirstVisibleDescendant<NTreasureRoom>(game);
+        var treasureChestButton = ResolveFirstVisibleNode(
+            GetHiddenFieldValue(treasureRoom, "_chestButton") as NTreasureButton,
+            FindFirstVisibleDescendant<NTreasureButton>(treasureRoom));
+        var treasureRelicCollection = ResolveFirstVisibleNode(
+            GetHiddenFieldValue(treasureRoom, "_relicCollection") as NTreasureRoomRelicCollection,
+            FindFirstVisibleDescendant<NTreasureRoomRelicCollection>(treasureRoom));
+        var treasureRelicOptions = treasureRelicCollection is null
+            ? new List<NTreasureRoomRelicHolder>()
+            : SortByVisualPosition(FindVisibleDescendants<NTreasureRoomRelicHolder>(treasureRelicCollection));
         var proceedButton = ResolveVisibleProceedButton(
             game,
             combatRoom?.ProceedButton,
@@ -315,6 +501,10 @@ internal static class BridgeGameApi
         var cardSelectionCancelButton = GetHiddenFieldValue(cardSelectionScreen, "_previewCancelButton") as Node;
         var cardSelectionCloseButton = GetHiddenFieldValue(cardSelectionScreen, "_closeButton") as Node;
         var cardSelectionSkipButton = GetHiddenFieldValue(cardSelectionScreen, "_skipButton") as Node;
+        var eventRoom = FindFirstVisibleDescendant<NEventRoom>(game);
+        var hoverTipSet = FindFirstVisibleDescendant(
+            game,
+            static node => IsTypeFullName(node, "MegaCrit.Sts2.Core.Nodes.HoverTips.NHoverTipSet"));
         var eventOptionButtons = SortByVisualPosition(FindVisibleDescendants<NEventOptionButton>(game))
             .Where(static button => button.Option is not null)
             .ToList();
@@ -363,6 +553,7 @@ internal static class BridgeGameApi
                 merchantRoom,
                 merchantInventory,
                 rewardsScreen,
+                proceedButton,
                 rewardProceedButton,
                 rewardButtons,
                 cardRewardScreen,
@@ -382,6 +573,9 @@ internal static class BridgeGameApi
             RestSiteRoom = restSiteRoom,
             MerchantRoom = merchantRoom,
             MerchantInventory = merchantInventory,
+            TreasureRoom = treasureRoom,
+            TreasureChestButton = treasureChestButton,
+            TreasureRelicCollection = treasureRelicCollection,
             RewardsScreen = rewardsScreen,
             RewardProceedButton = rewardProceedButton,
             CardRewardScreen = cardRewardScreen,
@@ -400,9 +594,12 @@ internal static class BridgeGameApi
             DeckUpgradeOptions = deckUpgradeOptions,
             CharacterButtons = characterButtons,
             EventOptionButtons = eventOptionButtons,
+            EventRoom = eventRoom,
+            HoverTipSet = hoverTipSet,
             MapPoints = mapPoints,
             RestSiteButtons = restSiteButtons,
             MerchantSlots = merchantSlots,
+            TreasureRelicOptions = treasureRelicOptions,
             MainMenuRoot = mainMenuRoot,
             MainMenuContinueButton = mainMenuContinueButton,
             MainMenuTextButtons = mainMenuTextButtons,
@@ -435,6 +632,7 @@ internal static class BridgeGameApi
             Players = BuildPlayersPayload(context.RunState, context.CombatManager, context.CombatState),
             Rewards = BuildRewardsPayload(
                 context.RewardsScreen,
+                context.ProceedButton,
                 context.RewardProceedButton,
                 context.MapScreen,
                 context.RewardButtons),
@@ -457,7 +655,11 @@ internal static class BridgeGameApi
                 context.RunModeDailyButton,
                 context.RunModeCustomButton,
                 context.RunModeBackButton),
-            EventOptions = BuildEventOptionsPayload(context.EventOptionButtons, context.MapScreen),
+            EventOptions = BuildEventOptionsPayload(
+                context.EventOptionButtons,
+                context.MapScreen,
+                context.EventRoom,
+                context.HoverTipSet),
             Map = BuildMapPayload(context.RunState, context.MapScreen, context.MapPoints),
             RestSite = BuildRestSitePayload(
                 context.MapScreen,
@@ -568,6 +770,7 @@ internal static class BridgeGameApi
         AddCardSelectionActions(actions, context);
         AddRestSiteActions(actions, context);
         AddShopActions(actions, context);
+        AddTreasureRoomActions(actions, context);
 
         for (var index = 0; index < context.CharacterButtons.Count; index++)
         {
@@ -666,7 +869,8 @@ internal static class BridgeGameApi
         }
         else if (context.MapScreen?.IsOpen != true &&
                  context.ProceedButton is not null &&
-                 IsNodeVisible(context.ProceedButton))
+                 IsNodeVisible(context.ProceedButton) &&
+                 !ShouldSuppressGenericRoomProceed(context))
         {
             var label = context.ProceedButton.IsSkip ? "Skip" : "Proceed";
             actions.Add(new BridgeResolvedAction
@@ -802,6 +1006,56 @@ internal static class BridgeGameApi
         }
 
         return actions;
+    }
+
+    private static void AddTreasureRoomActions(List<BridgeResolvedAction> actions, BridgeWorldContext context)
+    {
+        if (context.TreasureRoom is null || !IsNodeVisible(context.TreasureRoom))
+        {
+            return;
+        }
+
+        if (CanOpenTreasureChest(context))
+        {
+            var chestButton = context.TreasureChestButton!;
+            actions.Add(new BridgeResolvedAction
+            {
+                ActionId = "treasure:open",
+                Payload = new
+                {
+                    action_id = "treasure:open",
+                    kind = "treasure",
+                    label = "Open treasure chest",
+                    screen = context.Screen
+                },
+                Execute = () => InvokeTreasureChestAction(context.TreasureRoom, chestButton)
+            });
+        }
+
+        for (var index = 0; index < context.TreasureRelicOptions.Count; index++)
+        {
+            var holder = context.TreasureRelicOptions[index];
+            if (!IsNodeVisible(holder))
+            {
+                continue;
+            }
+
+            var actionId = $"treasure_relic:{index}";
+            actions.Add(new BridgeResolvedAction
+            {
+                ActionId = actionId,
+                Payload = new
+                {
+                    action_id = actionId,
+                    kind = "treasure_relic",
+                    index,
+                    label = $"Pick treasure relic {index}: {TextOf(holder.Relic?.Model?.Title)}",
+                    relic = BuildRelicPayload(holder.Relic?.Model),
+                    screen = context.Screen
+                },
+                Execute = () => InvokeTreasureRelicAction(context.TreasureRelicCollection, holder)
+            });
+        }
     }
 
     private static void AddRunModeActions(List<BridgeResolvedAction> actions, BridgeWorldContext context)
@@ -1454,8 +1708,9 @@ internal static class BridgeGameApi
 
                     var targetLabel = string.IsNullOrEmpty(resolvedTarget.LabelSuffix)
                         ? string.Empty
-                        : $" -> {resolvedTarget.LabelSuffix}";
+                        : $" -> {BuildResolvedTargetLabel(resolvedTarget.ActionSuffix, resolvedTarget.Target)}";
                     var cardTitle = TextOf(card.Title);
+                    var targetMapping = BuildResolvedTargetMapping(resolvedTarget.ActionSuffix, resolvedTarget.Target);
 
                     actions.Add(new BridgeResolvedAction
                     {
@@ -1468,8 +1723,13 @@ internal static class BridgeGameApi
                             player_index = playerIndex,
                             player_net_id = player.NetId,
                             hand_index = handIndex,
-                            card = BuildCardPayload(card),
+                            card = BuildCardPayload(card, resolvedTarget.Target),
                             target = resolvedTarget.Target is null ? null : BuildCreaturePayload(resolvedTarget.Target),
+                            target_action_suffix = resolvedTarget.ActionSuffix,
+                            target_combat_id = resolvedTarget.Target?.CombatId,
+                            target_name = resolvedTarget.Target?.Name,
+                            target_side = resolvedTarget.Target?.Side.ToString(),
+                            target_mapping = targetMapping,
                             target_scope = card.TargetType.ToString(),
                             requires_target_selection = resolvedTarget.RequiresTargetSelection,
                             screen = context.Screen
@@ -1515,8 +1775,9 @@ internal static class BridgeGameApi
 
                     var targetLabel = string.IsNullOrEmpty(resolvedTarget.LabelSuffix)
                         ? string.Empty
-                        : $" -> {resolvedTarget.LabelSuffix}";
+                        : $" -> {BuildResolvedTargetLabel(resolvedTarget.ActionSuffix, resolvedTarget.Target)}";
                     var potionTitle = TextOf(potion.Title);
+                    var targetMapping = BuildResolvedTargetMapping(resolvedTarget.ActionSuffix, resolvedTarget.Target);
 
                     actions.Add(new BridgeResolvedAction
                     {
@@ -1531,6 +1792,11 @@ internal static class BridgeGameApi
                             slot_index = slotIndex,
                             potion = BuildPotionPayload(potion),
                             target = resolvedTarget.Target is null ? null : BuildCreaturePayload(resolvedTarget.Target),
+                            target_action_suffix = resolvedTarget.ActionSuffix,
+                            target_combat_id = resolvedTarget.Target?.CombatId,
+                            target_name = resolvedTarget.Target?.Name,
+                            target_side = resolvedTarget.Target?.Side.ToString(),
+                            target_mapping = targetMapping,
                             target_scope = potion.TargetType.ToString(),
                             requires_target_selection = resolvedTarget.RequiresTargetSelection,
                             screen = context.Screen
@@ -2065,7 +2331,37 @@ internal static class BridgeGameApi
 
     private static string DescribeCreatureTarget(Creature creature)
     {
-        return $"{creature.Name}#{creature.CombatId}";
+        return $"{creature.Name} (combat_id {creature.CombatId})";
+    }
+
+    private static string BuildResolvedTargetLabel(string? actionSuffix, Creature? target)
+    {
+        if (target is null)
+        {
+            return string.IsNullOrWhiteSpace(actionSuffix) ? string.Empty : actionSuffix;
+        }
+
+        var prefix = string.IsNullOrWhiteSpace(actionSuffix)
+            ? string.Empty
+            : $"{actionSuffix} = ";
+        return $"{prefix}{DescribeCreatureTarget(target)}";
+    }
+
+    private static object? BuildResolvedTargetMapping(string? actionSuffix, Creature? target)
+    {
+        if (string.IsNullOrWhiteSpace(actionSuffix) && target is null)
+        {
+            return null;
+        }
+
+        return new
+        {
+            action_suffix = actionSuffix,
+            combat_id = target?.CombatId,
+            name = target?.Name,
+            side = target?.Side.ToString(),
+            label = BuildResolvedTargetLabel(actionSuffix, target)
+        };
     }
 
     private static object BuildRunPayload(RunState? runState)
@@ -2122,12 +2418,45 @@ internal static class BridgeGameApi
             player_actions_disabled = combatManager.PlayerActionsDisabled,
             round_number = combatState.RoundNumber,
             current_side = combatState.CurrentSide.ToString(),
+            target_index_map = BuildCombatTargetIndexPayload(combatState),
             player_creatures = combatState.PlayerCreatures.Select(BuildCreaturePayload).ToArray(),
             enemy_creatures = combatState.Creatures
                 .Where(static creature => creature.IsEnemy)
                 .Select(BuildCreaturePayload)
                 .ToArray()
         };
+    }
+
+    private static object[] BuildCombatTargetIndexPayload(CombatState combatState)
+    {
+        var canUseSelfAlias = combatState.PlayerCreatures.Count == 1;
+
+        return combatState.Creatures
+            .Select(creature => new
+            {
+                action_suffixes = BuildCombatTargetActionSuffixes(creature, canUseSelfAlias),
+                combat_id = creature.CombatId,
+                name = creature.Name,
+                side = creature.Side.ToString(),
+                is_enemy = creature.IsEnemy,
+                is_alive = creature.IsAlive,
+                is_hittable = creature.IsHittable
+            })
+            .Cast<object>()
+            .ToArray();
+    }
+
+    private static string[] BuildCombatTargetActionSuffixes(Creature creature, bool canUseSelfAlias)
+    {
+        var suffixes = new List<string>();
+
+        if (!creature.IsEnemy && canUseSelfAlias)
+        {
+            suffixes.Add("self");
+        }
+
+        suffixes.Add(creature.CombatId.ToString() ?? string.Empty);
+        return suffixes.ToArray();
     }
 
     private static object[] BuildPlayersPayload(
@@ -2204,11 +2533,11 @@ internal static class BridgeGameApi
             pile_type = pile.Type.ToString(),
             is_combat_pile = pile.IsCombatPile,
             count = pile.Cards.Count,
-            cards = pile.Cards.Select(BuildCardPayload).ToArray()
+            cards = pile.Cards.Select(card => BuildCardPayload(card)).ToArray()
         };
     }
 
-    private static object BuildCardPayload(CardModel? card)
+    private static object BuildCardPayload(CardModel? card, Creature? previewTarget = null)
     {
         if (card is null)
         {
@@ -2218,11 +2547,60 @@ internal static class BridgeGameApi
             };
         }
 
+        var resolvedTarget = previewTarget ?? card.CurrentTarget;
+        var previewVars = BuildCardPreviewVarSet(card, resolvedTarget);
+        var damagePerHit = GetDynamicVarInt(previewVars, "Damage");
+        var totalDamage = GetDynamicVarInt(previewVars, "CalculatedDamage") ?? damagePerHit;
+        var repeats = GetDynamicVarInt(previewVars, "Repeat");
+        if (totalDamage is null && damagePerHit.HasValue && repeats.GetValueOrDefault(1) > 1)
+        {
+            totalDamage = damagePerHit.Value * repeats!.Value;
+        }
+
+        var totalBlock = GetDynamicVarInt(previewVars, "CalculatedBlock") ?? GetDynamicVarInt(previewVars, "Block");
+        var drawCount = GetDynamicVarInt(previewVars, "Cards");
+        var healAmount = GetDynamicVarInt(previewVars, "Heal");
+        var hpLossAmount = GetDynamicVarInt(previewVars, "HpLoss");
+        var weakAmount = GetDynamicVarInt(previewVars, "Weak");
+        var vulnerableAmount = GetDynamicVarInt(previewVars, "Vulnerable");
+        var poisonAmount = GetDynamicVarInt(previewVars, "Poison");
+        var strengthAmount = GetDynamicVarInt(previewVars, "Strength");
+        var dexterityAmount = GetDynamicVarInt(previewVars, "Dexterity");
+        var summonCount = GetDynamicVarInt(previewVars, "Summon");
+        var extraDamage = GetDynamicVarInt(previewVars, "ExtraDamage");
+        var description = GetCardDescription(card, resolvedTarget);
+        var xCostValue = card.EnergyCost.CostsX ? SafeResolveCardEnergyXValue(card) : null;
+        var xCostSemantics = ResolveXCostSemantics(card, description, damagePerHit, totalDamage, repeats, xCostValue);
+        (damagePerHit, totalDamage, repeats) = ApplyXCostPreviewMapping(
+            damagePerHit,
+            totalDamage,
+            repeats,
+            xCostValue,
+            xCostSemantics);
+        var effectSummary = BuildCardEffectSummary(
+            totalDamage,
+            damagePerHit,
+            repeats,
+            totalBlock,
+            drawCount,
+            healAmount,
+            hpLossAmount,
+            weakAmount,
+            vulnerableAmount,
+            poisonAmount,
+            strengthAmount,
+            dexterityAmount,
+            summonCount,
+            extraDamage,
+            xCostValue);
+
         return new
         {
             id = card.Id.ToString(),
-            title = card.Title,
-            description = TextOf(card.Description),
+            title = string.IsNullOrWhiteSpace(card.Title)
+                ? DescribeText(card.TitleLocString, card)
+                : DescribeText(card.Title, card),
+            description,
             type = card.Type.ToString(),
             rarity = card.Rarity.ToString(),
             target_type = card.TargetType.ToString(),
@@ -2233,8 +2611,305 @@ internal static class BridgeGameApi
             costs_x = card.EnergyCost.CostsX,
             canonical_star_cost = card.CanonicalStarCost,
             current_star_cost = card.CurrentStarCost,
-            has_star_cost_x = card.HasStarCostX
+            has_star_cost_x = card.HasStarCostX,
+            effect_preview = new
+            {
+                summary = effectSummary,
+                preview_target_combat_id = resolvedTarget?.CombatId,
+                total_damage = totalDamage,
+                damage_per_hit = damagePerHit,
+                hits = repeats,
+                total_block = totalBlock,
+                draw = drawCount,
+                heal = healAmount,
+                hp_loss = hpLossAmount,
+                weak = weakAmount,
+                vulnerable = vulnerableAmount,
+                poison = poisonAmount,
+                strength = strengthAmount,
+                dexterity = dexterityAmount,
+                summon = summonCount,
+                extra_damage = extraDamage,
+                x_cost_value = xCostValue,
+                x_cost_semantics = xCostSemantics
+            },
+            dynamic_vars = BuildDynamicVarPayloads(previewVars)
         };
+    }
+
+    private static string GetCardDescription(CardModel card, Creature? previewTarget)
+    {
+        try
+        {
+            var pileType = card.Pile?.Type ?? (card.IsInCombat ? PileType.Hand : PileType.Deck);
+            var description = card.GetDescriptionForPile(pileType, previewTarget!);
+            if (!string.IsNullOrWhiteSpace(description))
+            {
+                return DescribeText(description, card);
+            }
+        }
+        catch
+        {
+        }
+
+        return DescribeText(card.Description, card);
+    }
+
+    private static DynamicVarSet? BuildCardPreviewVarSet(CardModel card, Creature? previewTarget)
+    {
+        try
+        {
+            var dynamicVars = card.DynamicVars;
+            var previewVars = dynamicVars?.Clone(card);
+            if (previewVars is null)
+            {
+                return null;
+            }
+
+            previewVars.ClearPreview();
+            card.UpdateDynamicVarPreview(ResolveCardPreviewMode(card), previewTarget!, previewVars);
+            return previewVars;
+        }
+        catch
+        {
+            return card.DynamicVars;
+        }
+    }
+
+    private static CardPreviewMode ResolveCardPreviewMode(CardModel card)
+    {
+        return card.TargetType == TargetType.AllEnemies
+            ? CardPreviewMode.MultiCreatureTargeting
+            : CardPreviewMode.Normal;
+    }
+
+    private static int? SafeResolveCardEnergyXValue(CardModel card)
+    {
+        var currentEnergy = card.Owner?.PlayerCombatState?.Energy;
+
+        try
+        {
+            var resolvedXValue = card.ResolveEnergyXValue();
+            if (currentEnergy.HasValue)
+            {
+                return Math.Max(resolvedXValue, currentEnergy.Value);
+            }
+
+            return resolvedXValue;
+        }
+        catch
+        {
+            return currentEnergy;
+        }
+    }
+
+    private static string? ResolveXCostSemantics(
+        CardModel card,
+        string description,
+        int? damagePerHit,
+        int? totalDamage,
+        int? repeats,
+        int? xCostValue)
+    {
+        if (!card.EnergyCost.CostsX || !xCostValue.HasValue || xCostValue.Value <= 0)
+        {
+            return null;
+        }
+
+        var normalizedDescription = NormalizeComparableText(description).ToLowerInvariant();
+        var looksLikeRepeatPerEnergyText =
+            normalizedDescription.Contains("x次", StringComparison.Ordinal) ||
+            normalizedDescription.Contains("x times", StringComparison.Ordinal) ||
+            normalizedDescription.Contains("times equal to x", StringComparison.Ordinal);
+
+        if (looksLikeRepeatPerEnergyText &&
+            (damagePerHit.HasValue || totalDamage.HasValue))
+        {
+            return "repeat_per_energy";
+        }
+
+        if (card.Type == CardType.Attack &&
+            xCostValue.Value > 1 &&
+            repeats.GetValueOrDefault(1) <= 1 &&
+            (damagePerHit.HasValue || totalDamage.HasValue))
+        {
+            return "repeat_per_energy";
+        }
+
+        return null;
+    }
+
+    private static (int? DamagePerHit, int? TotalDamage, int? Repeats) ApplyXCostPreviewMapping(
+        int? damagePerHit,
+        int? totalDamage,
+        int? repeats,
+        int? xCostValue,
+        string? xCostSemantics)
+    {
+        if (!string.Equals(xCostSemantics, "repeat_per_energy", StringComparison.Ordinal) ||
+            !xCostValue.HasValue ||
+            xCostValue.Value <= 0)
+        {
+            return (damagePerHit, totalDamage, repeats);
+        }
+
+        var mappedDamagePerHit = damagePerHit ?? totalDamage;
+        var mappedRepeats = xCostValue.Value;
+        var mappedTotalDamage = mappedDamagePerHit.HasValue
+            ? mappedDamagePerHit.Value * mappedRepeats
+            : totalDamage;
+
+        return (mappedDamagePerHit, mappedTotalDamage, mappedRepeats);
+    }
+
+    private static object[] BuildDynamicVarPayloads(DynamicVarSet? dynamicVarSet)
+    {
+        return dynamicVarSet?.Values
+            .Select(BuildDynamicVarPayload)
+            .Where(static payload => payload is not null)
+            .Cast<object>()
+            .ToArray()
+            ?? Array.Empty<object>();
+    }
+
+    private static object? BuildDynamicVarPayload(DynamicVar? dynamicVar)
+    {
+        if (dynamicVar is null)
+        {
+            return null;
+        }
+
+        return new
+        {
+            name = dynamicVar.Name,
+            int_value = dynamicVar.IntValue,
+            preview_value = dynamicVar.PreviewValue,
+            base_value = dynamicVar.BaseValue,
+            enchanted_value = dynamicVar.EnchantedValue,
+            was_just_upgraded = dynamicVar.WasJustUpgraded
+        };
+    }
+
+    private static int? GetDynamicVarInt(DynamicVarSet? dynamicVarSet, string key)
+    {
+        if (dynamicVarSet is null || string.IsNullOrWhiteSpace(key))
+        {
+            return null;
+        }
+
+        try
+        {
+            return dynamicVarSet.TryGetValue(key, out var dynamicVar)
+                ? GetDynamicVarInt(dynamicVar)
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static int? GetDynamicVarInt(DynamicVar? dynamicVar)
+    {
+        if (dynamicVar is null)
+        {
+            return null;
+        }
+
+        return decimal.Truncate(dynamicVar.PreviewValue) != 0m
+            ? (int)decimal.Truncate(dynamicVar.PreviewValue)
+            : dynamicVar.IntValue;
+    }
+
+    private static string BuildCardEffectSummary(
+        int? totalDamage,
+        int? damagePerHit,
+        int? repeats,
+        int? totalBlock,
+        int? drawCount,
+        int? healAmount,
+        int? hpLossAmount,
+        int? weakAmount,
+        int? vulnerableAmount,
+        int? poisonAmount,
+        int? strengthAmount,
+        int? dexterityAmount,
+        int? summonCount,
+        int? extraDamage,
+        int? xCostValue)
+    {
+        var parts = new List<string>();
+
+        if (damagePerHit.HasValue && repeats.GetValueOrDefault(1) > 1)
+        {
+            parts.Add($"{damagePerHit.Value} x {repeats!.Value} damage");
+        }
+        else if (totalDamage.HasValue && totalDamage.Value != 0)
+        {
+            parts.Add($"{totalDamage.Value} damage");
+        }
+
+        if (totalBlock.HasValue && totalBlock.Value != 0)
+        {
+            parts.Add($"{totalBlock.Value} block");
+        }
+
+        if (drawCount.HasValue && drawCount.Value != 0)
+        {
+            parts.Add($"draw {drawCount.Value}");
+        }
+
+        if (healAmount.HasValue && healAmount.Value != 0)
+        {
+            parts.Add($"heal {healAmount.Value}");
+        }
+
+        if (hpLossAmount.HasValue && hpLossAmount.Value != 0)
+        {
+            parts.Add($"lose {hpLossAmount.Value} HP");
+        }
+
+        if (weakAmount.HasValue && weakAmount.Value != 0)
+        {
+            parts.Add($"apply {weakAmount.Value} Weak");
+        }
+
+        if (vulnerableAmount.HasValue && vulnerableAmount.Value != 0)
+        {
+            parts.Add($"apply {vulnerableAmount.Value} Vulnerable");
+        }
+
+        if (poisonAmount.HasValue && poisonAmount.Value != 0)
+        {
+            parts.Add($"apply {poisonAmount.Value} Poison");
+        }
+
+        if (strengthAmount.HasValue && strengthAmount.Value != 0)
+        {
+            parts.Add($"gain {strengthAmount.Value} Strength");
+        }
+
+        if (dexterityAmount.HasValue && dexterityAmount.Value != 0)
+        {
+            parts.Add($"gain {dexterityAmount.Value} Dexterity");
+        }
+
+        if (summonCount.HasValue && summonCount.Value != 0)
+        {
+            parts.Add($"summon {summonCount.Value}");
+        }
+
+        if (extraDamage.HasValue && extraDamage.Value != 0)
+        {
+            parts.Add($"{extraDamage.Value} extra damage");
+        }
+
+        if (xCostValue.HasValue && xCostValue.Value != 0)
+        {
+            parts.Add($"X={xCostValue.Value}");
+        }
+
+        return string.Join(" + ", parts);
     }
 
     private static object BuildCreaturePayload(Creature? creature)
@@ -2301,6 +2976,11 @@ internal static class BridgeGameApi
 
     private static IReadOnlyList<AbstractIntent> SafeGetMonsterIntents(MonsterModel monster, MoveState? nextMove)
     {
+        if (nextMove?.Intents is { Count: > 0 } nextMoveIntents)
+        {
+            return nextMoveIntents.ToArray();
+        }
+
         try
         {
             var method = FindMethod(monster.GetType(), "GetIntents", 0);
@@ -2358,7 +3038,7 @@ internal static class BridgeGameApi
 
     private static string GetMonsterIntentTitle(AbstractIntent intent)
     {
-        return TextOf(GetHiddenPropertyObjectValue(intent, "IntentTitle"));
+        return DescribeText(GetHiddenPropertyObjectValue(intent, "IntentTitle"), intent);
     }
 
     private static int? SafeGetIntentTotalDamage(object intent, IEnumerable<Creature> targets, Creature owner)
@@ -2387,7 +3067,7 @@ internal static class BridgeGameApi
         try
         {
             var method = FindMethod(intent.GetType(), methodName, 2);
-            return TextOf(method?.Invoke(intent, new object?[] { targets, owner }));
+            return DescribeText(method?.Invoke(intent, new object?[] { targets, owner }), intent);
         }
         catch
         {
@@ -2400,7 +3080,7 @@ internal static class BridgeGameApi
         return new
         {
             title = TextOf(power.Title),
-            description = TextOf(power.Description),
+            description = TryGetDescription(power),
             amount = power.Amount,
             display_amount = power.DisplayAmount,
             type = power.Type.ToString(),
@@ -2410,11 +3090,17 @@ internal static class BridgeGameApi
 
     private static object BuildRewardsPayload(
         NRewardsScreen? rewardsScreen,
+        NProceedButton? roomProceedButton,
         NProceedButton? rewardProceedButton,
         NMapScreen? mapScreen,
         IReadOnlyList<NRewardButton> rewardButtons)
     {
-        var visible = IsRewardsScreenVisible(rewardsScreen, rewardProceedButton, mapScreen, rewardButtons);
+        var visible = IsRewardsScreenVisible(
+            rewardsScreen,
+            roomProceedButton,
+            rewardProceedButton,
+            mapScreen,
+            rewardButtons);
         return new
         {
             visible,
@@ -2445,34 +3131,34 @@ internal static class BridgeGameApi
             CardReward cardReward => new
             {
                 reward_type = "card",
-                description = TextOf(cardReward.Description),
+                description = DescribeText(cardReward.Description, cardReward),
                 can_skip = cardReward.CanSkip,
                 can_reroll = cardReward.CanReroll,
-                cards = cardReward.Cards.Select(BuildCardPayload).ToArray()
+                cards = cardReward.Cards.Select(card => BuildCardPayload(card)).ToArray()
             },
             GoldReward goldReward => new
             {
                 reward_type = "gold",
-                description = TextOf(goldReward.Description),
+                description = DescribeText(goldReward.Description, goldReward),
                 amount = goldReward.Amount
             },
             RelicReward relicReward => new
             {
                 reward_type = "relic",
-                description = TextOf(relicReward.Description),
+                description = DescribeText(relicReward.Description, relicReward),
                 rarity = relicReward.Rarity.ToString(),
                 relic = BuildRelicPayload(relicReward.ClaimedRelic)
             },
             PotionReward potionReward => new
             {
                 reward_type = "potion",
-                description = TextOf(potionReward.Description),
+                description = DescribeText(potionReward.Description, potionReward),
                 potion = BuildPotionPayload(potionReward.Potion)
             },
             _ => new
             {
                 reward_type = reward.GetType().Name,
-                description = TextOf(reward.Description)
+                description = DescribeText(reward.Description, reward)
             }
         };
     }
@@ -2490,7 +3176,7 @@ internal static class BridgeGameApi
             GoldReward goldReward => $"{goldReward.Amount} gold",
             RelicReward relicReward => $"Relic {TextOf(relicReward.ClaimedRelic?.Title)}",
             PotionReward potionReward => $"Potion {TextOf(potionReward.Potion?.Title)}",
-            _ => TextOf(reward.Description)
+            _ => DescribeText(reward.Description, reward)
         };
     }
 
@@ -2638,20 +3324,33 @@ internal static class BridgeGameApi
 
     private static object BuildEventOptionsPayload(
         IReadOnlyList<NEventOptionButton> eventOptionButtons,
-        NMapScreen? mapScreen)
+        NMapScreen? mapScreen,
+        NEventRoom? eventRoom,
+        Node? hoverTipSet)
     {
         if (mapScreen is not null && mapScreen.IsOpen)
         {
             return new
             {
                 visible = false,
+                visible_glossary_source = (string?)null,
+                visible_glossary_texts = Array.Empty<string>(),
+                visible_glossary = Array.Empty<object>(),
                 options = Array.Empty<object>()
             };
         }
 
+        var (glossarySource, glossaryTexts) = CollectVisibleEventGlossaryTexts(
+            eventOptionButtons,
+            eventRoom,
+            hoverTipSet);
+
         return new
         {
             visible = eventOptionButtons.Count > 0,
+            visible_glossary_source = glossarySource,
+            visible_glossary_texts = glossaryTexts.ToArray(),
+            visible_glossary = BuildVisibleGlossaryPayload(glossaryTexts),
             options = eventOptionButtons.Select((button, index) => BuildEventOptionPayload(button, index)).ToArray()
         };
     }
@@ -2746,15 +3445,235 @@ internal static class BridgeGameApi
     private static object BuildEventOptionPayload(NEventOptionButton button, int index)
     {
         var option = button.Option;
+        var glossary = BuildHoverTipPayloads(option?.HoverTips);
 
         return new
         {
             index,
-            title = TextOf(option?.Title),
-            description = TextOf(option?.Description),
+            title = option is null ? string.Empty : TryGetTitle(option),
+            description = option is null ? string.Empty : TryGetDescription(option),
             is_locked = option?.IsLocked ?? true,
-            is_proceed = option?.IsProceed ?? false
+            is_proceed = option?.IsProceed ?? false,
+            relic = option?.Relic is null ? null : BuildRelicPayload(option.Relic),
+            glossary
         };
+    }
+
+    private static (string? Source, IReadOnlyList<string> Texts) CollectVisibleEventGlossaryTexts(
+        IReadOnlyList<NEventOptionButton> eventOptionButtons,
+        NEventRoom? eventRoom,
+        Node? hoverTipSet)
+    {
+        var excludedTexts = new HashSet<string>(
+            eventOptionButtons
+                .SelectMany(static button => CollectVisibleText(button, 6))
+                .Select(NormalizeComparableText)
+                .Where(static text => !string.IsNullOrWhiteSpace(text)),
+            StringComparer.Ordinal);
+
+        var hoverTipTexts = FilterGlossaryCandidateTexts(CollectVisibleText(hoverTipSet, 24), excludedTexts);
+        if (hoverTipTexts.Count > 0)
+        {
+            return ("hover_tip_set", hoverTipTexts);
+        }
+
+        var eventRoomTexts = FilterGlossaryCandidateTexts(CollectVisibleText(eventRoom, 48), excludedTexts);
+        if (eventRoomTexts.Count > 0)
+        {
+            return ("event_room_fallback", eventRoomTexts);
+        }
+
+        return (null, Array.Empty<string>());
+    }
+
+    private static IReadOnlyList<string> FilterGlossaryCandidateTexts(
+        IEnumerable<string> texts,
+        IReadOnlySet<string> excludedTexts)
+    {
+        var filtered = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var rawText in texts)
+        {
+            var comparableText = NormalizeComparableText(rawText);
+            if (string.IsNullOrWhiteSpace(comparableText) ||
+                excludedTexts.Contains(comparableText) ||
+                !seen.Add(comparableText))
+            {
+                continue;
+            }
+
+            filtered.Add(rawText.ReplaceLineEndings("\n").Trim());
+        }
+
+        return filtered;
+    }
+
+    private static object[] BuildVisibleGlossaryPayload(IReadOnlyList<string> glossaryTexts)
+    {
+        if (glossaryTexts.Count == 0)
+        {
+            return Array.Empty<object>();
+        }
+
+        var entries = new List<object>();
+
+        for (var index = 0; index < glossaryTexts.Count; index++)
+        {
+            var title = glossaryTexts[index];
+            string? description = null;
+
+            if (index + 1 < glossaryTexts.Count &&
+                LooksLikeGlossaryTitle(title) &&
+                LooksLikeGlossaryDescription(glossaryTexts[index + 1], title))
+            {
+                description = glossaryTexts[index + 1];
+                index++;
+            }
+
+            entries.Add(new
+            {
+                title,
+                description,
+                texts = description is null ? new[] { title } : new[] { title, description }
+            });
+        }
+
+        return entries.ToArray();
+    }
+
+    private static object[] BuildHoverTipPayloads(IEnumerable? hoverTips)
+    {
+        if (hoverTips is null)
+        {
+            return Array.Empty<object>();
+        }
+
+        var entries = new List<object>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var hoverTip in hoverTips)
+        {
+            if (hoverTip is null)
+            {
+                continue;
+            }
+
+            var canonicalModel = GetHiddenPropertyObjectValue(hoverTip, "CanonicalModel") as AbstractModel;
+            var id = TextOf(GetHiddenPropertyObjectValue(hoverTip, "Id"));
+            var title = ResolveHoverTipTitle(hoverTip, canonicalModel, id);
+            var description = ResolveHoverTipDescription(hoverTip, canonicalModel);
+            var dedupeKey = string.Join(
+                "|",
+                hoverTip.GetType().FullName ?? hoverTip.GetType().Name,
+                NormalizeComparableText(id),
+                NormalizeComparableText(title),
+                NormalizeComparableText(description));
+
+            if (!seen.Add(dedupeKey))
+            {
+                continue;
+            }
+
+            entries.Add(new
+            {
+                id,
+                type = hoverTip.GetType().Name,
+                title,
+                description,
+                is_debuff = GetHiddenPropertyValue<bool>(hoverTip, "IsDebuff") ?? false,
+                is_instanced = GetHiddenPropertyValue<bool>(hoverTip, "IsInstanced") ?? false,
+                is_smart = GetHiddenPropertyValue<bool>(hoverTip, "IsSmart") ?? false,
+                canonical_model = canonicalModel is null ? null : BuildModelPayload(canonicalModel),
+                texts = new[] { title, description }
+                    .Where(static text => !string.IsNullOrWhiteSpace(text))
+                    .ToArray()
+            });
+        }
+
+        return entries.ToArray();
+    }
+
+    private static string ResolveHoverTipTitle(object hoverTip, AbstractModel? canonicalModel, string fallbackId)
+    {
+        return FirstNonEmptyText(
+            TryGetNamedValueText(hoverTip, "HoverTipTitle"),
+            TryGetNamedValueText(hoverTip, "Title"),
+            TryGetNamedValueText(hoverTip, "Name"),
+            TryGetNamedValueText(hoverTip, "Label"),
+            TryGetNamedValueText(hoverTip, "BotKeyword"),
+            canonicalModel is null ? string.Empty : TryGetTitle(canonicalModel),
+            fallbackId);
+    }
+
+    private static string ResolveHoverTipDescription(object hoverTip, AbstractModel? canonicalModel)
+    {
+        return FirstNonEmptyText(
+            TryGetNamedValueText(hoverTip, "HoverTipDesc"),
+            TryGetNamedValueText(hoverTip, "Description"),
+            TryGetNamedValueText(hoverTip, "Text"),
+            TryGetNamedValueText(hoverTip, "Body"),
+            TryGetNamedValueText(hoverTip, "BotText"),
+            canonicalModel is null ? string.Empty : TryGetDescription(canonicalModel));
+    }
+
+    private static string TryGetNamedValueText(object target, string memberName)
+    {
+        return DescribeText(
+            GetHiddenPropertyObjectValue(target, memberName) ??
+            GetHiddenFieldValue(target, memberName),
+            target);
+    }
+
+    private static string FirstNonEmptyText(params string[] candidates)
+    {
+        foreach (var candidate in candidates)
+        {
+            if (!string.IsNullOrWhiteSpace(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private static bool LooksLikeGlossaryTitle(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var normalized = text.ReplaceLineEndings("\n").Trim();
+        return normalized.Length <= 32 &&
+               !normalized.Contains('\n') &&
+               !normalized.Contains('。') &&
+               !normalized.Contains('！') &&
+               !normalized.Contains('？') &&
+               !normalized.Contains('：');
+    }
+
+    private static bool LooksLikeGlossaryDescription(string text, string title)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var normalized = text.ReplaceLineEndings("\n").Trim();
+        var normalizedTitle = title.ReplaceLineEndings("\n").Trim();
+        if (string.Equals(normalized, normalizedTitle, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return normalized.Contains('\n') ||
+               normalized.Contains('。') ||
+               normalized.Contains('！') ||
+               normalized.Contains('？') ||
+               normalized.Contains('：') ||
+               normalized.Length > normalizedTitle.Length;
     }
 
     private static object BuildMapPayload(
@@ -2895,9 +3814,9 @@ internal static class BridgeGameApi
     {
         return entry switch
         {
-            MerchantCardEntry cardEntry => TextOf(cardEntry.CreationResult?.Card?.Description),
-            MerchantRelicEntry relicEntry => TextOf(relicEntry.Model?.Description),
-            MerchantPotionEntry potionEntry => TextOf(potionEntry.Model?.Description),
+            MerchantCardEntry cardEntry when cardEntry.CreationResult?.Card is CardModel card => GetCardDescription(card, null),
+            MerchantRelicEntry relicEntry => relicEntry.Model is null ? string.Empty : TryGetDescription(relicEntry.Model),
+            MerchantPotionEntry potionEntry => potionEntry.Model is null ? string.Empty : TryGetDescription(potionEntry.Model),
             MerchantCardRemovalEntry cardRemovalEntry => cardRemovalEntry.Used
                 ? "Card removal already used"
                 : "Remove a card from your deck",
@@ -2922,8 +3841,8 @@ internal static class BridgeGameApi
             index,
             option_id = option.OptionId,
             option_type = option.GetType().Name,
-            title = TextOf(option.Title),
-            description = TextOf(option.Description),
+            title = TryGetTitle(option),
+            description = TryGetDescription(option),
             is_enabled = option.IsEnabled
         };
     }
@@ -3003,8 +3922,8 @@ internal static class BridgeGameApi
         return new
         {
             id = character.Id.ToString(),
-            title = TextOf(character.CharacterSelectTitle),
-            description = TextOf(character.CharacterSelectDesc),
+            title = DescribeCharacter(character),
+            description = DescribeText(character.CharacterSelectDesc, character),
             starting_hp = character.StartingHp,
             starting_gold = character.StartingGold
         };
@@ -3023,8 +3942,8 @@ internal static class BridgeGameApi
         return new
         {
             id = relic.Id.ToString(),
-            title = TextOf(relic.Title),
-            description = TextOf(relic.Description),
+            title = TryGetTitle(relic),
+            description = TryGetDescription(relic),
             rarity = relic.Rarity.ToString()
         };
     }
@@ -3042,11 +3961,11 @@ internal static class BridgeGameApi
         return new
         {
             id = potion.Id.ToString(),
-            title = TextOf(potion.Title),
-            description = TextOf(potion.Description),
+            title = TryGetTitle(potion),
+            description = TryGetDescription(potion),
             rarity = potion.Rarity.ToString(),
             target_type = potion.TargetType.ToString(),
-            selection_screen_prompt = TextOf(potion.SelectionScreenPrompt),
+            selection_screen_prompt = DescribeText(potion.SelectionScreenPrompt, potion),
             can_throw_at_ally = SafeCanThrowPotionAtAlly(potion),
             is_usable = SafeGetPotionIsUsable(potion),
             is_queued = SafeGetPotionIsQueued(potion)
@@ -3075,6 +3994,7 @@ internal static class BridgeGameApi
         NMerchantRoom? merchantRoom,
         NMerchantInventory? merchantInventory,
         NRewardsScreen? rewardsScreen,
+        NProceedButton? roomProceedButton,
         NProceedButton? rewardProceedButton,
         IReadOnlyList<NRewardButton> rewardButtons,
         NCardRewardSelectionScreen? cardRewardScreen,
@@ -3093,6 +4013,7 @@ internal static class BridgeGameApi
         var isMapOpen = mapScreen is not null && mapScreen.IsOpen;
         var isRewardsVisible = IsRewardsScreenVisible(
             rewardsScreen,
+            roomProceedButton,
             rewardProceedButton,
             mapScreen,
             rewardButtons);
@@ -3307,6 +4228,26 @@ internal static class BridgeGameApi
         return true;
     }
 
+    private static bool IsSameNodeInstance(Node? left, Node? right)
+    {
+        if (left is null || right is null)
+        {
+            return false;
+        }
+
+        if (ReferenceEquals(left, right))
+        {
+            return true;
+        }
+
+        if (!GodotObject.IsInstanceValid(left) || !GodotObject.IsInstanceValid(right))
+        {
+            return false;
+        }
+
+        return left.NativeInstance == right.NativeInstance;
+    }
+
     private static bool IsTypeFullName(Node? node, string fullTypeName)
     {
         return node is not null &&
@@ -3336,11 +4277,20 @@ internal static class BridgeGameApi
 
     private static bool IsRewardsScreenVisible(
         NRewardsScreen? rewardsScreen,
+        NProceedButton? roomProceedButton,
         NProceedButton? rewardProceedButton,
         NMapScreen? mapScreen,
         IReadOnlyList<NRewardButton> rewardButtons)
     {
         if (mapScreen?.IsOpen == true && rewardButtons.Count == 0)
+        {
+            return false;
+        }
+
+        if (rewardButtons.Count == 0 &&
+            roomProceedButton is not null &&
+            IsNodeVisible(roomProceedButton) &&
+            !IsSameNodeInstance(roomProceedButton, rewardProceedButton))
         {
             return false;
         }
@@ -3371,6 +4321,7 @@ internal static class BridgeGameApi
     {
         return IsRewardsScreenVisible(
                    context.RewardsScreen,
+                   context.ProceedButton,
                    context.RewardProceedButton,
                    context.MapScreen,
                    context.RewardButtons) &&
@@ -3422,8 +4373,9 @@ internal static class BridgeGameApi
                 const int autoProceedWaitMs = 2200;
                 var stateVersionBeforeAutoProceed = snapshot.StateVersion;
                 var stateHashBeforeAutoProceed = snapshot.StateHash;
-                await Task.Delay(autoProceedWaitMs, cancellationToken);
+                await WaitForSnapshotBarrierAsync(autoProceedWaitMs, cancellationToken);
                 snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
+                snapshot = await MaybeWaitForStablePostActionSnapshotAsync("proceed", snapshot, cancellationToken);
                 autoProceedCount++;
                 var stateChanged =
                     snapshot.StateVersion != stateVersionBeforeAutoProceed ||
@@ -3454,7 +4406,7 @@ internal static class BridgeGameApi
                 break;
             }
 
-            await Task.Delay(500, cancellationToken);
+            await WaitForSnapshotBarrierAsync(500, cancellationToken);
             snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
         }
 
@@ -3484,8 +4436,9 @@ internal static class BridgeGameApi
         });
 
         const int autoConfirmWaitMs = 1800;
-        await Task.Delay(autoConfirmWaitMs, cancellationToken);
+        await WaitForSnapshotBarrierAsync(autoConfirmWaitMs, cancellationToken);
         snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
+        snapshot = await MaybeWaitForStablePostActionSnapshotAsync("card_selection:confirm", snapshot, cancellationToken);
         autoExecutedActions.Add(new
         {
             action_id = "card_selection:confirm",
@@ -3730,6 +4683,13 @@ internal static class BridgeGameApi
             return;
         }
 
+        if (context.TreasureRoom is not null &&
+            IsNodeVisible(context.TreasureRoom))
+        {
+            InvokeTreasureProceedAction(context.TreasureRoom, context.ProceedButton);
+            return;
+        }
+
         InvokeProceedButtonAction(context.ProceedButton);
     }
 
@@ -3756,6 +4716,52 @@ internal static class BridgeGameApi
     private static void InvokeMerchantLeaveAction(NMerchantRoom? merchantRoom, NProceedButton button)
     {
         if (TryInvokeSingleArgument(merchantRoom, "HideScreen", button))
+        {
+            return;
+        }
+
+        InvokeProceedButtonAction(button);
+    }
+
+    private static void InvokeTreasureChestAction(NTreasureRoom? treasureRoom, NTreasureButton chestButton)
+    {
+        if (TryInvokeSingleArgument(treasureRoom, "OnChestButtonReleased", chestButton))
+        {
+            return;
+        }
+
+        var openChestResult = InvokeParameterless(treasureRoom, "OpenChest");
+        if (openChestResult is Task openChestTask)
+        {
+            openChestTask.GetAwaiter().GetResult();
+            return;
+        }
+
+        InvokeButtonAction(chestButton, "OnRelease");
+    }
+
+    private static void InvokeTreasureRelicAction(
+        NTreasureRoomRelicCollection? treasureRelicCollection,
+        NTreasureRoomRelicHolder relicHolder)
+    {
+        if (TryInvokeSingleArgument(treasureRelicCollection, "PickRelic", relicHolder))
+        {
+            return;
+        }
+
+        if (TryInvokeParameterless(relicHolder, "OnRelease") ||
+            TryInvokeParameterless(relicHolder, "OnPress"))
+        {
+            return;
+        }
+
+        InvokeClickablePressAndRelease(relicHolder);
+    }
+
+    private static void InvokeTreasureProceedAction(NTreasureRoom? treasureRoom, NProceedButton button)
+    {
+        if (TryInvokeSingleArgument(treasureRoom, "OnProceedButtonReleased", button) ||
+            TryInvokeSingleArgument(treasureRoom, "OnProceedButtonPressed", button))
         {
             return;
         }
@@ -3925,17 +4931,23 @@ internal static class BridgeGameApi
         NRewardsScreen? rewardsScreen,
         NProceedButton? rewardProceedButton)
     {
-        if (TryInvokeParameterless(runManager, "ProceedFromTerminalRewardsScreen") ||
-            TryInvokeParameterless(rewardsScreen, "ProceedFromTerminalRewardsScreen"))
+        // Prefer the real rewards-screen handler so boss-room reward exits
+        // follow the same path as a manual click.
+        if (rewardProceedButton is not null &&
+            TryInvokeSingleArgument(rewardsScreen, "OnProceedButtonPressed", rewardProceedButton))
         {
             return;
         }
 
-        if (rewardProceedButton is not null)
+        if (rewardProceedButton is not null && IsNodeVisible(rewardProceedButton))
         {
             InvokeProceedButtonAction(rewardProceedButton);
             return;
         }
+
+        if (TryInvokeParameterless(runManager, "ProceedFromTerminalRewardsScreen") ||
+            TryInvokeParameterless(rewardsScreen, "ProceedFromTerminalRewardsScreen"))
+            return;
 
         throw new BridgeRequestException(
             HttpStatusCode.Conflict,
@@ -4305,6 +5317,36 @@ internal static class BridgeGameApi
             .LastOrDefault();
     }
 
+    private static bool ShouldSuppressGenericRoomProceed(BridgeWorldContext context)
+    {
+        if (context.TreasureRoom is null || !IsNodeVisible(context.TreasureRoom))
+        {
+            return false;
+        }
+
+        if (CanOpenTreasureChest(context))
+        {
+            return true;
+        }
+
+        return context.TreasureRelicOptions.Any(IsNodeVisible);
+    }
+
+    private static bool CanOpenTreasureChest(BridgeWorldContext context)
+    {
+        if (context.TreasureRoom is null ||
+            context.TreasureChestButton is null ||
+            !IsNodeVisible(context.TreasureChestButton))
+        {
+            return false;
+        }
+
+        var hasRelicBeenClaimed = GetHiddenFieldValue(context.TreasureRoom, "_hasRelicBeenClaimed") is bool claimed && claimed;
+        var isRelicCollectionOpen = GetHiddenFieldValue(context.TreasureRoom, "_isRelicCollectionOpen") is bool collectionOpen && collectionOpen;
+
+        return !hasRelicBeenClaimed && !isRelicCollectionOpen;
+    }
+
     private static string? TryGetCardSelectionPrompt(Node? cardSelectionScreen)
     {
         if (cardSelectionScreen is null)
@@ -4395,24 +5437,663 @@ internal static class BridgeGameApi
 
     private static string DescribeCharacter(CharacterModel? character)
     {
-        return TextOf(character?.CharacterSelectTitle);
+        return DescribeText(character?.CharacterSelectTitle, character);
     }
 
     private static string TryGetTitle(object model)
     {
-        var property = FindProperty(model.GetType(), "Title");
-        return TextOf(property?.GetValue(model));
+        var title = TryGetNamedTextValue(model, "Title", "TitleLocString");
+        return string.IsNullOrWhiteSpace(title)
+            ? DescribeText(model, model)
+            : title;
     }
 
     private static string TryGetDescription(object model)
     {
-        var property = FindProperty(model.GetType(), "Description");
-        return TextOf(property?.GetValue(model));
+        return DescribeText(TryGetPreferredDescriptionValue(model), model);
     }
 
     private static string TextOf(object? value)
     {
-        return value?.ToString() ?? string.Empty;
+        if (value is string textValue)
+        {
+            return textValue;
+        }
+
+        if (value is LocString locString)
+        {
+            try
+            {
+                var formatted = locString.GetFormattedText();
+                if (!string.IsNullOrWhiteSpace(formatted))
+                {
+                    return formatted;
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                var raw = locString.GetRawText();
+                if (!string.IsNullOrWhiteSpace(raw))
+                {
+                    return raw;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        if (value is not null)
+        {
+            var formatted = TryInvokeTextMethod(value, "GetFormattedText");
+            if (!string.IsNullOrWhiteSpace(formatted))
+            {
+                return formatted;
+            }
+
+            var raw = TryInvokeTextMethod(value, "GetRawText");
+            if (!string.IsNullOrWhiteSpace(raw))
+            {
+                return raw;
+            }
+        }
+
+        var text = value?.ToString() ?? string.Empty;
+        return value is not null && LooksLikeTypeName(text, value.GetType())
+            ? string.Empty
+            : text;
+    }
+
+    private static string DescribeText(object? value, object? placeholderContext = null)
+    {
+        var text = TextOf(value);
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return text;
+        }
+
+        return NormalizePayloadText(ResolvePlaceholderText(text, placeholderContext));
+    }
+
+    private static string NormalizePayloadText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        var normalized = ReplaceImageTags(text.ReplaceLineEndings("\n")).Trim();
+        if (normalized.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        normalized = StripBbCode(normalized);
+        normalized = normalized.Replace("[", string.Empty).Replace("]", string.Empty);
+        normalized = normalized.Replace(" \n", "\n").Replace("\n ", "\n");
+
+        var builder = new StringBuilder(normalized.Length);
+        var previousWasWhitespace = false;
+
+        foreach (var character in normalized)
+        {
+            if (character == '\n')
+            {
+                if (builder.Length > 0 && builder[^1] == ' ')
+                {
+                    builder.Length--;
+                }
+
+                if (builder.Length == 0 || builder[^1] != '\n')
+                {
+                    builder.Append('\n');
+                }
+
+                previousWasWhitespace = false;
+                continue;
+            }
+
+            if (char.IsWhiteSpace(character))
+            {
+                if (!previousWasWhitespace)
+                {
+                    builder.Append(' ');
+                    previousWasWhitespace = true;
+                }
+
+                continue;
+            }
+
+            builder.Append(character);
+            previousWasWhitespace = false;
+        }
+
+        return builder.ToString().Trim();
+    }
+
+    private static string ReplaceImageTags(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        const string openTag = "[img]";
+        const string closeTag = "[/img]";
+        var builder = new StringBuilder(text.Length);
+        var cursor = 0;
+
+        while (cursor < text.Length)
+        {
+            var openIndex = text.IndexOf(openTag, cursor, StringComparison.OrdinalIgnoreCase);
+            if (openIndex < 0)
+            {
+                builder.Append(text, cursor, text.Length - cursor);
+                break;
+            }
+
+            builder.Append(text, cursor, openIndex - cursor);
+
+            var contentStart = openIndex + openTag.Length;
+            var closeIndex = text.IndexOf(closeTag, contentStart, StringComparison.OrdinalIgnoreCase);
+            if (closeIndex < 0)
+            {
+                builder.Append(text, openIndex, text.Length - openIndex);
+                break;
+            }
+
+            var inner = text.Substring(contentStart, closeIndex - contentStart);
+            builder.Append(SummarizeImageTag(inner));
+            cursor = closeIndex + closeTag.Length;
+        }
+
+        return builder.ToString();
+    }
+
+    private static string SummarizeImageTag(string inner)
+    {
+        if (string.IsNullOrWhiteSpace(inner))
+        {
+            return "图标";
+        }
+
+        return inner.IndexOf("energy_icon", StringComparison.OrdinalIgnoreCase) >= 0
+            ? "1点能量"
+            : "图标";
+    }
+
+    private static string ResolvePlaceholderText(string text, object? placeholderContext)
+    {
+        if (string.IsNullOrWhiteSpace(text) ||
+            placeholderContext is null ||
+            !text.Contains('{'))
+        {
+            return text;
+        }
+
+        var builder = new StringBuilder(text.Length);
+        var cursor = 0;
+
+        while (cursor < text.Length)
+        {
+            var openBrace = text.IndexOf('{', cursor);
+            if (openBrace < 0)
+            {
+                builder.Append(text, cursor, text.Length - cursor);
+                break;
+            }
+
+            var closeBrace = text.IndexOf('}', openBrace + 1);
+            if (closeBrace < 0)
+            {
+                builder.Append(text, cursor, text.Length - cursor);
+                break;
+            }
+
+            builder.Append(text, cursor, openBrace - cursor);
+
+            var placeholderBody = text.Substring(openBrace + 1, closeBrace - openBrace - 1);
+            if (TryResolvePlaceholderText(placeholderContext, placeholderBody, out var resolvedPlaceholder))
+            {
+                builder.Append(resolvedPlaceholder);
+            }
+            else
+            {
+                builder.Append(text, openBrace, closeBrace - openBrace + 1);
+            }
+
+            cursor = closeBrace + 1;
+        }
+
+        return builder.ToString();
+    }
+
+    private static bool TryResolvePlaceholderText(
+        object placeholderContext,
+        string placeholderBody,
+        out string resolvedText)
+    {
+        resolvedText = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(placeholderBody))
+        {
+            return false;
+        }
+
+        var separatorIndex = placeholderBody.IndexOf(':');
+        var tokenName = separatorIndex >= 0
+            ? placeholderBody[..separatorIndex].Trim()
+            : placeholderBody.Trim();
+        var formatHint = separatorIndex >= 0
+            ? placeholderBody[(separatorIndex + 1)..].Trim()
+            : string.Empty;
+
+        if (string.IsNullOrWhiteSpace(tokenName) ||
+            !TryResolvePlaceholderValue(placeholderContext, tokenName, out var resolvedValue))
+        {
+            return false;
+        }
+
+        resolvedText = FormatResolvedPlaceholderValue(formatHint, resolvedValue);
+        return !string.IsNullOrWhiteSpace(resolvedText);
+    }
+
+    private static bool TryResolvePlaceholderValue(
+        object placeholderContext,
+        string tokenName,
+        out object? resolvedValue)
+    {
+        resolvedValue = null;
+
+        foreach (var candidate in EnumeratePlaceholderContexts(placeholderContext))
+        {
+            if (candidate is null)
+            {
+                continue;
+            }
+
+            if (TryResolvePlaceholderValueFromTypeHierarchy(candidate, tokenName, out resolvedValue) ||
+                TryResolvePlaceholderValueFromCanonicalVars(candidate, tokenName, out resolvedValue) ||
+                TryResolvePlaceholderValueFromDynamicVars(candidate, tokenName, out resolvedValue))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<object?> EnumeratePlaceholderContexts(object placeholderContext)
+    {
+        yield return placeholderContext;
+
+        if (GetHiddenPropertyObjectValue(placeholderContext, "CanonicalModel") is { } canonicalModel)
+        {
+            yield return canonicalModel;
+        }
+
+        if (GetHiddenPropertyObjectValue(placeholderContext, "Model") is { } model)
+        {
+            yield return model;
+        }
+
+        if (GetHiddenPropertyObjectValue(placeholderContext, "Info") is { } info)
+        {
+            yield return info;
+        }
+    }
+
+    private static object? TryGetPreferredDescriptionValue(object model)
+    {
+        var preferredPropertyNames = new[]
+        {
+            "DynamicDescription",
+            "SmartDescription",
+            "RemoteDescription",
+            "DynamicEventDescription",
+            "EventDescription",
+            "StaticDescription",
+            "DescriptionLocString",
+            "Description"
+        };
+
+        foreach (var propertyName in preferredPropertyNames)
+        {
+            var property = FindProperty(model.GetType(), propertyName);
+            if (property is null)
+            {
+                continue;
+            }
+
+            object? value;
+            try
+            {
+                value = property.GetValue(model);
+            }
+            catch
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(TextOf(value)))
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private static string TryGetNamedTextValue(object model, params string[] memberNames)
+    {
+        foreach (var memberName in memberNames)
+        {
+            var property = FindProperty(model.GetType(), memberName);
+            if (property is null)
+            {
+                continue;
+            }
+
+            object? value;
+            try
+            {
+                value = property.GetValue(model);
+            }
+            catch
+            {
+                continue;
+            }
+
+            var text = DescribeText(value, model);
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private static string TryInvokeTextMethod(object value, string methodName)
+    {
+        var method = FindMethod(value.GetType(), methodName, 0);
+        if (method is null)
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            return TextOf(method.Invoke(value, Array.Empty<object>()));
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static bool LooksLikeTypeName(string text, Type type)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        return string.Equals(text, type.FullName, StringComparison.Ordinal) ||
+               string.Equals(text, type.Name, StringComparison.Ordinal);
+    }
+
+    private static bool TryResolvePlaceholderValueFromTypeHierarchy(
+        object candidate,
+        string tokenName,
+        out object? resolvedValue)
+    {
+        resolvedValue = null;
+        var type = candidate.GetType();
+        var normalizedTokenName = NormalizePlaceholderMemberName(tokenName);
+
+        while (type is not null)
+        {
+            foreach (var property in type.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+            {
+                if (!string.Equals(
+                        NormalizePlaceholderMemberName(property.Name),
+                        normalizedTokenName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    resolvedValue = property.GetValue(candidate);
+                    return resolvedValue is not null;
+                }
+                catch
+                {
+                }
+            }
+
+            foreach (var field in type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+            {
+                if (!string.Equals(
+                        NormalizePlaceholderMemberName(field.Name),
+                        normalizedTokenName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    resolvedValue = field.GetValue(candidate);
+                    return resolvedValue is not null;
+                }
+                catch
+                {
+                }
+            }
+
+            type = type.BaseType;
+        }
+
+        return false;
+    }
+
+    private static bool TryResolvePlaceholderValueFromCanonicalVars(
+        object candidate,
+        string tokenName,
+        out object? resolvedValue)
+    {
+        resolvedValue = null;
+
+        if (FindProperty(candidate.GetType(), "CanonicalVars")?.GetValue(candidate) is not IEnumerable canonicalVars)
+        {
+            return false;
+        }
+
+        foreach (var dynamicVar in canonicalVars)
+        {
+            if (!TryGetDynamicVarName(dynamicVar, out var dynamicVarName) ||
+                !string.Equals(dynamicVarName, tokenName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            resolvedValue = GetPreferredDynamicVarValue(dynamicVar);
+            return resolvedValue is not null;
+        }
+
+        return false;
+    }
+
+    private static bool TryResolvePlaceholderValueFromDynamicVars(
+        object candidate,
+        string tokenName,
+        out object? resolvedValue)
+    {
+        resolvedValue = null;
+
+        var dynamicVars = FindProperty(candidate.GetType(), "DynamicVars")?.GetValue(candidate);
+        if (dynamicVars is null)
+        {
+            return false;
+        }
+
+        var tryGetValueMethod = FindMethod(dynamicVars.GetType(), "TryGetValue", 2);
+        if (tryGetValueMethod is null)
+        {
+            return false;
+        }
+
+        var parameters = new object?[] { tokenName, null };
+
+        try
+        {
+            if (tryGetValueMethod.Invoke(dynamicVars, parameters) is true &&
+                parameters[1] is { } dynamicVar)
+            {
+                resolvedValue = GetPreferredDynamicVarValue(dynamicVar);
+                return resolvedValue is not null;
+            }
+        }
+        catch
+        {
+        }
+
+        return false;
+    }
+
+    private static bool TryGetDynamicVarName(object? dynamicVar, out string name)
+    {
+        name = string.Empty;
+
+        if (dynamicVar is null)
+        {
+            return false;
+        }
+
+        var property = FindProperty(dynamicVar.GetType(), "Name");
+        name = TextOf(property?.GetValue(dynamicVar));
+        return !string.IsNullOrWhiteSpace(name);
+    }
+
+    private static object? GetPreferredDynamicVarValue(object dynamicVar)
+    {
+        if (dynamicVar is null)
+        {
+            return null;
+        }
+
+        var previewValue = GetHiddenPropertyValue<decimal>(dynamicVar, "PreviewValue");
+        if (previewValue.HasValue && previewValue.Value != 0m)
+        {
+            return decimal.Truncate(previewValue.Value) == previewValue.Value
+                ? (int)previewValue.Value
+                : previewValue.Value;
+        }
+
+        var intValue = GetHiddenPropertyValue<int>(dynamicVar, "IntValue");
+        if (intValue.HasValue)
+        {
+            return intValue.Value;
+        }
+
+        var baseValue = GetHiddenPropertyValue<decimal>(dynamicVar, "BaseValue");
+        if (baseValue.HasValue)
+        {
+            return decimal.Truncate(baseValue.Value) == baseValue.Value
+                ? (int)baseValue.Value
+                : baseValue.Value;
+        }
+
+        return dynamicVar;
+    }
+
+    private static string NormalizePlaceholderMemberName(string? memberName)
+    {
+        if (string.IsNullOrWhiteSpace(memberName))
+        {
+            return string.Empty;
+        }
+
+        var normalized = memberName.Trim();
+        const string backingFieldSuffix = ">k__BackingField";
+
+        if (normalized.StartsWith('<') &&
+            normalized.EndsWith(backingFieldSuffix, StringComparison.Ordinal))
+        {
+            normalized = normalized.Substring(1, normalized.Length - backingFieldSuffix.Length - 1);
+        }
+
+        return normalized.TrimStart('_');
+    }
+
+    private static string FormatResolvedPlaceholderValue(string formatHint, object? resolvedValue)
+    {
+        if (resolvedValue is null)
+        {
+            return string.Empty;
+        }
+
+        if (!string.IsNullOrWhiteSpace(formatHint) &&
+            formatHint.Contains("energyIcons()", StringComparison.OrdinalIgnoreCase) &&
+            TryConvertToInt(resolvedValue, out var energyAmount))
+        {
+            return $"{energyAmount}点能量";
+        }
+
+        return TextOf(resolvedValue);
+    }
+
+    private static bool TryConvertToInt(object value, out int number)
+    {
+        switch (value)
+        {
+            case byte byteValue:
+                number = byteValue;
+                return true;
+            case sbyte sbyteValue:
+                number = sbyteValue;
+                return true;
+            case short shortValue:
+                number = shortValue;
+                return true;
+            case ushort ushortValue:
+                number = ushortValue;
+                return true;
+            case int intValue:
+                number = intValue;
+                return true;
+            case uint uintValue when uintValue <= int.MaxValue:
+                number = (int)uintValue;
+                return true;
+            case long longValue when longValue is >= int.MinValue and <= int.MaxValue:
+                number = (int)longValue;
+                return true;
+            case ulong ulongValue when ulongValue <= int.MaxValue:
+                number = (int)ulongValue;
+                return true;
+            case decimal decimalValue when decimalValue >= int.MinValue && decimalValue <= int.MaxValue:
+                number = (int)decimal.Truncate(decimalValue);
+                return true;
+            case float floatValue when floatValue >= int.MinValue && floatValue <= int.MaxValue:
+                number = (int)MathF.Truncate(floatValue);
+                return true;
+            case double doubleValue when doubleValue >= int.MinValue && doubleValue <= int.MaxValue:
+                number = (int)Math.Truncate(doubleValue);
+                return true;
+            case string stringValue when int.TryParse(stringValue, out var parsedNumber):
+                number = parsedNumber;
+                return true;
+            default:
+                number = 0;
+                return false;
+        }
     }
 
     private static IReadOnlyList<string> CollectVisibleText(Node? root, int maxCount)
@@ -4504,12 +6185,12 @@ internal static class BridgeGameApi
 
         if (node is Label label)
         {
-            return label.Text;
+            return DescribeText(label.Text);
         }
 
         if (node is RichTextLabel richTextLabel)
         {
-            return richTextLabel.Text;
+            return DescribeText(richTextLabel.Text);
         }
 
         return string.Empty;
@@ -4520,11 +6201,75 @@ internal static class BridgeGameApi
         return value switch
         {
             null => string.Empty,
-            string text => text,
+            string text => DescribeText(text),
             Node node => TryGetNodeText(node),
             _ when value is System.Collections.IEnumerable => string.Empty,
-            _ => TextOf(value)
+            _ => DescribeText(value)
         };
+    }
+
+    private static string NormalizeComparableText(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        var stripped = StripBbCode(text.ReplaceLineEndings("\n"));
+        var builder = new StringBuilder(stripped.Length);
+        var previousWasWhitespace = false;
+
+        foreach (var rune in stripped.Trim())
+        {
+            if (char.IsWhiteSpace(rune))
+            {
+                if (!previousWasWhitespace)
+                {
+                    builder.Append(' ');
+                    previousWasWhitespace = true;
+                }
+
+                continue;
+            }
+
+            builder.Append(rune);
+            previousWasWhitespace = false;
+        }
+
+        return builder.ToString();
+    }
+
+    private static string StripBbCode(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder(text.Length);
+        var insideTag = false;
+
+        foreach (var character in text)
+        {
+            if (character == '[')
+            {
+                insideTag = true;
+                continue;
+            }
+
+            if (character == ']')
+            {
+                insideTag = false;
+                continue;
+            }
+
+            if (!insideTag)
+            {
+                builder.Append(character);
+            }
+        }
+
+        return builder.ToString();
     }
 
     private static string? TryGetMainMenuSemanticAction(string text)
@@ -4662,6 +6407,12 @@ internal static class BridgeGameApi
 
         public NMerchantInventory? MerchantInventory { get; init; }
 
+        public NTreasureRoom? TreasureRoom { get; init; }
+
+        public NTreasureButton? TreasureChestButton { get; init; }
+
+        public NTreasureRoomRelicCollection? TreasureRelicCollection { get; init; }
+
         public NRewardsScreen? RewardsScreen { get; init; }
 
         public NProceedButton? RewardProceedButton { get; init; }
@@ -4712,11 +6463,17 @@ internal static class BridgeGameApi
 
         public required IReadOnlyList<NEventOptionButton> EventOptionButtons { get; init; }
 
+        public NEventRoom? EventRoom { get; init; }
+
+        public Node? HoverTipSet { get; init; }
+
         public required IReadOnlyList<NMapPoint> MapPoints { get; init; }
 
         public required IReadOnlyList<NRestSiteButton> RestSiteButtons { get; init; }
 
         public required IReadOnlyList<NMerchantSlot> MerchantSlots { get; init; }
+
+        public required IReadOnlyList<NTreasureRoomRelicHolder> TreasureRelicOptions { get; init; }
 
         public Node? MainMenuRoot { get; init; }
 

@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"sts2","version":"0.4.5"},"instructions":"Use sts2_get_state and sts2_list_actions to observe the game, then sts2_perform_action or sts2_end_turn to execute only legal actions."}}

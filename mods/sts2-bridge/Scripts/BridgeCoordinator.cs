@@ -11,7 +11,30 @@ internal static class BridgeCoordinator
 {
     private static readonly object Sync = new();
     private static readonly ConcurrentQueue<Action> Queue = new();
+    private static readonly List<PumpTickWaiter> PumpTickWaiters = new();
     private static bool _isAttached;
+    private static long _pumpTick;
+
+    private sealed class PumpTickWaiter
+    {
+        public required long TargetTick { get; init; }
+
+        public required TaskCompletionSource<bool> CompletionSource { get; init; }
+
+        public CancellationTokenRegistration CancellationRegistration { get; set; }
+
+        public void Complete()
+        {
+            CancellationRegistration.Dispose();
+            CompletionSource.TrySetResult(true);
+        }
+
+        public void Cancel(CancellationToken cancellationToken)
+        {
+            CancellationRegistration.Dispose();
+            CompletionSource.TrySetCanceled(cancellationToken);
+        }
+    }
 
     public static bool IsReady
     {
@@ -49,14 +72,34 @@ internal static class BridgeCoordinator
 
     public static void Detach()
     {
+        List<PumpTickWaiter>? waitersToCancel = null;
+
         lock (Sync)
         {
             while (Queue.TryDequeue(out _))
             {
             }
 
+            if (PumpTickWaiters.Count > 0)
+            {
+                waitersToCancel = new List<PumpTickWaiter>(PumpTickWaiters);
+                PumpTickWaiters.Clear();
+            }
+
             BridgeDebugTrace.Write("coordinator detached");
             _isAttached = false;
+        }
+
+        if (waitersToCancel is null)
+        {
+            return;
+        }
+
+        foreach (var waiter in waitersToCancel)
+        {
+            waiter.CancellationRegistration.Dispose();
+            waiter.CompletionSource.TrySetException(
+                new InvalidOperationException("Bridge coordinator detached before the requested pump ticks completed."));
         }
     }
 
@@ -95,9 +138,50 @@ internal static class BridgeCoordinator
         return tcs.Task;
     }
 
+    public static Task WaitForPumpTicksAsync(int tickCount, CancellationToken cancellationToken = default)
+    {
+        if (tickCount <= 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        PumpTickWaiter waiter;
+        lock (Sync)
+        {
+            if (!_isAttached)
+            {
+                throw new InvalidOperationException("Bridge coordinator is not attached yet.");
+            }
+
+            waiter = new PumpTickWaiter
+            {
+                TargetTick = _pumpTick + tickCount,
+                CompletionSource = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
+            };
+
+            if (cancellationToken.CanBeCanceled)
+            {
+                waiter.CancellationRegistration = cancellationToken.Register(() =>
+                {
+                    lock (Sync)
+                    {
+                        PumpTickWaiters.Remove(waiter);
+                    }
+
+                    waiter.Cancel(cancellationToken);
+                });
+            }
+
+            PumpTickWaiters.Add(waiter);
+        }
+
+        return waiter.CompletionSource.Task;
+    }
+
     public static void Pump()
     {
         var processedAny = false;
+        List<PumpTickWaiter>? readyWaiters = null;
 
         while (Queue.TryDequeue(out var action))
         {
@@ -105,9 +189,39 @@ internal static class BridgeCoordinator
             action();
         }
 
+        lock (Sync)
+        {
+            _pumpTick++;
+
+            if (PumpTickWaiters.Count > 0)
+            {
+                readyWaiters = PumpTickWaiters
+                    .Where(waiter => waiter.TargetTick <= _pumpTick)
+                    .ToList();
+
+                if (readyWaiters.Count > 0)
+                {
+                    foreach (var waiter in readyWaiters)
+                    {
+                        PumpTickWaiters.Remove(waiter);
+                    }
+                }
+            }
+        }
+
         if (processedAny)
         {
             BridgeDebugTrace.Write("coordinator processed queued work");
+        }
+
+        if (readyWaiters is null)
+        {
+            return;
+        }
+
+        foreach (var waiter in readyWaiters)
+        {
+            waiter.Complete();
         }
     }
 
