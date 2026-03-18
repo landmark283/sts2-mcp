@@ -21,6 +21,7 @@ Thumbs.db
 # Local research and temporary files
 scratch/
 新建游戏项目/
+release-assets/
 
 # Docs are intentionally excluded from the public code repo
 docs/

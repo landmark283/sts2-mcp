@@ -1,125 +1,100 @@
-# sts2-mcp
+# sts2-mcp 🌌
 
-[English README](./README.md)
+[![Chinese](https://img.shields.io/badge/lang-中文-red.svg)](#) [![English](https://img.shields.io/badge/lang-English-blue.svg)](./README.md)
 
-`sts2-mcp` 是一个面向 **Slay the Spire 2** 的本地控制栈，由“游戏内桥接模组 +
-外部 MCP 服务”两部分组成。
+`sts2-mcp` 是一个为 **《杀戮尖塔 2》(Slay the Spire 2)** 打造的高性能本地控制栈。它利用 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) 协议，在游戏的内部状态与外部 AI Agent 之间搭建了一座桥梁。
 
-这个项目不把截图、OCR、鼠标点击当作主要控制路径。它的核心思路是：
+与传统的截图识别 (Screen-scraping) 或 OCR 方案不同，`sts2-mcp` 通过一个**原生 C# 桥接模组 (Bridge Mod)** 直接提取精确的游戏数据并暴露合法动作，确保了 100% 的准确性和毫秒级的响应延迟。
 
-- 在游戏进程内加载一个原生桥接模组
-- 直接读取当前可见游戏状态
-- 直接暴露当前合法动作
-- 再由外部 MCP 服务把这些能力提供给 agent
+---
 
-## 仓库内容
+## 🏗️ 项目架构
 
-- `mods/sts2-bridge`
-  - 运行在 `Slay the Spire 2` 进程内的 C# / .NET 9 桥接模组
-  - 暴露本地 loopback HTTP 接口
-  - 序列化当前 run / combat / reward / map 等状态
-  - 执行当前合法的游戏动作
-- `packages/mcp-server`
-  - Node 22 的 stdio MCP 服务
-  - 读取桥接发现文件
-  - 对外暴露桥接驱动的 MCP tools，例如：
-    - `sts2_get_state`
-    - `sts2_list_actions`
-    - `sts2_perform_action`
-    - `sts2_play_card_sequence`
-    - `sts2_resolve_room_rewards`
-    - `sts2_resolve_rest_site`
-    - `sts2_resolve_card_selection`
-    - `sts2_resolve_shop_visit`
+项目主要由两个核心组件组成：
 
-## 当前仓库范围
+### 1. `mods/sts2-bridge` (传感器与执行器)
+一个直接注入到《杀戮尖塔 2》进程中的 C#/.NET 9 模组。
+- **状态序列化**：将复杂的内部游戏对象（运行数据、战斗、奖励、地图等）转换为干净的 JSON。
+- **动作执行**：直接调用游戏方法执行出牌、选择和地图移动。
+- **自动发现**：自动创建 session 文件，方便 MCP 服务定位并连接。
 
-这个仓库现在主要发布的是**源码**，不是本地开发全量工作区。
+### 2. `packages/mcp-server` (交互界面)
+基于 Node.js 22 的标准 MCP 协议实现。
+- **工具映射**：将桥接器的 HTTP 接口转换为标准的 MCP Tools。
+- **操作安全**：引入 `state_version` 保护机制，防止执行“过时”动作（例如尝试打出一张已经消耗掉的牌）。
+- **流程优化**：针对奖励、商店、营火等复杂场景实现批量化处理，大幅减少 LLM 的往返调用。
 
-不会放进公开仓库的内容包括：
+---
 
-- 本地规划文档
-- 本地实验目录
-- 构建产物
-- 本地 MCP 配置
-- 机器相关日志与 session 文件
+## 🛠️ MCP 工具参考 (Tools)
 
-## 当前能力
+该服务向任何兼容 MCP 的 Agent（如 Claude Desktop 或 Antigravity）暴露以下工具：
 
-这套代码已经在本机 `Slay the Spire 2 0.99+` 版本上做过真实联调，当前包含：
+| 工具名称 | 功能描述 |
+| :--- | :--- |
+| `sts2_get_state` | 获取完整的当前游戏状态（界面、血量、卡组、遗物等）。 |
+| `sts2_list_actions` | 列出当前玩家所有合法的可选动作。 |
+| `sts2_perform_action` | 通过唯一的 Action ID 执行单个动作。 |
+| `sts2_play_card_sequence` | 按顺序打出多张卡牌，并自动处理手牌索引重排。 |
+| `sts2_resolve_room_rewards` | 一键领取金币/药水，并可选择性地拿取卡牌奖励。 |
+| `sts2_resolve_rest_site` | 执行休息/锻造操作，并自动返回地图。 |
+| `sts2_resolve_card_selection` | 完美处理选牌、跳过或转化的弹出界面。 |
+| `sts2_pick_option` | 以统一索引方式选择奖励/事件/营火/选牌项，不再依赖原始 Action ID。 |
+| `sts2_travel_to_coordinate` | 自动吸收奖励/营火收尾并等待地图稳定后，再移动到指定坐标。 |
+| `sts2_resolve_shop_visit` | 在单次批量操作中购买多个物品并执行移除卡牌。 |
 
-- 通过 `%APPDATA%\\SlayTheSpire2\\bridge\\session.json` 发现 bridge
-- 在窗口化运行时稳定读取状态
-- 列出当前合法动作
-- 带 `state_version` 保护的动作执行
-- 战斗出牌
-- 多张牌单次调用出牌，并在手牌重排后自动 rematch
-- 关卡奖励一轮结算
-- 营火一轮结算
-- 选牌面一轮结算
-- 商店购买一轮结算，并处理购买后的重排
-- 地图路线摘要建模，供 agent 做选路
+---
 
-## 环境要求
+## 🚀 快速上手
 
-- Windows
-- Node.js 22 或更高
-- .NET 9 SDK
-- 本地安装的 `Slay the Spire 2`
+### 环境要求
+- **操作系统**: Windows (目前《杀戮尖塔 2》仅支持 Windows)。
+- **运行环境**: [Node.js 22+](https://nodejs.org/)。
+- **游戏**: 已安装的正版《杀戮尖塔 2》。
 
-## 构建桥接模组
+### 选项 A: 使用预编译版本 (推荐)
+1. 从 Releases 页面下载最新的 `sts2-bridge` 预编译包 (包含 DLL 等文件)。
+2. 在游戏的 `mods` 目录下创建一个名为 `sts2-bridge` 的文件夹。
+   - 例如: `<杀戮尖塔2安装目录>\mods\sts2-bridge`
+3. 将下载的文件放入该文件夹中。
 
-可以直接显式传入游戏安装目录：
+### 选项 B: 从源码编译
+如果你想自行编译桥接模组，你还需要安装 [.NET 9 SDK](https://dotnet.microsoft.com/download/dotnet/9.0)。
+设置你的游戏安装路径并构建项目：
 
 ```powershell
-dotnet build .\mods\sts2-bridge\sts2-bridge.csproj `
-  -p:Sts2Dir="E:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2" `
-  -p:Sts2SkipDeploy=true
+$env:STS2_DIR = "<杀戮尖塔2安装目录>"
+dotnet build .\mods\sts2-bridge\sts2-bridge.csproj
 ```
+*注意：构建脚本会自动将生成的文件拷贝到游戏的 `mods\sts2-bridge` 文件夹中。*
 
-也可以先设环境变量：
+### 后续步骤...
 
-```powershell
-$env:STS2_DIR="E:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2"
-dotnet build .\mods\sts2-bridge\sts2-bridge.csproj -p:Sts2SkipDeploy=true
-```
-
-如果要把 DLL 直接部署到游戏目录下的 `mods\sts2-bridge`，去掉
-`-p:Sts2SkipDeploy=true` 即可。
-
-## 启动 MCP 服务
-
+1. **启动游戏**: 运行《杀戮尖塔 2》。桥接模组将初始化并在 `%APPDATA%\SlayTheSpire2\bridge\session.json` 生成会话文件。
+2. **启动 MCP 服务**:
 ```powershell
 node .\packages\mcp-server\index.js
 ```
 
-默认 discovery 文件路径：
+---
 
-```text
-%APPDATA%\SlayTheSpire2\bridge\session.json
-```
+## 🗺️ 路线图 & TODO
 
-如需覆盖，可设置：
+- [ ] **更完善的 Tools**: 扩展 MCP 工具集，支持更细粒度的状态查询和复杂的动作序列。
+- [ ] **联机支持**: 允许 Agent 交互或管理游戏内的联机/合作模式机制。
+- [ ] **游戏内对话注入**: 将 AI 的策略文本和思考过程直接作为对话框内容注入到游戏中，提升交互的沉浸感。
 
-```text
-STS2_BRIDGE_SESSION_FILE
-```
+---
 
-## 公开仓库约定
+## 📝 配置说明
 
-- `packages/mcp-server/package.json` 保持 `private: true`
-  - 这表示它不是一个准备发布到 npm 的包
-  - 不影响作为 GitHub 源码仓库公开
-- `mods/sts2-bridge/sts2-bridge.csproj`
-  - 不再硬编码本机游戏安装路径
-  - 请使用 `Sts2Dir`、`STS2_DIR` 或 `SLAY_THE_SPIRE_2_DIR`
-- `mods/sts2-bridge/sts2-bridge.json`
-  - 保持最小化、偏 loader-facing 的 manifest 结构
+MCP 服务会自动寻找桥接会话文件。你可以通过环境变量手动覆盖：
+- `STS2_BRIDGE_SESSION_FILE`: 指向自定义会话 JSON 的路径。
 
-## 免责声明
+---
 
-这是一个非官方项目，与 `Slay the Spire 2` 的开发者和发行方无隶属关系。
+## ⚖️ 免责声明与许可证
 
-## 许可证
+**免责声明**: 这是一个非官方的社区项目。它与 Mega Crit 或《杀戮尖塔 2》的开发者没有隶属关系、背书或关联。使用风险自负。
 
-[MIT](./LICENSE)
+**许可证**: [MIT](./LICENSE)

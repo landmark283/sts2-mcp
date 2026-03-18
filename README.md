@@ -1,121 +1,100 @@
-# sts2-mcp
+# sts2-mcp 🌌
 
-[中文说明](./README.zh-CN.md)
+[![English](https://img.shields.io/badge/lang-English-blue.svg)](#) [![Chinese](https://img.shields.io/badge/lang-中文-red.svg)](./README.zh-CN.md)
 
-`sts2-mcp` is a local control stack for **Slay the Spire 2** built around a
-bridge mod plus an MCP server.
+`sts2-mcp` is a high-performance, local control stack for **Slay the Spire 2**. It bridges the gap between the game's internal state and external AI agents using the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
 
-The project avoids screen scraping as the primary control path. Instead, it
-reads visible in-game state from a native mod running inside the game process
-and exposes legal actions to external agents through MCP.
+Unlike traditional screen-scraping or OCR-based solutions, `sts2-mcp` uses a **native C# bridge mod** to extract precise game data and expose legal actions directly, ensuring 100% accuracy and sub-millisecond latency.
 
-## What Is In This Repo
+---
 
-- `mods/sts2-bridge`
-  - C#/.NET 9 bridge mod loaded by Slay the Spire 2
-  - exposes local loopback HTTP endpoints
-  - serializes current run/combat/reward/map state
-  - executes legal in-game actions
-- `packages/mcp-server`
-  - Node 22 stdio MCP server
-  - reads the bridge discovery file
-  - exposes bridge-backed MCP tools such as:
-    - `sts2_get_state`
-    - `sts2_list_actions`
-    - `sts2_perform_action`
-    - `sts2_play_card_sequence`
-    - `sts2_resolve_room_rewards`
-    - `sts2_resolve_rest_site`
-    - `sts2_resolve_card_selection`
-    - `sts2_resolve_shop_visit`
+## 🏗️ Architecture
 
-## Current Scope
+The project consists of two primary components:
 
-This repository is focused on **source code** for the bridge and MCP server.
+### 1. `mods/sts2-bridge` (The "Sensors & Actuators")
+A C#/.NET 9 mod that injects directly into the Slay the Spire 2 process.
+- **State Serialization**: Converts complex in-game objects (Run, Combat, Rewards, Maps) into clean JSON.
+- **Action Execution**: Directly invokes game methods to perform cards plays, selections, and navigation.
+- **Discovery**: Automatically creates a session file for the MCP server to find and connect to.
 
-It does not include:
+### 2. `packages/mcp-server` (The "Interface")
+A Node.js 22 server that implements the standard MCP.
+- **Tool Mapping**: Translates bridge HTTP endpoints into standard MCP tools.
+- **Safety**: Implements `state_version` guarding to prevent "stale" actions (e.g., trying to play a card that was already exhausted).
+- **Optimization**: Handles complex batching for rewards, shops, and campfires to minimize LLM round trips.
 
-- local planning documents
-- local experiment folders
-- generated binaries
-- local MCP config
-- machine-specific logs or session files
+---
 
-## Status
+## 🛠️ MCP Tools Reference
 
-The current codebase has already been live-tested against a local
-`Slay the Spire 2` install on the `0.99+` line and includes working support for:
+The server exposes the following tools to any MCP-compliant agent (like Claude Desktop or Antigravity):
 
-- bridge discovery through `%APPDATA%\\SlayTheSpire2\\bridge\\session.json`
-- stable state reads while the game is running windowed
-- legal action listing
-- state-version-guarded action execution
-- combat card play
-- batched multi-card sequencing with rematching after hand reindex
-- room reward batching
-- campfire batching
-- card-selection batching
-- shop batching with purchase reindex handling
-- map route summarization for route planning
+| Tool | Description |
+| :--- | :--- |
+| `sts2_get_state` | Fetches the full current game state (Screen, Health, Deck, Relics, etc.). |
+| `sts2_list_actions` | Lists all currently legal actions available to the player. |
+| `sts2_perform_action` | Executes a single action by its unique ID. |
+| `sts2_play_card_sequence` | Plays multiple cards in order, with automatic hand re-indexing. |
+| `sts2_resolve_room_rewards` | Claims all gold/potions and optionally picks a card in one call. |
+| `sts2_resolve_rest_site` | Performs a rest/smith and proceeds back to the map. |
+| `sts2_resolve_card_selection` | Handles card pick/skip/transform screens perfectly. |
+| `sts2_pick_option` | Picks indexed reward/event/rest/card-selection options without raw action-id guessing. |
+| `sts2_travel_to_coordinate` | Resolves cleanup, waits for a stable map snapshot, and then travels to a coordinate. |
+| `sts2_resolve_shop_visit` | Buys multiple items and removes a card in a single batch. |
 
-## Requirements
+---
 
-- Windows
-- Node.js 22 or newer
-- .NET 9 SDK
-- a local `Slay the Spire 2` install
+## 🚀 Getting Started
 
-## Build The Bridge
+### Prerequisites
+- **OS**: Windows (Slay the Spire 2 is currently Windows-only).
+- **Runtime**: [Node.js 22+](https://nodejs.org/).
+- **Game**: A legal copy of Slay the Spire 2.
 
-Pass the game install path explicitly:
+### Option A: Using Pre-compiled Release (Recommended)
+1. Download the latest `sts2-bridge` release (DLL and associated files) from the Releases page.
+2. Create a folder named `sts2-bridge` inside your game's `mods` directory.
+   - Example: `<PATH_TO_STS2>\mods\sts2-bridge`
+3. Place the downloaded files into that folder.
+
+### Option B: Building from Source
+If you prefer to compile it yourself, you will also need the [.NET 9 SDK](https://dotnet.microsoft.com/download/dotnet/9.0).
+Set your game installation path and build the project:
 
 ```powershell
-dotnet build .\mods\sts2-bridge\sts2-bridge.csproj `
-  -p:Sts2Dir="E:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2" `
-  -p:Sts2SkipDeploy=true
+$env:STS2_DIR = "<PATH_TO_STS2>"
+dotnet build .\mods\sts2-bridge\sts2-bridge.csproj
 ```
+*Note: This will automatically copy the build output to the game's `mods\sts2-bridge` folder.*
 
-Or set an environment variable first:
+### Next Steps...
 
-```powershell
-$env:STS2_DIR="E:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2"
-dotnet build .\mods\sts2-bridge\sts2-bridge.csproj -p:Sts2SkipDeploy=true
-```
-
-To deploy the built DLL into the game's `mods\sts2-bridge` directory, omit
-`-p:Sts2SkipDeploy=true`.
-
-## Run The MCP Server
-
+1. **Launch the Game**: Run Slay the Spire 2. The bridge will initialize and create a session file at `%APPDATA%\SlayTheSpire2\bridge\session.json`.
+2. **Start the MCP Server**:
 ```powershell
 node .\packages\mcp-server\index.js
 ```
 
-The server discovers the active bridge session from:
+---
 
-```text
-%APPDATA%\SlayTheSpire2\bridge\session.json
-```
+## 🗺️ Roadmap & TODO
 
-You can override that path with:
+- [ ] **Better Tools**: Expanding the MCP toolset for more granular state queries and complex action sequences.
+- [ ] **Multiplayer Support**: Enabling agents to interact with or manage cooperative/multiplayer gameplay mechanics.
+- [ ] **In-Game Dialogue Integration**: Injecting AI strategy text and reasoning directly into the game's dialogue boxes for a more immersive, visual experience.
 
-```text
-STS2_BRIDGE_SESSION_FILE
-```
+---
 
-## Repository Notes
+## 📝 Configuration
 
-- `packages/mcp-server/package.json` stays `private: true` because this project
-  is not intended to be published as an npm package.
-- `mods/sts2-bridge/sts2-bridge.csproj` intentionally avoids hardcoded local
-  install paths. Use `Sts2Dir`, `STS2_DIR`, or `SLAY_THE_SPIRE_2_DIR`.
-- `mods/sts2-bridge/sts2-bridge.json` is kept minimal and loader-facing.
+The MCP server looks for the bridge session file automatically. You can override it via environment variables:
+- `STS2_BRIDGE_SESSION_FILE`: Path to a custom session JSON.
 
-## Disclaimer
+---
 
-This is an unofficial project and is not affiliated with the Slay the Spire 2
-developers or publishers.
+## ⚖️ Disclaimer & License
 
-## License
+**Disclaimer**: This is an unofficial community project. It is not affiliated with, endorsed by, or associated with Mega Crit or the developers of Slay the Spire 2. Use at your own risk.
 
-[MIT](./LICENSE)
+**License**: [MIT](./LICENSE)
