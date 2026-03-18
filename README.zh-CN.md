@@ -33,9 +33,11 @@
 | 工具名称 | 功能描述 |
 | :--- | :--- |
 | `sts2_get_state` | 获取完整的当前游戏状态（界面、血量、卡组、遗物等）。 |
+| `sts2_get_deck` | 返回完整主牌组，适合商店、升级和 Boss 前的低频策略判断。 |
 | `sts2_list_actions` | 列出当前玩家所有合法的可选动作。 |
-| `sts2_perform_action` | 通过唯一的 Action ID 执行单个动作。 |
+| `sts2_perform_action` | 通过唯一的 Action ID 执行单个动作，并可通过 `return_state_after` 一并返回完整的后置原始状态。 |
 | `sts2_play_card_sequence` | 按顺序打出多张卡牌，并自动处理手牌索引重排。 |
+| `sts2_execute_combat_sequence` | 在一次调用中混合执行出牌、喝药和 `end_turn`，并自动处理重匹配。 |
 | `sts2_resolve_room_rewards` | 一键领取金币/药水，并可选择性地拿取卡牌奖励。 |
 | `sts2_resolve_rest_site` | 执行休息/锻造操作，并自动返回地图。 |
 | `sts2_resolve_card_selection` | 完美处理选牌、跳过或转化的弹出界面。 |
@@ -90,6 +92,11 @@ node .\packages\mcp-server\index.js
 
 MCP 服务会自动寻找桥接会话文件。你可以通过环境变量手动覆盖：
 - `STS2_BRIDGE_SESSION_FILE`: 指向自定义会话 JSON 的路径。
+
+战斗调用说明：
+- 不要把连续出牌拆成并行的 `sts2_perform_action`。
+- 纯出牌回合优先使用 `sts2_play_card_sequence`。
+- 如果同一回合要混合出牌、喝药或结束回合，优先使用 `sts2_execute_combat_sequence`。
 
 ---
 

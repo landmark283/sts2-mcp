@@ -156,7 +156,7 @@ internal static class BridgeServer
                 BridgeDebugTrace.Write("http GET /state authorize");
                 EnsureAuthorized(context.Request);
                 BridgeDebugTrace.Write("http GET /state authorized");
-                var payload = await BridgeGameApi.GetStateResponseAsync();
+                var payload = await BridgeGameApi.GetStateResponseAsync(cancellationToken);
                 await WriteJsonAsync(context.Response, HttpStatusCode.OK, payload, cancellationToken);
                 BridgeDebugTrace.Write("http GET /state ok");
                 return;
@@ -168,7 +168,7 @@ internal static class BridgeServer
                 BridgeDebugTrace.Write("http GET /actions authorize");
                 EnsureAuthorized(context.Request);
                 BridgeDebugTrace.Write("http GET /actions authorized");
-                var payload = await BridgeGameApi.GetActionsResponseAsync();
+                var payload = await BridgeGameApi.GetActionsResponseAsync(cancellationToken);
                 await WriteJsonAsync(context.Response, HttpStatusCode.OK, payload, cancellationToken);
                 BridgeDebugTrace.Write("http GET /actions ok");
                 return;

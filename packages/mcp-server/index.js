@@ -6,7 +6,7 @@ const path = require("path");
 const { setTimeout: delay } = require("timers/promises");
 
 const SERVER_NAME = "sts2";
-const SERVER_VERSION = "0.4.16";
+const SERVER_VERSION = "0.4.17";
 const FALLBACK_PROTOCOL_VERSION = "2025-03-26";
 const DEFAULT_LOG_FILE_NAME = "mcp-stdio.log";
 const MAX_LOG_PREVIEW = 600;
@@ -91,7 +91,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "sts2_perform_action",
     description:
-      "Execute one currently legal bridge action by action_id and return the resulting state snapshot.",
+      "Execute one currently legal bridge action by action_id. Avoid parallel combat play-card calls; use sts2_play_card_sequence or sts2_execute_combat_sequence for consecutive combat actions. Set return_state_after=true to include the full post-action bridge state in the tool response.",
     inputSchema: {
       type: "object",
       properties: {
@@ -109,6 +109,9 @@ const TOOL_DEFINITIONS = [
           type: "integer",
           minimum: 0,
           maximum: MAX_ACTION_WAIT_MS
+        },
+        return_state_after: {
+          type: "boolean"
         }
       },
       required: ["action_id"],
@@ -118,7 +121,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "sts2_play_card_sequence",
     description:
-      "Execute multiple currently planned play_card actions in one tool call. Later steps are automatically rematched against the current hand and legal targets after each card resolves, so the caller does not need to manually rewrite hand indices after reordering or draws.",
+      "Execute multiple currently planned play_card actions in one tool call. Later steps are automatically rematched against the current hand and legal targets after each card resolves, so the caller does not need to manually rewrite hand indices after reordering or draws. Do not parallelize consecutive combat card plays with sts2_perform_action. Set return_state_after=true to include a compact post-sequence combat summary in the tool response.",
     inputSchema: {
       type: "object",
       properties: {
@@ -140,6 +143,43 @@ const TOOL_DEFINITIONS = [
           type: "integer",
           minimum: 0,
           maximum: MAX_ACTION_WAIT_MS
+        },
+        return_state_after: {
+          type: "boolean"
+        }
+      },
+      required: ["action_ids"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_execute_combat_sequence",
+    description:
+      "Execute a mixed combat sequence in one tool call. Supports play_card, use_potion, and end_turn actions, automatically rematching later play_card/use_potion steps after reindexing or draw changes. If end_turn is included anywhere in action_ids, it is always executed last. Set return_state_after=true to include a compact post-sequence combat summary in the tool response.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action_ids: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "string",
+            minLength: 1
+          }
+        },
+        expected_state_version: {
+          type: "integer"
+        },
+        strict: {
+          type: "boolean"
+        },
+        wait_after_ms: {
+          type: "integer",
+          minimum: 0,
+          maximum: MAX_ACTION_WAIT_MS
+        },
+        return_state_after: {
+          type: "boolean"
         }
       },
       required: ["action_ids"],
@@ -149,7 +189,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "sts2_end_turn",
     description:
-      "Convenience wrapper around sts2_perform_action for the combat end_turn action.",
+      "Convenience wrapper around sts2_perform_action for the combat end_turn action. Set return_state_after=true to include the full post-action bridge state in the tool response.",
     inputSchema: {
       type: "object",
       properties: {
@@ -163,6 +203,9 @@ const TOOL_DEFINITIONS = [
           type: "integer",
           minimum: 0,
           maximum: MAX_ACTION_WAIT_MS
+        },
+        return_state_after: {
+          type: "boolean"
         }
       },
       additionalProperties: false
@@ -584,7 +627,7 @@ async function handleMessage(message) {
             version: SERVER_VERSION
           },
           instructions:
-            "Use sts2_get_state and sts2_list_actions to observe the game, then sts2_perform_action or sts2_end_turn to execute only legal actions."
+            "Use sts2_get_state and sts2_list_actions to observe the game, then execute only legal actions. For consecutive combat plays, prefer sts2_play_card_sequence or sts2_execute_combat_sequence instead of parallel sts2_perform_action calls."
         });
       case "ping":
         return writeResult(message.id, {});
@@ -622,6 +665,8 @@ async function handleToolCall(params) {
       return await performActionTool(args);
     case "sts2_play_card_sequence":
       return await playCardSequenceTool(args);
+    case "sts2_execute_combat_sequence":
+      return await executeCombatSequenceTool(args);
     case "sts2_end_turn":
       return await endTurnTool(args);
     case "sts2_resolve_room_rewards":
@@ -787,6 +832,10 @@ async function performActionTool(args) {
       "expected_state_version"
     );
     const strictStateVersion = optionalBoolean(args.strict, "strict") ?? false;
+    const returnStateAfter = optionalBoolean(
+      args.return_state_after,
+      "return_state_after"
+    ) ?? false;
     const waitAfterMs = clampInteger(
       args.wait_after_ms,
       DEFAULT_ACTION_WAIT_MS,
@@ -806,22 +855,109 @@ async function performActionTool(args) {
       }
     );
 
-    return asToolResult(attachInteractionHints(result), false);
+    return asToolResult(
+      attachInteractionHints(
+        attachReturnStateAfterPayload(result, returnStateAfter, result?.state)
+      ),
+      false
+    );
   } catch (error) {
     return asToolResult(toolErrorPayload(error), true);
   }
 }
 
 async function playCardSequenceTool(args) {
+  return runCombatSequenceTool(args, {
+    toolName: "sts2_play_card_sequence",
+    sequenceLabel: "play-card sequence",
+    allowedActionKinds: new Set(["play_card"])
+  });
+}
+
+async function executeCombatSequenceTool(args) {
+  return runCombatSequenceTool(args, {
+    toolName: "sts2_execute_combat_sequence",
+    sequenceLabel: "combat sequence",
+    allowedActionKinds: new Set(["play_card", "use_potion", "end_turn"])
+  });
+}
+
+async function endTurnTool(args) {
   try {
+    const expectedStateVersion = optionalInteger(
+      args.expected_state_version,
+      "expected_state_version"
+    );
+    const strictStateVersion = optionalBoolean(args.strict, "strict") ?? false;
+    const returnStateAfter = optionalBoolean(
+      args.return_state_after,
+      "return_state_after"
+    ) ?? false;
+    const waitAfterMs = clampInteger(
+      args.wait_after_ms,
+      DEFAULT_ACTION_WAIT_MS,
+      0,
+      MAX_ACTION_WAIT_MS,
+      "wait_after_ms"
+    );
+    const session = getLiveSession();
+    const result = await performBridgeAction(
+      session,
+      "end_turn",
+      waitAfterMs,
+      expectedStateVersion,
+      {
+        strictStateVersion
+      }
+    );
+
+    return asToolResult(
+      attachInteractionHints(
+        attachReturnStateAfterPayload(result, returnStateAfter, result?.state)
+      ),
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+function attachReturnStateAfterPayload(payload, returnStateAfter, stateAfter) {
+  if (!returnStateAfter || !isPlainObject(payload) || !isPlainObject(stateAfter)) {
+    return payload;
+  }
+
+  return {
+    ...payload,
+    state_after: stateAfter
+  };
+}
+
+async function runCombatSequenceTool(args, options = {}) {
+  try {
+    let initialSequenceState = null;
     const finalize = (payload) =>
-      asPrecompactedToolResult(compactPlayCardSequencePayload(payload), false);
+      asPrecompactedToolResult(
+        compactPlayCardSequencePayload(
+          isPlainObject(payload) && isPlainObject(initialSequenceState)
+            ? {
+                ...payload,
+                initial_state: initialSequenceState
+              }
+            : payload
+        ),
+        false
+      );
     const actionIds = requireNonEmptyStringArray(args.action_ids, "action_ids");
     const expectedStateVersion = optionalInteger(
       args.expected_state_version,
       "expected_state_version"
     );
     const strictStateVersion = optionalBoolean(args.strict, "strict") ?? false;
+    const returnStateAfter = optionalBoolean(
+      args.return_state_after,
+      "return_state_after"
+    ) ?? false;
     const waitAfterMs = clampInteger(
       args.wait_after_ms,
       DEFAULT_ACTION_WAIT_MS,
@@ -840,8 +976,22 @@ async function playCardSequenceTool(args) {
       );
     }
 
+    const sequenceLabel =
+      typeof options.sequenceLabel === "string" && options.sequenceLabel.trim()
+        ? options.sequenceLabel.trim()
+        : "combat sequence";
+    const allowedActionKinds =
+      options.allowedActionKinds instanceof Set && options.allowedActionKinds.size > 0
+        ? options.allowedActionKinds
+        : new Set(["play_card", "use_potion", "end_turn"]);
+    const normalizedActionIds = normalizeCombatSequenceActionIds(actionIds);
+    const reorderedEndTurnToLast =
+      normalizedActionIds.length === actionIds.length &&
+      normalizedActionIds.some((actionId, index) => actionId !== actionIds[index]);
+
     const session = getLiveSession();
     let state = await getBridgeState(session);
+    initialSequenceState = isPlainObject(state) ? state : null;
 
     const initialStateVersionAdjusted =
       Number.isInteger(expectedStateVersion) &&
@@ -854,106 +1004,143 @@ async function playCardSequenceTool(args) {
         : null;
 
     if (strictStateVersion && initialStateVersionAdjusted) {
-      return asPrecompactedToolResult(
-        compactPlayCardSequencePayload(
-        {
-          ok: false,
-          resolved: false,
-          reason: "state_version_mismatch",
-          ...initialStateVersionAdjusted,
-          state
-        }),
-        false
-      );
-    }
-
-    const initialBlocker = getPlayCardSequenceContinuationBlocker(state);
-    if (initialBlocker) {
       return finalize(
-        {
-          ok: false,
-          resolved: false,
-          ...initialBlocker,
-          requested_action_count: actionIds.length,
-          state
-        }
-      );
-    }
-
-    const initialPlayCardActions = getPlayableCardActions(state);
-    const sequencePlan = [];
-    for (let sequenceIndex = 0; sequenceIndex < actionIds.length; sequenceIndex += 1) {
-      const requestedActionId = actionIds[sequenceIndex];
-      const requestedActionResolution = resolveRequestedPlayCardAction(
-        requestedActionId,
-        initialPlayCardActions
-      );
-      const matchedAction = requestedActionResolution.action;
-      if (!matchedAction) {
-        return finalize(
+        attachReturnStateAfterPayload(
           {
             ok: false,
             resolved: false,
-            reason: "requested_play_card_action_unavailable",
-            sequence_index: sequenceIndex,
-            requested_action_id: requestedActionId,
-            available_play_card_actions: initialPlayCardActions.map((action) =>
-              summarizeActionForAgent(action)
-            ),
+            reason: "state_version_mismatch",
+            ...initialStateVersionAdjusted,
+            requested_action_ids: actionIds,
+            normalized_action_ids: normalizedActionIds,
+            reordered_end_turn_to_last: reorderedEndTurnToLast,
             state
-          }
+          },
+          returnStateAfter,
+          state
+        )
+      );
+    }
+
+    const initialBlocker = getCombatSequenceContinuationBlocker(state, sequenceLabel);
+    if (initialBlocker) {
+      return finalize(
+        attachReturnStateAfterPayload(
+          {
+            ok: false,
+            resolved: false,
+            ...initialBlocker,
+            requested_action_count: normalizedActionIds.length,
+            requested_action_ids: actionIds,
+            normalized_action_ids: normalizedActionIds,
+            reordered_end_turn_to_last: reorderedEndTurnToLast,
+            state
+          },
+          returnStateAfter,
+          state
+        )
+      );
+    }
+
+    const sequencePlan = [];
+    for (let sequenceIndex = 0; sequenceIndex < normalizedActionIds.length; sequenceIndex += 1) {
+      const requestedActionId = normalizedActionIds[sequenceIndex];
+      const requestedActionResolution = resolveRequestedCombatSequenceAction(
+        requestedActionId,
+        state,
+        allowedActionKinds
+      );
+      const matchedAction = requestedActionResolution.action;
+      if (!matchedAction) {
+        const reason = requestedActionResolution.unsupported_kind
+          ? "unsupported_combat_sequence_action"
+          : "requested_combat_sequence_action_unavailable";
+        return finalize(
+          attachReturnStateAfterPayload(
+            {
+              ok: false,
+              resolved: false,
+              reason,
+              sequence_index: sequenceIndex,
+              requested_action_id: requestedActionId,
+              requested_action_kind: requestedActionResolution.kind,
+              allowed_action_kinds: Array.from(allowedActionKinds),
+              available_actions: summarizeCombatSequenceAvailableActions(
+                getCombatSequenceAvailableActions(state, allowedActionKinds)
+              ),
+              requested_action_ids: actionIds,
+              normalized_action_ids: normalizedActionIds,
+              reordered_end_turn_to_last: reorderedEndTurnToLast,
+              state
+            },
+            returnStateAfter,
+            state
+          )
         );
       }
 
       sequencePlan.push(
-        buildPlannedPlayCardSequenceStep(matchedAction, sequenceIndex, requestedActionId)
+        buildPlannedCombatSequenceStep(matchedAction, sequenceIndex, requestedActionId)
       );
     }
-    const sequencePlanOutput = sequencePlan.map(summarizePlayCardSequencePlanStep);
+    const sequencePlanOutput = sequencePlan.map(summarizeCombatSequencePlanStep);
 
     const executedSteps = [];
 
     for (let sequenceIndex = 0; sequenceIndex < sequencePlan.length; sequenceIndex += 1) {
-      const blocker = getPlayCardSequenceContinuationBlocker(state);
+      const blocker = getCombatSequenceContinuationBlocker(state, sequenceLabel);
       if (blocker) {
         return finalize(
-          {
-            ok: true,
-            resolved: false,
-            reason: blocker.reason,
-            message: blocker.message,
-            requested_action_count: sequencePlan.length,
-            executed_count: executedSteps.length,
-            remaining_count: sequencePlan.length - executedSteps.length,
-            next_sequence_index: sequenceIndex,
-            sequence_plan: sequencePlanOutput,
-            executed_steps: executedSteps,
+          attachReturnStateAfterPayload(
+            {
+              ok: true,
+              resolved: false,
+              reason: blocker.reason,
+              message: blocker.message,
+              requested_action_count: sequencePlan.length,
+              executed_count: executedSteps.length,
+              remaining_count: sequencePlan.length - executedSteps.length,
+              next_sequence_index: sequenceIndex,
+              requested_action_ids: actionIds,
+              normalized_action_ids: normalizedActionIds,
+              reordered_end_turn_to_last: reorderedEndTurnToLast,
+              sequence_plan: sequencePlanOutput,
+              executed_steps: executedSteps,
+              state
+            },
+            returnStateAfter,
             state
-          }
+          )
         );
       }
 
       const planStep = sequencePlan[sequenceIndex];
-      const currentPlayCardActions = getPlayableCardActions(state);
-      const resolution = resolvePlannedPlayCardStep(planStep, currentPlayCardActions);
+      let resolution = resolvePlannedCombatSequenceStep(planStep, state);
       if (!resolution.action) {
         return finalize(
-          {
-            ok: true,
-            resolved: false,
-            reason: "requested_play_card_action_unavailable_after_reindex",
-            requested_action_count: sequencePlan.length,
-            executed_count: executedSteps.length,
-            remaining_count: sequencePlan.length - executedSteps.length,
-            next_sequence_index: sequenceIndex,
-            failed_step: summarizePlayCardSequencePlanStep(planStep),
-            sequence_plan: sequencePlanOutput,
-            executed_steps: executedSteps,
-            available_play_card_actions: currentPlayCardActions.map((action) =>
-              summarizeActionForAgent(action)
-            ),
+          attachReturnStateAfterPayload(
+            {
+              ok: true,
+              resolved: false,
+              reason: "requested_combat_sequence_action_unavailable_after_reindex",
+              requested_action_count: sequencePlan.length,
+              executed_count: executedSteps.length,
+              remaining_count: sequencePlan.length - executedSteps.length,
+              next_sequence_index: sequenceIndex,
+              failed_step: summarizeCombatSequencePlanStep(planStep),
+              requested_action_ids: actionIds,
+              normalized_action_ids: normalizedActionIds,
+              reordered_end_turn_to_last: reorderedEndTurnToLast,
+              sequence_plan: sequencePlanOutput,
+              executed_steps: executedSteps,
+              available_actions: summarizeCombatSequenceAvailableActions(
+                getCombatSequenceAvailableActions(state, allowedActionKinds)
+              ),
+              state
+            },
+            returnStateAfter,
             state
-          }
+          )
         );
       }
 
@@ -975,59 +1162,69 @@ async function playCardSequenceTool(args) {
           if (
             strictStateVersion ||
             stepAttempt >= ACTION_STATE_VERSION_RETRY_LIMIT ||
-            !isRecoverablePlayCardSequenceExecutionError(error)
+            !isRecoverableCombatSequenceExecutionError(error)
           ) {
             throw error;
           }
 
           state = await getBridgeState(session);
           stepAttempt += 1;
-          const retryBlocker = getPlayCardSequenceContinuationBlocker(state);
+          const retryBlocker = getCombatSequenceContinuationBlocker(state, sequenceLabel);
           if (retryBlocker) {
             return finalize(
-              {
-                ok: true,
-                resolved: false,
-                reason: retryBlocker.reason,
-                message: retryBlocker.message,
-                requested_action_count: sequencePlan.length,
-                executed_count: executedSteps.length,
-                remaining_count: sequencePlan.length - executedSteps.length,
-                next_sequence_index: sequenceIndex,
-                sequence_plan: sequencePlanOutput,
-                executed_steps: executedSteps,
+              attachReturnStateAfterPayload(
+                {
+                  ok: true,
+                  resolved: false,
+                  reason: retryBlocker.reason,
+                  message: retryBlocker.message,
+                  requested_action_count: sequencePlan.length,
+                  executed_count: executedSteps.length,
+                  remaining_count: sequencePlan.length - executedSteps.length,
+                  next_sequence_index: sequenceIndex,
+                  requested_action_ids: actionIds,
+                  normalized_action_ids: normalizedActionIds,
+                  reordered_end_turn_to_last: reorderedEndTurnToLast,
+                  sequence_plan: sequencePlanOutput,
+                  executed_steps: executedSteps,
+                  state
+                },
+                returnStateAfter,
                 state
-              }
+              )
             );
           }
 
-          const retryActions = getPlayableCardActions(state);
-          const retryResolution = resolvePlannedPlayCardStep(planStep, retryActions);
+          const retryResolution = resolvePlannedCombatSequenceStep(planStep, state);
           if (!retryResolution.action) {
             return finalize(
-              {
-                ok: true,
-                resolved: false,
-                reason: "requested_play_card_action_unavailable_after_retry",
-                requested_action_count: sequencePlan.length,
-                executed_count: executedSteps.length,
-                remaining_count: sequencePlan.length - executedSteps.length,
-                next_sequence_index: sequenceIndex,
-                failed_step: summarizePlayCardSequencePlanStep(planStep),
-                sequence_plan: sequencePlanOutput,
-                executed_steps: executedSteps,
-                available_play_card_actions: retryActions.map((action) =>
-                  summarizeActionForAgent(action)
-                ),
+              attachReturnStateAfterPayload(
+                {
+                  ok: true,
+                  resolved: false,
+                  reason: "requested_combat_sequence_action_unavailable_after_retry",
+                  requested_action_count: sequencePlan.length,
+                  executed_count: executedSteps.length,
+                  remaining_count: sequencePlan.length - executedSteps.length,
+                  next_sequence_index: sequenceIndex,
+                  failed_step: summarizeCombatSequencePlanStep(planStep),
+                  requested_action_ids: actionIds,
+                  normalized_action_ids: normalizedActionIds,
+                  reordered_end_turn_to_last: reorderedEndTurnToLast,
+                  sequence_plan: sequencePlanOutput,
+                  executed_steps: executedSteps,
+                  available_actions: summarizeCombatSequenceAvailableActions(
+                    getCombatSequenceAvailableActions(state, allowedActionKinds)
+                  ),
+                  state
+                },
+                returnStateAfter,
                 state
-              }
+              )
             );
           }
 
-          resolution.action = retryResolution.action;
-          resolution.match_type = retryResolution.match_type;
-          resolution.compatible_candidate_count =
-            retryResolution.compatible_candidate_count;
+          resolution = retryResolution;
         }
       }
       executedSteps.push({
@@ -1043,53 +1240,279 @@ async function playCardSequenceTool(args) {
     }
 
     return finalize(
-      {
-        ok: true,
-        resolved: true,
-        initial_state_version_adjusted: initialStateVersionAdjusted,
-        requested_action_count: sequencePlan.length,
-        executed_count: executedSteps.length,
-        remaining_count: 0,
-        sequence_plan: sequencePlanOutput,
-        executed_steps: executedSteps,
+      attachReturnStateAfterPayload(
+        {
+          ok: true,
+          resolved: true,
+          initial_state_version_adjusted: initialStateVersionAdjusted,
+          requested_action_count: sequencePlan.length,
+          executed_count: executedSteps.length,
+          remaining_count: 0,
+          requested_action_ids: actionIds,
+          normalized_action_ids: normalizedActionIds,
+          reordered_end_turn_to_last: reorderedEndTurnToLast,
+          sequence_plan: sequencePlanOutput,
+          executed_steps: executedSteps,
+          state
+        },
+        returnStateAfter,
         state
-      }
+      )
     );
   } catch (error) {
     return asToolResult(toolErrorPayload(error), true);
   }
 }
 
-async function endTurnTool(args) {
-  try {
-    const expectedStateVersion = optionalInteger(
-      args.expected_state_version,
-      "expected_state_version"
-    );
-    const strictStateVersion = optionalBoolean(args.strict, "strict") ?? false;
-    const waitAfterMs = clampInteger(
-      args.wait_after_ms,
-      DEFAULT_ACTION_WAIT_MS,
-      0,
-      MAX_ACTION_WAIT_MS,
-      "wait_after_ms"
-    );
-
-    const session = getLiveSession();
-    const result = await performBridgeAction(
-      session,
-      "end_turn",
-      waitAfterMs,
-      expectedStateVersion,
-      {
-        strictStateVersion
-      }
-    );
-
-    return asToolResult(attachInteractionHints(result), false);
-  } catch (error) {
-    return asToolResult(toolErrorPayload(error), true);
+function normalizeCombatSequenceActionIds(actionIds) {
+  if (!Array.isArray(actionIds) || actionIds.length <= 0) {
+    return [];
   }
+
+  const endTurnActions = [];
+  const orderedActions = [];
+  for (const actionId of actionIds) {
+    if (actionId === "end_turn") {
+      endTurnActions.push(actionId);
+      continue;
+    }
+
+    orderedActions.push(actionId);
+  }
+
+  return orderedActions.concat(endTurnActions);
+}
+
+function getCombatSequenceContinuationBlocker(state, sequenceLabel) {
+  const label =
+    typeof sequenceLabel === "string" && sequenceLabel.trim()
+      ? sequenceLabel.trim()
+      : "combat sequence";
+
+  if (!isPlainObject(state)) {
+    return {
+      reason: "missing_state",
+      message: `Bridge state was missing while resolving the ${label}.`
+    };
+  }
+
+  const cardSelectionBundle = buildCardSelectionBundle(state);
+  if (cardSelectionBundle.in_card_selection_flow) {
+    return {
+      reason: "card_selection_ready",
+      message: `Card selection became visible before the requested ${label} finished.`
+    };
+  }
+
+  const rewardBundle = buildRewardBundle(state);
+  if (rewardBundle.in_reward_flow) {
+    return {
+      reason: rewardBundle.card_reward_selection.visible
+        ? "reward_card_selection_ready"
+        : "reward_flow_ready",
+      message: `Combat transitioned into rewards before the requested ${label} finished.`
+    };
+  }
+
+  const screen = typeof state.screen === "string" ? state.screen : null;
+  if (screen !== "COMBAT") {
+    return {
+      reason: `screen:${screen ?? "unknown"}`,
+      message: "The game is no longer on the combat screen."
+    };
+  }
+
+  const combat = isPlainObject(state.combat) ? state.combat : {};
+  if (combat.in_progress !== true) {
+    return {
+      reason: "combat_not_in_progress",
+      message: "Combat is no longer in progress."
+    };
+  }
+
+  if (combat.current_side !== "Player") {
+    return {
+      reason: "not_player_turn",
+      message: "It is no longer the player's turn."
+    };
+  }
+
+  if (combat.is_play_phase !== true) {
+    return {
+      reason: "not_play_phase",
+      message: "Combat is not currently in the play phase."
+    };
+  }
+
+  if (combat.player_actions_disabled === true) {
+    return {
+      reason: "player_actions_disabled",
+      message: "Player actions are currently disabled."
+    };
+  }
+
+  return null;
+}
+
+function getRequestedCombatSequenceActionKind(actionId) {
+  if (typeof actionId !== "string") {
+    return null;
+  }
+
+  if (actionId.startsWith("play_card:")) {
+    return "play_card";
+  }
+
+  if (actionId.startsWith("use_potion:")) {
+    return "use_potion";
+  }
+
+  if (actionId === "end_turn") {
+    return "end_turn";
+  }
+
+  return null;
+}
+
+function getCombatSequenceAvailableActions(state, allowedActionKinds) {
+  return getNonAutomationActions(state).filter((action) => {
+    const kind = getRequestedCombatSequenceActionKind(action?.action_id);
+    return kind !== null && allowedActionKinds.has(kind);
+  });
+}
+
+function resolveRequestedCombatSequenceAction(requestedActionId, state, allowedActionKinds) {
+  const kind = getRequestedCombatSequenceActionKind(requestedActionId);
+  if (kind === null || !allowedActionKinds.has(kind)) {
+    return {
+      kind,
+      action: null,
+      unsupported_kind: true,
+      match_type: "unsupported",
+      compatible_candidate_count: 0
+    };
+  }
+
+  if (kind === "play_card") {
+    return {
+      kind,
+      ...resolveRequestedPlayCardAction(requestedActionId, getPlayableCardActions(state))
+    };
+  }
+
+  if (kind === "use_potion") {
+    return {
+      kind,
+      ...resolveRequestedUsePotionAction(requestedActionId, getUsablePotionActions(state))
+    };
+  }
+
+  if (kind === "end_turn") {
+    const action = getNonAutomationActions(state).find(
+      (candidate) => candidate?.action_id === "end_turn"
+    );
+    return {
+      kind,
+      action: action ?? null,
+      match_type: action ? "exact" : "unavailable",
+      compatible_candidate_count: action ? 1 : 0
+    };
+  }
+
+  return {
+    kind,
+    action: null,
+    unsupported_kind: true,
+    match_type: "unsupported",
+    compatible_candidate_count: 0
+  };
+}
+
+function buildPlannedCombatSequenceStep(action, sequenceIndex, requestedActionId = null) {
+  const actionId = typeof action?.action_id === "string" ? action.action_id : "";
+  if (actionId.startsWith("play_card:")) {
+    return buildPlannedPlayCardSequenceStep(action, sequenceIndex, requestedActionId);
+  }
+
+  if (actionId.startsWith("use_potion:")) {
+    return buildPlannedUsePotionSequenceStep(action, sequenceIndex, requestedActionId);
+  }
+
+  return buildPlannedEndTurnSequenceStep(action, sequenceIndex, requestedActionId);
+}
+
+function summarizeCombatSequencePlanStep(planStep) {
+  if (!isPlainObject(planStep)) {
+    return null;
+  }
+
+  const summary = {
+    sequence_index: Number.isInteger(planStep.sequence_index) ? planStep.sequence_index : null,
+    kind: typeof planStep.kind === "string" ? planStep.kind : null,
+    requested_action_id:
+      typeof planStep.requested_action_id === "string" ? planStep.requested_action_id : null
+  };
+
+  if (Number.isInteger(planStep.player_index)) {
+    summary.player_index = planStep.player_index;
+  }
+
+  if (Number.isInteger(planStep.initial_hand_index)) {
+    summary.initial_hand_index = planStep.initial_hand_index;
+  }
+
+  if (Number.isInteger(planStep.initial_slot_index)) {
+    summary.initial_slot_index = planStep.initial_slot_index;
+  }
+
+  if (isPlainObject(planStep.card)) {
+    summary.card = planStep.card;
+  }
+
+  if (isPlainObject(planStep.potion)) {
+    summary.potion = planStep.potion;
+  }
+
+  if (isPlainObject(planStep.target)) {
+    summary.target = planStep.target;
+  }
+
+  return summary;
+}
+
+function resolvePlannedCombatSequenceStep(planStep, state) {
+  if (!isPlainObject(planStep)) {
+    return {
+      action: null,
+      match_type: "unavailable",
+      compatible_candidate_count: 0
+    };
+  }
+
+  if (planStep.kind === "play_card") {
+    return resolvePlannedPlayCardStep(planStep, getPlayableCardActions(state));
+  }
+
+  if (planStep.kind === "use_potion") {
+    return resolvePlannedUsePotionStep(planStep, getUsablePotionActions(state));
+  }
+
+  if (planStep.kind === "end_turn") {
+    const action = getNonAutomationActions(state).find(
+      (candidate) => candidate?.action_id === "end_turn"
+    );
+    return {
+      action: action ?? null,
+      match_type: action ? "exact" : "unavailable",
+      compatible_candidate_count: action ? 1 : 0
+    };
+  }
+
+  return {
+    action: null,
+    match_type: "unavailable",
+    compatible_candidate_count: 0
+  };
 }
 
 async function resolveRoomRewardsTool(args) {
@@ -3429,70 +3852,20 @@ function getPlayableCardActions(state) {
   return getNonAutomationActions(state).filter(isPlayCardAction);
 }
 
+function isUsePotionAction(action) {
+  return (
+    isPlainObject(action) &&
+    typeof action.action_id === "string" &&
+    action.action_id.startsWith("use_potion:")
+  );
+}
+
+function getUsablePotionActions(state) {
+  return getNonAutomationActions(state).filter(isUsePotionAction);
+}
+
 function getPlayCardSequenceContinuationBlocker(state) {
-  if (!isPlainObject(state)) {
-    return {
-      reason: "missing_state",
-      message: "Bridge state was missing while resolving the play-card sequence."
-    };
-  }
-
-  const cardSelectionBundle = buildCardSelectionBundle(state);
-  if (cardSelectionBundle.in_card_selection_flow) {
-    return {
-      reason: "card_selection_ready",
-      message: "Card selection became visible before the requested play-card sequence finished."
-    };
-  }
-
-  const rewardBundle = buildRewardBundle(state);
-  if (rewardBundle.in_reward_flow) {
-    return {
-      reason: rewardBundle.card_reward_selection.visible
-        ? "reward_card_selection_ready"
-        : "reward_flow_ready",
-      message: "Combat transitioned into rewards before the requested play-card sequence finished."
-    };
-  }
-
-  const screen = typeof state.screen === "string" ? state.screen : null;
-  if (screen !== "COMBAT") {
-    return {
-      reason: `screen:${screen ?? "unknown"}`,
-      message: "The game is no longer on the combat screen."
-    };
-  }
-
-  const combat = isPlainObject(state.combat) ? state.combat : {};
-  if (combat.in_progress !== true) {
-    return {
-      reason: "combat_not_in_progress",
-      message: "Combat is no longer in progress."
-    };
-  }
-
-  if (combat.current_side !== "Player") {
-    return {
-      reason: "not_player_turn",
-      message: "It is no longer the player's turn."
-    };
-  }
-
-  if (combat.is_play_phase !== true) {
-    return {
-      reason: "not_play_phase",
-      message: "Combat is not currently in the play phase."
-    };
-  }
-
-  if (combat.player_actions_disabled === true) {
-    return {
-      reason: "player_actions_disabled",
-      message: "Player actions are currently disabled."
-    };
-  }
-
-  return null;
+  return getCombatSequenceContinuationBlocker(state, "play-card sequence");
 }
 
 function buildPlannedPlayCardSequenceStep(action, sequenceIndex, requestedActionId = null) {
@@ -3506,6 +3879,7 @@ function buildPlannedPlayCardSequenceStep(action, sequenceIndex, requestedAction
 
   return {
     sequence_index: sequenceIndex,
+    kind: "play_card",
     requested_action_id:
       typeof requestedActionId === "string" && requestedActionId.trim()
         ? requestedActionId
@@ -3524,19 +3898,46 @@ function buildPlannedPlayCardSequenceStep(action, sequenceIndex, requestedAction
 }
 
 function summarizePlayCardSequencePlanStep(planStep) {
-  if (!isPlainObject(planStep)) {
-    return null;
-  }
+  return summarizeCombatSequencePlanStep(planStep);
+}
+
+function buildPlannedUsePotionSequenceStep(action, sequenceIndex, requestedActionId = null) {
+  const targetActionSuffix =
+    typeof action?.target_action_suffix === "string" ? action.target_action_suffix : null;
+  const targetCombatId = Number.isFinite(action?.target_combat_id)
+    ? action.target_combat_id
+    : null;
+  const targetSide = typeof action?.target_side === "string" ? action.target_side : null;
+  const targetName = normalizeAgentText(action?.target_name);
 
   return {
-    sequence_index: Number.isInteger(planStep.sequence_index) ? planStep.sequence_index : null,
+    sequence_index: sequenceIndex,
+    kind: "use_potion",
     requested_action_id:
-      typeof planStep.requested_action_id === "string" ? planStep.requested_action_id : null,
-    player_index: Number.isInteger(planStep.player_index) ? planStep.player_index : null,
-    initial_hand_index:
-      Number.isInteger(planStep.initial_hand_index) ? planStep.initial_hand_index : null,
-    card: isPlainObject(planStep.card) ? planStep.card : null,
-    target: isPlainObject(planStep.target) ? planStep.target : null
+      typeof requestedActionId === "string" && requestedActionId.trim()
+        ? requestedActionId
+        : action.action_id,
+    player_index: Number.isInteger(action?.player_index) ? action.player_index : null,
+    initial_slot_index: Number.isInteger(action?.slot_index) ? action.slot_index : null,
+    potion: summarizePotionForAgent(action?.potion),
+    target: {
+      action_suffix: targetActionSuffix,
+      combat_id: targetCombatId,
+      side: targetSide,
+      name: targetName
+    },
+    action_fingerprint: buildUsePotionActionFingerprint(action)
+  };
+}
+
+function buildPlannedEndTurnSequenceStep(action, sequenceIndex, requestedActionId = null) {
+  return {
+    sequence_index: sequenceIndex,
+    kind: "end_turn",
+    requested_action_id:
+      typeof requestedActionId === "string" && requestedActionId.trim()
+        ? requestedActionId
+        : action?.action_id ?? "end_turn"
   };
 }
 
@@ -3717,10 +4118,10 @@ function doesRequestedPlayCardActionIdMatchAction(parsedActionId, action) {
     return true;
   }
 
-  return isCompatibleRequestedPlayCardTargetAlias(requestedTargetSuffix, action);
+  return isCompatibleRequestedActionTargetAlias(requestedTargetSuffix, action);
 }
 
-function isCompatibleRequestedPlayCardTargetAlias(requestedTargetSuffix, action) {
+function isCompatibleRequestedActionTargetAlias(requestedTargetSuffix, action) {
   if (typeof requestedTargetSuffix !== "string" || !requestedTargetSuffix.trim()) {
     return false;
   }
@@ -3728,8 +4129,7 @@ function isCompatibleRequestedPlayCardTargetAlias(requestedTargetSuffix, action)
   const normalizedSuffix = requestedTargetSuffix.trim().toLowerCase();
   const actionTargetSuffix =
     typeof action?.target_action_suffix === "string" ? action.target_action_suffix : null;
-  const targetType =
-    typeof action?.card?.target_type === "string" ? action.card.target_type : null;
+  const targetType = getActionTargetType(action);
 
   if (
     (normalizedSuffix === "all" || normalizedSuffix === "all_enemies" || normalizedSuffix === "aoe") &&
@@ -3776,7 +4176,7 @@ function scoreRequestedPlayCardActionIdMatch(parsedActionId, action) {
 
   if (requestedTargetSuffix !== null && actionTargetSuffix === requestedTargetSuffix) {
     score += 10;
-  } else if (isCompatibleRequestedPlayCardTargetAlias(requestedTargetSuffix, action)) {
+  } else if (isCompatibleRequestedActionTargetAlias(requestedTargetSuffix, action)) {
     score += 6;
   }
 
@@ -3813,7 +4213,259 @@ function scorePlayCardActionAgainstPlanStep(action, planStep) {
   return score;
 }
 
-function isRecoverablePlayCardSequenceExecutionError(error) {
+function getActionTargetType(action) {
+  if (typeof action?.target_scope === "string" && action.target_scope.trim()) {
+    return action.target_scope;
+  }
+
+  if (typeof action?.card?.target_type === "string" && action.card.target_type.trim()) {
+    return action.card.target_type;
+  }
+
+  if (typeof action?.potion?.target_type === "string" && action.potion.target_type.trim()) {
+    return action.potion.target_type;
+  }
+
+  return null;
+}
+
+function parseRequestedUsePotionActionId(actionId) {
+  if (typeof actionId !== "string") {
+    return null;
+  }
+
+  const parts = actionId.trim().split(":");
+  if (parts.length < 3 || parts[0] !== "use_potion") {
+    return null;
+  }
+
+  const playerIndex = Number.parseInt(parts[1], 10);
+  const slotIndex = Number.parseInt(parts[2], 10);
+  if (!Number.isInteger(playerIndex) || !Number.isInteger(slotIndex)) {
+    return null;
+  }
+
+  const rawTargetSuffix = parts.length > 3 ? parts.slice(3).join(":").trim() : "";
+  return {
+    action_id: actionId.trim(),
+    player_index: playerIndex,
+    slot_index: slotIndex,
+    target_suffix: rawTargetSuffix || null
+  };
+}
+
+function resolveRequestedUsePotionAction(requestedActionId, currentUsePotionActions) {
+  const actions = Array.isArray(currentUsePotionActions) ? currentUsePotionActions : [];
+  const exactMatch = actions.find((action) => action?.action_id === requestedActionId);
+  if (exactMatch) {
+    return {
+      action: exactMatch,
+      match_type: "exact",
+      compatible_candidate_count: 1
+    };
+  }
+
+  const parsed = parseRequestedUsePotionActionId(requestedActionId);
+  if (!parsed) {
+    return {
+      action: null,
+      match_type: "unavailable",
+      compatible_candidate_count: 0
+    };
+  }
+
+  const compatibleActions = actions.filter((action) =>
+    doesRequestedUsePotionActionIdMatchAction(parsed, action)
+  );
+  if (compatibleActions.length <= 0) {
+    return {
+      action: null,
+      match_type: "unavailable",
+      compatible_candidate_count: 0
+    };
+  }
+
+  const rankedActions = compatibleActions
+    .map((action) => ({
+      action,
+      score: scoreRequestedUsePotionActionIdMatch(parsed, action)
+    }))
+    .sort((left, right) => right.score - left.score);
+
+  return {
+    action: rankedActions[0].action,
+    match_type:
+      compatibleActions.length === 1 ? "normalized_id" : "normalized_id_ambiguous",
+    compatible_candidate_count: compatibleActions.length
+  };
+}
+
+function doesRequestedUsePotionActionIdMatchAction(parsedActionId, action) {
+  if (!isPlainObject(parsedActionId) || !isUsePotionAction(action)) {
+    return false;
+  }
+
+  if (
+    Number.isInteger(action?.player_index) &&
+    action.player_index !== parsedActionId.player_index
+  ) {
+    return false;
+  }
+
+  if (Number.isInteger(action?.slot_index) && action.slot_index !== parsedActionId.slot_index) {
+    return false;
+  }
+
+  const requestedTargetSuffix =
+    typeof parsedActionId.target_suffix === "string" ? parsedActionId.target_suffix : null;
+  const actionTargetSuffix =
+    typeof action?.target_action_suffix === "string" ? action.target_action_suffix : null;
+  if (requestedTargetSuffix === actionTargetSuffix) {
+    return true;
+  }
+
+  return isCompatibleRequestedActionTargetAlias(requestedTargetSuffix, action);
+}
+
+function scoreRequestedUsePotionActionIdMatch(parsedActionId, action) {
+  let score = 0;
+
+  if (
+    Number.isInteger(action?.player_index) &&
+    action.player_index === parsedActionId.player_index
+  ) {
+    score += 8;
+  }
+
+  if (Number.isInteger(action?.slot_index) && action.slot_index === parsedActionId.slot_index) {
+    score += 12;
+  }
+
+  const requestedTargetSuffix =
+    typeof parsedActionId.target_suffix === "string" ? parsedActionId.target_suffix : null;
+  const actionTargetSuffix =
+    typeof action?.target_action_suffix === "string" ? action.target_action_suffix : null;
+
+  if (requestedTargetSuffix !== null && actionTargetSuffix === requestedTargetSuffix) {
+    score += 10;
+  } else if (isCompatibleRequestedActionTargetAlias(requestedTargetSuffix, action)) {
+    score += 6;
+  }
+
+  return score;
+}
+
+function resolvePlannedUsePotionStep(planStep, currentUsePotionActions) {
+  const actions = Array.isArray(currentUsePotionActions) ? currentUsePotionActions : [];
+  const exactMatch = actions.find(
+    (action) =>
+      action?.action_id === planStep?.requested_action_id &&
+      doesUsePotionActionMatchPlanStep(action, planStep)
+  );
+  if (exactMatch) {
+    return {
+      action: exactMatch,
+      match_type: "exact",
+      compatible_candidate_count: 1
+    };
+  }
+
+  const compatibleActions = actions.filter((action) =>
+    doesUsePotionActionMatchPlanStep(action, planStep)
+  );
+  if (compatibleActions.length <= 0) {
+    return {
+      action: null,
+      match_type: "unavailable",
+      compatible_candidate_count: 0
+    };
+  }
+
+  const rankedActions = compatibleActions
+    .map((action) => ({
+      action,
+      score: scoreUsePotionActionAgainstPlanStep(action, planStep)
+    }))
+    .sort((left, right) => right.score - left.score);
+
+  return {
+    action: rankedActions[0].action,
+    match_type: compatibleActions.length === 1 ? "reindexed" : "reindexed_ambiguous",
+    compatible_candidate_count: compatibleActions.length
+  };
+}
+
+function doesUsePotionActionMatchPlanStep(action, planStep) {
+  if (!isUsePotionAction(action) || !isPlainObject(planStep)) {
+    return false;
+  }
+
+  if (
+    Number.isInteger(planStep.player_index) &&
+    Number.isInteger(action?.player_index) &&
+    action.player_index !== planStep.player_index
+  ) {
+    return false;
+  }
+
+  if (buildUsePotionActionFingerprint(action) !== planStep.action_fingerprint) {
+    return false;
+  }
+
+  const planTargetSuffix =
+    typeof planStep?.target?.action_suffix === "string"
+      ? planStep.target.action_suffix
+      : null;
+  const actionTargetSuffix =
+    typeof action?.target_action_suffix === "string" ? action.target_action_suffix : null;
+  if (planTargetSuffix !== actionTargetSuffix) {
+    return false;
+  }
+
+  const planTargetCombatId = Number.isFinite(planStep?.target?.combat_id)
+    ? planStep.target.combat_id
+    : null;
+  const actionTargetCombatId = Number.isFinite(action?.target_combat_id)
+    ? action.target_combat_id
+    : null;
+  if (planTargetCombatId !== null && actionTargetCombatId !== planTargetCombatId) {
+    return false;
+  }
+
+  return true;
+}
+
+function scoreUsePotionActionAgainstPlanStep(action, planStep) {
+  let score = 0;
+
+  const actionSlotIndex = Number.isInteger(action?.slot_index) ? action.slot_index : null;
+  const planSlotIndex = Number.isInteger(planStep?.initial_slot_index)
+    ? planStep.initial_slot_index
+    : null;
+  if (actionSlotIndex !== null && planSlotIndex !== null) {
+    score += 20 - Math.min(Math.abs(actionSlotIndex - planSlotIndex), 20);
+  }
+
+  if (
+    Number.isFinite(action?.target_combat_id) &&
+    Number.isFinite(planStep?.target?.combat_id) &&
+    action.target_combat_id === planStep.target.combat_id
+  ) {
+    score += 5;
+  }
+
+  if (
+    typeof action?.target_action_suffix === "string" &&
+    typeof planStep?.target?.action_suffix === "string" &&
+    action.target_action_suffix === planStep.target.action_suffix
+  ) {
+    score += 3;
+  }
+
+  return score;
+}
+
+function isRecoverableCombatSequenceExecutionError(error) {
   return (
     error instanceof BridgeHttpError &&
     (error.code === "state_version_conflict" || error.code === "action_not_available")
@@ -3909,6 +4561,16 @@ function buildPlayCardActionFingerprint(action) {
     costs_x: card.costs_x === true,
     has_star_cost_x: card.has_star_cost_x === true,
     dynamic_vars: buildCardDynamicVarFingerprint(card.dynamic_vars)
+  });
+}
+
+function buildUsePotionActionFingerprint(action) {
+  const potion = isPlainObject(action?.potion) ? action.potion : {};
+
+  return JSON.stringify({
+    title: normalizeAgentText(potion.title),
+    description_shape: buildStableCardTextFingerprint(potion.description),
+    target_type: getActionTargetType(action)
   });
 }
 
@@ -5774,6 +6436,19 @@ function summarizeStateForAgent(state) {
   };
 
   if (combat.in_progress === true || Array.isArray(playerCombat?.hand?.cards)) {
+    const playerCombatId = Number.isFinite(playerCreature?.combat_id) ? playerCreature.combat_id : null;
+    const playerName = normalizeAgentText(playerCreature?.name);
+    const summons = Array.isArray(combat.player_creatures)
+      ? combat.player_creatures
+          .map(summarizeCreatureForAgent)
+          .filter(
+            (creature) =>
+              creature !== null &&
+              (playerCombatId !== null
+                ? creature.combat_id !== playerCombatId
+                : normalizeAgentText(creature?.name) !== playerName)
+          )
+      : [];
     summary.combat = {
       in_progress: combat.in_progress === true,
       round_number: Number.isFinite(combat.round_number) ? combat.round_number : null,
@@ -5800,6 +6475,7 @@ function summarizeStateForAgent(state) {
       exhaust_pile_count: Number.isFinite(playerCombat?.exhaust_pile?.count)
         ? playerCombat.exhaust_pile.count
         : null,
+      summons,
       enemies: Array.isArray(combat.enemy_creatures)
         ? combat.enemy_creatures.map(summarizeCreatureForAgent).filter((creature) => creature !== null)
         : [],
@@ -7013,7 +7689,21 @@ function compactPayloadForOutput(payload) {
 }
 
 function compactPlayCardSequencePayload(payload) {
-  const compacted = compactPayloadForOutput(payload);
+  const rawState = isPlainObject(payload?.state) ? payload.state : null;
+  const rawInitialState = isPlainObject(payload?.initial_state)
+    ? payload.initial_state
+    : null;
+  const rawStateAfter = isPlainObject(payload?.state_after) ? payload.state_after : null;
+  const payloadWithoutInitialState = isPlainObject(payload)
+    ? (() => {
+        const cloned = {
+          ...payload
+        };
+        delete cloned.initial_state;
+        return cloned;
+      })()
+    : payload;
+  const compacted = compactPayloadForOutput(payloadWithoutInitialState);
   if (!isPlainObject(compacted)) {
     return compacted;
   }
@@ -7024,34 +7714,359 @@ function compactPlayCardSequencePayload(payload) {
 
   delete result.interaction_hints;
 
+  if (isPlainObject(rawStateAfter)) {
+    result.state_after = summarizeCombatSequenceStateForAgent(
+      rawStateAfter,
+      rawInitialState
+    );
+    delete result.state;
+  } else if (isPlainObject(rawState)) {
+    result.state = summarizeCombatSequenceStateForAgent(rawState, rawInitialState);
+  }
+
+  if (Array.isArray(result.sequence_plan)) {
+    result.sequence_plan = result.sequence_plan
+      .map(compactCombatSequencePlanStep)
+      .filter((step) => step !== null);
+  }
+
+  if (isPlainObject(result.failed_step)) {
+    result.failed_step = compactCombatSequencePlanStep(result.failed_step);
+  }
+
   if (Array.isArray(result.executed_steps)) {
-    result.executed_steps = result.executed_steps.map((step) => {
-      if (!isPlainObject(step)) {
-        return step;
-      }
+    result.executed_steps = result.executed_steps
+      .map((step) =>
+        compactCombatSequenceExecutedStep(step, {
+          includeRequestedActionId: !(result.ok === true && result.resolved === true)
+        })
+      )
+      .filter((step) => step !== null);
+  }
 
-      const compactStep = {
-        ...step
-      };
+  if (result.initial_state_version_adjusted == null) {
+    delete result.initial_state_version_adjusted;
+  }
 
-      if (isPlainObject(compactStep.execution)) {
-        const {
-          post_action_settled,
-          post_action_settle_reason,
-          post_action_settle_polls,
-          ...execution
-        } = compactStep.execution;
-        void post_action_settled;
-        void post_action_settle_reason;
-        void post_action_settle_polls;
-        compactStep.execution = execution;
-      }
+  if (result.reordered_end_turn_to_last !== true) {
+    delete result.reordered_end_turn_to_last;
+  }
 
-      return compactStep;
-    });
+  if (
+    Array.isArray(result.requested_action_ids) &&
+    Array.isArray(result.normalized_action_ids) &&
+    areStringArraysEqual(result.requested_action_ids, result.normalized_action_ids)
+  ) {
+    delete result.normalized_action_ids;
+  }
+
+  if (result.resolved === true) {
+    delete result.requested_action_ids;
+    delete result.normalized_action_ids;
+    delete result.remaining_count;
+  }
+
+  if (result.resolved === true) {
+    delete result.sequence_plan;
+  }
+
+  if (result.ok === true && result.resolved === true) {
+    delete result.requested_action_count;
+    delete result.executed_count;
   }
 
   return result;
+}
+
+function compactCombatSequencePlanStep(step) {
+  if (!isPlainObject(step)) {
+    return null;
+  }
+
+  return {
+    sequence_index: Number.isInteger(step.sequence_index) ? step.sequence_index : null,
+    kind: typeof step.kind === "string" ? step.kind : null,
+    requested_action_id:
+      typeof step.requested_action_id === "string" ? step.requested_action_id : null
+  };
+}
+
+function compactCombatSequenceExecutedStep(step, options = {}) {
+  if (!isPlainObject(step)) {
+    return null;
+  }
+
+  const executedActionId =
+    typeof step.executed_action_id === "string" ? step.executed_action_id : null;
+  if (!executedActionId) {
+    return null;
+  }
+
+  const requestedActionId =
+    typeof step.requested_action_id === "string" ? step.requested_action_id : null;
+  const includeRequestedActionId = options?.includeRequestedActionId === true;
+  const matchType =
+    typeof step.match_type === "string" && step.match_type !== "exact"
+      ? step.match_type
+      : null;
+  const compatibleCandidateCount =
+    Number.isInteger(step.compatible_candidate_count) && step.compatible_candidate_count > 1
+      ? step.compatible_candidate_count
+      : null;
+  const autoExecutedActions =
+    Array.isArray(step?.execution?.auto_executed_actions) &&
+    step.execution.auto_executed_actions.length > 0
+      ? step.execution.auto_executed_actions
+      : null;
+
+  if (
+    requestedActionId === null ||
+    requestedActionId === executedActionId ||
+    includeRequestedActionId !== true
+  ) {
+    if (matchType === null && compatibleCandidateCount === null && autoExecutedActions === null) {
+      return executedActionId;
+    }
+  }
+
+  const compactStep = {
+    action_id: executedActionId
+  };
+
+  if (
+    includeRequestedActionId === true &&
+    requestedActionId !== null &&
+    requestedActionId !== executedActionId
+  ) {
+    compactStep.requested_action_id = requestedActionId;
+  }
+
+  if (matchType !== null) {
+    compactStep.match = matchType;
+  }
+
+  if (compatibleCandidateCount !== null) {
+    compactStep.candidates = compatibleCandidateCount;
+  }
+
+  if (autoExecutedActions !== null) {
+    compactStep.auto_executed_actions = autoExecutedActions;
+  }
+
+  return compactStep;
+}
+
+function summarizeCombatSequenceStateForAgent(state, initialState = null) {
+  if (!isPlainObject(state)) {
+    return state;
+  }
+
+  const player = isPlainObject(state?.players?.[0]) ? state.players[0] : {};
+  const playerCreature = isPlainObject(player.creature) ? player.creature : {};
+  const playerCombat = isPlainObject(player.combat) ? player.combat : {};
+
+  return {
+    screen: typeof state.screen === "string" ? state.screen : null,
+    state_version: Number.isFinite(state.state_version) ? state.state_version : null,
+    player: {
+      current_hp: Number.isFinite(playerCreature.current_hp) ? playerCreature.current_hp : null,
+      max_hp: Number.isFinite(playerCreature.max_hp) ? playerCreature.max_hp : null,
+      energy: Number.isFinite(playerCombat.energy) ? playerCombat.energy : null,
+      max_energy: Number.isFinite(playerCombat.max_energy) ? playerCombat.max_energy : null
+    },
+    enemy_changes: summarizeCombatSequenceEnemyChanges(initialState, state),
+    available_actions: summarizeCombatSequenceAvailableActions(getNonAutomationActions(state))
+  };
+}
+
+function summarizeCombatSequenceEnemyChanges(initialState, state) {
+  const initialEnemyMap = collectCombatEnemyStates(initialState);
+  const currentEnemyMap = collectCombatEnemyStates(state);
+  const keys = [...new Set([...initialEnemyMap.keys(), ...currentEnemyMap.keys()])];
+  const inferAllMissingEnemiesDefeated =
+    initialEnemyMap.size > 0 &&
+    currentEnemyMap.size === 0 &&
+    typeof state?.screen === "string" &&
+    state.screen !== "COMBAT";
+  const changes = [];
+
+  for (const key of keys) {
+    const before = initialEnemyMap.get(key) ?? null;
+    let after = currentEnemyMap.get(key) ?? null;
+    if (!after && before && inferAllMissingEnemiesDefeated) {
+      after = {
+        ...before,
+        current_hp: 0,
+        block: 0,
+        is_alive: false
+      };
+    }
+
+    if (!before && !after) {
+      continue;
+    }
+
+    const currentHpChanged =
+      (Number.isFinite(before?.current_hp) ? before.current_hp : null) !==
+      (Number.isFinite(after?.current_hp) ? after.current_hp : null);
+    const aliveChanged =
+      (typeof before?.is_alive === "boolean" ? before.is_alive : null) !==
+      (typeof after?.is_alive === "boolean" ? after.is_alive : null);
+
+    if (!currentHpChanged && !aliveChanged && before && after) {
+      continue;
+    }
+
+    const hpDelta =
+      Number.isFinite(before?.current_hp) && Number.isFinite(after?.current_hp)
+        ? after.current_hp - before.current_hp
+        : null;
+    let change = "status_changed";
+    if (!before && after) {
+      change = "appeared";
+    } else if (before && !after) {
+      change = "removed";
+    } else if (before && after && before.is_alive !== false && after.is_alive === false) {
+      change = "defeated";
+    } else if (currentHpChanged) {
+      change = "hp_changed";
+    }
+
+    changes.push({
+      combat_id: Number.isFinite(after?.combat_id) ? after.combat_id : before?.combat_id ?? null,
+      name: typeof after?.name === "string" ? after.name : before?.name ?? null,
+      current_hp: Number.isFinite(after?.current_hp) ? after.current_hp : null,
+      max_hp: Number.isFinite(after?.max_hp) ? after.max_hp : before?.max_hp ?? null,
+      is_alive:
+        typeof after?.is_alive === "boolean"
+          ? after.is_alive
+          : typeof before?.is_alive === "boolean"
+            ? before.is_alive
+            : null,
+      hp_delta: hpDelta,
+      change
+    });
+  }
+
+  return changes.sort(compareCombatSequenceEnemyChanges);
+}
+
+function collectCombatEnemyStates(state) {
+  const enemies = Array.isArray(state?.combat?.enemy_creatures) ? state.combat.enemy_creatures : [];
+  const enemyMap = new Map();
+
+  for (let index = 0; index < enemies.length; index += 1) {
+    const enemy = enemies[index];
+    if (!isPlainObject(enemy)) {
+      continue;
+    }
+
+    const combatId = Number.isFinite(enemy.combat_id) ? enemy.combat_id : null;
+    const name = normalizeAgentText(enemy.name);
+    const key = combatId !== null ? `combat:${combatId}` : `name:${name ?? "unknown"}:${index}`;
+    enemyMap.set(key, {
+      combat_id: combatId,
+      name,
+      current_hp: Number.isFinite(enemy.current_hp) ? enemy.current_hp : null,
+      max_hp: Number.isFinite(enemy.max_hp) ? enemy.max_hp : null,
+      block: Number.isFinite(enemy.block) ? enemy.block : 0,
+      is_alive:
+        typeof enemy.is_alive === "boolean"
+          ? enemy.is_alive
+          : Number.isFinite(enemy.current_hp)
+            ? enemy.current_hp > 0
+            : null
+    });
+  }
+
+  return enemyMap;
+}
+
+function compareCombatSequenceEnemyChanges(left, right) {
+  const leftCombatId = Number.isFinite(left?.combat_id) ? left.combat_id : Number.POSITIVE_INFINITY;
+  const rightCombatId = Number.isFinite(right?.combat_id) ? right.combat_id : Number.POSITIVE_INFINITY;
+  if (leftCombatId !== rightCombatId) {
+    return leftCombatId - rightCombatId;
+  }
+
+  return String(left?.name ?? "").localeCompare(String(right?.name ?? ""), "zh-Hans-CN");
+}
+
+function summarizeCombatSequenceAvailableActions(actions) {
+  if (!Array.isArray(actions)) {
+    return [];
+  }
+
+  return actions
+    .map(summarizeCombatSequenceAvailableAction)
+    .filter((action) => action !== null);
+}
+
+function summarizeCombatSequenceAvailableAction(action) {
+  if (!isPlainObject(action)) {
+    return null;
+  }
+
+  const summary = {
+    action_id: typeof action.action_id === "string" ? action.action_id : null
+  };
+
+  if (typeof action?.card?.title === "string" && action.card.title.trim()) {
+    summary.title = normalizeAgentText(action.card.title);
+    if (Number.isInteger(action.card.resolved_energy_cost)) {
+      summary.cost = action.card.resolved_energy_cost;
+    }
+  } else if (typeof action?.potion?.title === "string" && action.potion.title.trim()) {
+    summary.title = normalizeAgentText(action.potion.title);
+  } else if (typeof action.label === "string" && action.label.trim()) {
+    summary.label = normalizeAgentText(action.label);
+  }
+
+  const targetName =
+    typeof action.target_name === "string"
+      ? normalizeAgentText(action.target_name)
+      : normalizeAgentText(action?.target?.name);
+  const targetCombatId = Number.isFinite(action.target_combat_id)
+    ? action.target_combat_id
+    : Number.isFinite(action?.target?.combat_id)
+      ? action.target.combat_id
+      : null;
+  const targetActionSuffix =
+    typeof action.target_action_suffix === "string"
+      ? action.target_action_suffix
+      : typeof action?.target_mapping?.action_suffix === "string"
+        ? action.target_mapping.action_suffix
+        : null;
+
+  const targetParts = [];
+  if (targetName !== null) {
+    targetParts.push(targetName);
+  }
+  if (targetCombatId !== null) {
+    targetParts.push(`#${targetCombatId}`);
+  } else if (targetActionSuffix !== null && targetName === null) {
+    targetParts.push(targetActionSuffix);
+  }
+
+  if (targetParts.length > 0) {
+    summary.target = targetParts.join(" ");
+  }
+
+  return summary;
+}
+
+function areStringArraysEqual(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+    return false;
+  }
+
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function getRewardResolutionBlocker(rewardBundle, options) {
@@ -7767,10 +8782,25 @@ function attachInteractionHints(payload) {
 
   const hints = {};
   const playableCardActions = getPlayableCardActions(state);
+  const usablePotionActions = getUsablePotionActions(state);
+  const endTurnAvailable = getNonAutomationActions(state).some(
+    (action) => action?.action_id === "end_turn"
+  );
   if (playableCardActions.length >= 2) {
     hints.play_card_sequence = {
       play_card_action_count: playableCardActions.length,
-      recommended_tool: "sts2_play_card_sequence"
+      recommended_tool: "sts2_play_card_sequence",
+      avoid_parallel_perform_action: true
+    };
+  }
+
+  if (playableCardActions.length >= 2 || usablePotionActions.length > 0) {
+    hints.combat_sequence = {
+      play_card_action_count: playableCardActions.length,
+      use_potion_action_count: usablePotionActions.length,
+      end_turn_available: endTurnAvailable,
+      recommended_tool: "sts2_execute_combat_sequence",
+      avoid_parallel_perform_action: true
     };
   }
 

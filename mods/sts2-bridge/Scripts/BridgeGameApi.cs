@@ -88,40 +88,51 @@ internal sealed class BridgeRequestException : Exception
 internal static class BridgeGameApi
 {
     private const int PostActionSnapshotPumpTicks = 4;
-    private const int PostActionStablePollIntervalMs = 200;
-    private const int PostActionStableTimeoutMs = 5000;
+    private const int SnapshotSettlePollIntervalMs = 200;
+    private const int SnapshotSettleTimeoutMs = 5000;
+    private const int ObservationStablePollTarget = 1;
+    private const int CombatActionStablePollTarget = 3;
+    private const int EndTurnStablePollTarget = 6;
 
     private static readonly JsonSerializerOptions HashJsonOptions = new()
     {
         WriteIndented = false
     };
 
-    public static Task<object> GetStateResponseAsync()
+    private enum SnapshotSettleKind
+    {
+        Observe,
+        CombatAction,
+        EndTurn,
+        MapTravel
+    }
+
+    private readonly record struct SnapshotSettlementVerdict(bool Settled, string Reason);
+
+    private readonly record struct SnapshotSettleResult(
+        BridgeSnapshot Snapshot,
+        bool Settled,
+        string Reason,
+        int PollCount);
+
+    public static async Task<object> GetStateResponseAsync(CancellationToken cancellationToken = default)
     {
         EnsureDispatcherReady();
         BridgeDebugTrace.Write("get_state requested");
 
-        return BridgeCoordinator.RunOnMainThreadAsync(() =>
-        {
-            BridgeDebugTrace.Write("get_state executing on main thread");
-            var snapshot = CaptureSnapshot();
-            BridgeDebugTrace.Write($"get_state completed state_version={snapshot.StateVersion}");
-            return snapshot.StatePayload;
-        });
+        var snapshot = await CaptureObservedSnapshotAsync(cancellationToken);
+        BridgeDebugTrace.Write($"get_state completed state_version={snapshot.StateVersion}");
+        return snapshot.StatePayload;
     }
 
-    public static Task<object> GetActionsResponseAsync()
+    public static async Task<object> GetActionsResponseAsync(CancellationToken cancellationToken = default)
     {
         EnsureDispatcherReady();
         BridgeDebugTrace.Write("get_actions requested");
 
-        return BridgeCoordinator.RunOnMainThreadAsync(() =>
-        {
-            BridgeDebugTrace.Write("get_actions executing on main thread");
-            var snapshot = CaptureSnapshot();
-            BridgeDebugTrace.Write($"get_actions completed count={snapshot.ActionPayloads.Count}");
-            return CreateActionsPayload(snapshot);
-        });
+        var snapshot = await CaptureObservedSnapshotAsync(cancellationToken);
+        BridgeDebugTrace.Write($"get_actions completed count={snapshot.ActionPayloads.Count}");
+        return CreateActionsPayload(snapshot);
     }
 
     public static async Task<object> PerformActionResponseAsync(
@@ -141,7 +152,7 @@ internal static class BridgeGameApi
                 "Request body must include a non-empty action_id.");
         }
 
-        var before = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
+        var before = await CaptureObservedSnapshotAsync(cancellationToken);
         BridgeDebugTrace.Write($"perform_action snapshot_before action={actionId} version={before.StateVersion}");
 
         if (request.ExpectedStateVersion is int expectedStateVersion &&
@@ -230,119 +241,224 @@ internal static class BridgeGameApi
         await BridgeCoordinator.WaitForPumpTicksAsync(PostActionSnapshotPumpTicks, cancellationToken);
     }
 
+    private static async Task<BridgeSnapshot> CaptureObservedSnapshotAsync(CancellationToken cancellationToken)
+    {
+        BridgeDebugTrace.Write("observe_snapshot executing on main thread");
+        var snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
+        var settleResult = await WaitForSettledSnapshotAsync(
+            SnapshotSettleKind.Observe,
+            actionId: null,
+            snapshot,
+            cancellationToken);
+
+        BridgeDebugTrace.Write(
+            $"observe_snapshot settled={settleResult.Settled} reason={settleResult.Reason} polls={settleResult.PollCount} version={settleResult.Snapshot.StateVersion}");
+        return settleResult.Snapshot;
+    }
+
     private static async Task<BridgeSnapshot> MaybeWaitForStablePostActionSnapshotAsync(
         string actionId,
         BridgeSnapshot snapshot,
         CancellationToken cancellationToken)
     {
-        if (!ShouldWaitForStablePostActionSnapshot(actionId) ||
-            IsStablePostActionSnapshot(actionId, snapshot))
+        var settleKind = GetPostActionSettleKind(actionId);
+        var settleResult = await WaitForSettledSnapshotAsync(
+            settleKind,
+            actionId,
+            snapshot,
+            cancellationToken);
+
+        BridgeDebugTrace.Write(
+            $"post_action_settle action={actionId} kind={settleKind} settled={settleResult.Settled} reason={settleResult.Reason} polls={settleResult.PollCount} version={settleResult.Snapshot.StateVersion}");
+        return settleResult.Snapshot;
+    }
+
+    private static SnapshotSettleKind GetPostActionSettleKind(string actionId)
+    {
+        if (actionId.Equals("end_turn", StringComparison.Ordinal))
         {
-            return snapshot;
+            return SnapshotSettleKind.EndTurn;
+        }
+
+        if (actionId.StartsWith("map:", StringComparison.Ordinal))
+        {
+            return SnapshotSettleKind.MapTravel;
+        }
+
+        if (actionId.StartsWith("play_card:", StringComparison.Ordinal) ||
+            actionId.StartsWith("card_selection:", StringComparison.Ordinal) ||
+            actionId.StartsWith("use_potion:", StringComparison.Ordinal))
+        {
+            return SnapshotSettleKind.CombatAction;
+        }
+
+        return SnapshotSettleKind.Observe;
+    }
+
+    private static async Task<SnapshotSettleResult> WaitForSettledSnapshotAsync(
+        SnapshotSettleKind settleKind,
+        string? actionId,
+        BridgeSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        var stablePolls = 0;
+        var previousStateHash = snapshot.StateHash;
+        var verdict = GetSnapshotSettlementVerdict(settleKind, actionId, snapshot, stablePolls);
+        if (verdict.Settled)
+        {
+            return new SnapshotSettleResult(snapshot, true, verdict.Reason, 0);
         }
 
         var startedAt = DateTime.UtcNow;
-        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < PostActionStableTimeoutMs)
+        var pollCount = 0;
+        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < SnapshotSettleTimeoutMs)
         {
-            await Task.Delay(PostActionStablePollIntervalMs, cancellationToken);
+            await Task.Delay(SnapshotSettlePollIntervalMs, cancellationToken);
             await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
             snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
+            pollCount++;
 
-            if (IsStablePostActionSnapshot(actionId, snapshot))
+            stablePolls = snapshot.StateHash.Equals(previousStateHash, StringComparison.Ordinal)
+                ? stablePolls + 1
+                : 0;
+            previousStateHash = snapshot.StateHash;
+
+            verdict = GetSnapshotSettlementVerdict(settleKind, actionId, snapshot, stablePolls);
+            if (verdict.Settled)
             {
-                return snapshot;
+                return new SnapshotSettleResult(snapshot, true, verdict.Reason, pollCount);
             }
         }
 
-        return snapshot;
+        return new SnapshotSettleResult(snapshot, false, verdict.Reason, pollCount);
     }
 
-    private static bool ShouldWaitForStablePostActionSnapshot(string actionId)
+    private static SnapshotSettlementVerdict GetSnapshotSettlementVerdict(
+        SnapshotSettleKind settleKind,
+        string? actionId,
+        BridgeSnapshot snapshot,
+        int stablePolls)
     {
-        return actionId.Equals("main_menu:continue", StringComparison.Ordinal) ||
-               actionId.Equals("proceed", StringComparison.Ordinal) ||
-               actionId.StartsWith("map:", StringComparison.Ordinal) ||
-               actionId.StartsWith("treasure:", StringComparison.Ordinal) ||
-               actionId.StartsWith("treasure_relic:", StringComparison.Ordinal) ||
-               actionId.StartsWith("reward:", StringComparison.Ordinal) ||
-               actionId.StartsWith("card_reward:", StringComparison.Ordinal) ||
-               actionId.StartsWith("rest_site:", StringComparison.Ordinal) ||
-               actionId.StartsWith("deck_upgrade:", StringComparison.Ordinal);
+        return settleKind switch
+        {
+            SnapshotSettleKind.Observe => GetObservationSettlementVerdict(snapshot, stablePolls),
+            SnapshotSettleKind.CombatAction => GetCombatActionSettlementVerdict(snapshot, stablePolls),
+            SnapshotSettleKind.EndTurn => GetEndTurnSettlementVerdict(snapshot, stablePolls),
+            SnapshotSettleKind.MapTravel => GetMapTravelSettlementVerdict(snapshot, stablePolls),
+            _ => GetObservationSettlementVerdict(snapshot, stablePolls)
+        };
     }
 
-    private static bool IsStablePostActionSnapshot(string actionId, BridgeSnapshot snapshot)
+    private static SnapshotSettlementVerdict GetObservationSettlementVerdict(
+        BridgeSnapshot snapshot,
+        int stablePolls)
     {
-        if (snapshot.Fields.Screen.Equals("MAIN_MENU", StringComparison.Ordinal))
+        var decisionSurfaceReadyReason = GetDecisionSurfaceReadyReason(snapshot);
+        if (decisionSurfaceReadyReason is not null)
         {
-            return false;
+            return stablePolls >= ObservationStablePollTarget
+                ? new SnapshotSettlementVerdict(true, decisionSurfaceReadyReason)
+                : new SnapshotSettlementVerdict(false, $"waiting_for_stable_surface:{decisionSurfaceReadyReason}");
         }
 
-        if (snapshot.Fields.Screen.Equals("COMBAT", StringComparison.Ordinal))
+        if (snapshot.Fields.Screen.Equals("COMBAT", StringComparison.Ordinal) ||
+            IsBooleanPropertyTrue(snapshot.Fields.Combat, "in_progress"))
         {
-            return IsStableCombatTransitionSnapshot(actionId, snapshot);
+            return GetCombatActionSettlementVerdict(snapshot, stablePolls);
         }
 
-        if (IsBooleanPropertyTrue(snapshot.Fields.CardSelection, "visible") ||
-            IsBooleanPropertyTrue(snapshot.Fields.CardRewardSelection, "visible"))
+        var nonAutomationActions = GetNonAutomationActions(snapshot);
+        if (nonAutomationActions.Length == 1 &&
+            nonAutomationActions[0].ActionId.Equals("proceed", StringComparison.Ordinal))
         {
-            return true;
+            return stablePolls >= ObservationStablePollTarget
+                ? new SnapshotSettlementVerdict(true, "proceed_ready")
+                : new SnapshotSettlementVerdict(false, "waiting_for_stable_surface:proceed_ready");
         }
 
-        if (IsBooleanPropertyTrue(snapshot.Fields.Rewards, "visible") ||
-            IsBooleanPropertyTrue(snapshot.Fields.Rewards, "terminal_proceed_visible"))
-        {
-            return true;
-        }
-
-        if (IsBooleanPropertyTrue(snapshot.Fields.RestSite, "visible") ||
-            IsBooleanPropertyTrue(snapshot.Fields.RestSite, "proceed_visible") ||
-            IsBooleanPropertyTrue(snapshot.Fields.DeckUpgradeSelection, "visible"))
-        {
-            return true;
-        }
-
-        if (IsBooleanPropertyTrue(snapshot.Fields.EventOptions, "visible"))
-        {
-            return true;
-        }
-
-        if (IsBooleanPropertyTrue(snapshot.Fields.Shop, "visible") ||
-            IsBooleanPropertyTrue(snapshot.Fields.Shop, "is_open"))
-        {
-            return true;
-        }
-
-        if (snapshot.Actions.Any(action =>
-                action.ActionId.StartsWith("treasure:", StringComparison.Ordinal) ||
-                action.ActionId.StartsWith("treasure_relic:", StringComparison.Ordinal)))
-        {
-            return true;
-        }
-
-        if (IsBooleanPropertyTrue(snapshot.Fields.Map, "is_open") ||
-            snapshot.Actions.Any(action => action.ActionId.StartsWith("map:", StringComparison.Ordinal)))
-        {
-            return true;
-        }
-
-        return snapshot.Actions.Count(action => !action.ActionId.StartsWith("automation:", StringComparison.Ordinal)) == 1 &&
-               snapshot.ActionLookup.ContainsKey("proceed");
+        return new SnapshotSettlementVerdict(
+            false,
+            $"waiting_for_decision_surface:{snapshot.Fields.Screen}");
     }
 
-    private static bool IsStableCombatTransitionSnapshot(string actionId, BridgeSnapshot snapshot)
+    private static SnapshotSettlementVerdict GetCombatActionSettlementVerdict(
+        BridgeSnapshot snapshot,
+        int stablePolls)
     {
-        if (!ShouldRequireCombatTurnReady(actionId) ||
-            !IsBooleanPropertyTrue(snapshot.Fields.Combat, "in_progress") ||
-            !IsBooleanPropertyTrue(snapshot.Fields.Combat, "is_play_phase") ||
-            IsBooleanPropertyTrue(snapshot.Fields.Combat, "player_actions_disabled"))
+        var decisionSurfaceReadyReason = GetDecisionSurfaceReadyReason(snapshot);
+        if (decisionSurfaceReadyReason is not null)
         {
-            return false;
+            return new SnapshotSettlementVerdict(true, decisionSurfaceReadyReason);
+        }
+
+        if (!snapshot.Fields.Screen.Equals("COMBAT", StringComparison.Ordinal))
+        {
+            return new SnapshotSettlementVerdict(
+                false,
+                $"waiting_for_room_transition:{snapshot.Fields.Screen}");
+        }
+
+        if (!IsBooleanPropertyTrue(snapshot.Fields.Combat, "in_progress"))
+        {
+            return new SnapshotSettlementVerdict(false, "waiting_for_room_transition");
         }
 
         var currentSide = GetHiddenPropertyObjectValue(snapshot.Fields.Combat, "current_side")?.ToString();
-        if (!string.Equals(currentSide, "Player", StringComparison.Ordinal))
+        if (!string.Equals(currentSide, "Player", StringComparison.Ordinal) ||
+            !IsBooleanPropertyTrue(snapshot.Fields.Combat, "is_play_phase") ||
+            IsBooleanPropertyTrue(snapshot.Fields.Combat, "player_actions_disabled"))
         {
-            return false;
+            return new SnapshotSettlementVerdict(false, "waiting_for_combat_resolution");
+        }
+
+        var nonAutomationActions = GetNonAutomationActions(snapshot);
+        if (nonAutomationActions.Length <= 0)
+        {
+            return new SnapshotSettlementVerdict(false, "waiting_for_action_list");
+        }
+
+        var hasMeaningfulCombatAction =
+            nonAutomationActions.Any(action => !action.ActionId.Equals("end_turn", StringComparison.Ordinal));
+        if (stablePolls >= CombatActionStablePollTarget)
+        {
+            return new SnapshotSettlementVerdict(
+                true,
+                hasMeaningfulCombatAction
+                    ? "player_turn_stable"
+                    : "player_turn_stable_end_turn_only");
+        }
+
+        return new SnapshotSettlementVerdict(false, "waiting_for_stable_player_turn");
+    }
+
+    private static SnapshotSettlementVerdict GetEndTurnSettlementVerdict(
+        BridgeSnapshot snapshot,
+        int stablePolls)
+    {
+        var decisionSurfaceReadyReason = GetDecisionSurfaceReadyReason(snapshot);
+        if (decisionSurfaceReadyReason is not null)
+        {
+            return new SnapshotSettlementVerdict(true, decisionSurfaceReadyReason);
+        }
+
+        if (!snapshot.Fields.Screen.Equals("COMBAT", StringComparison.Ordinal))
+        {
+            return new SnapshotSettlementVerdict(
+                false,
+                $"waiting_for_room_transition:{snapshot.Fields.Screen}");
+        }
+
+        if (!IsBooleanPropertyTrue(snapshot.Fields.Combat, "in_progress"))
+        {
+            return new SnapshotSettlementVerdict(false, "waiting_for_room_transition");
+        }
+
+        var currentSide = GetHiddenPropertyObjectValue(snapshot.Fields.Combat, "current_side")?.ToString();
+        if (!string.Equals(currentSide, "Player", StringComparison.Ordinal) ||
+            !IsBooleanPropertyTrue(snapshot.Fields.Combat, "is_play_phase") ||
+            IsBooleanPropertyTrue(snapshot.Fields.Combat, "player_actions_disabled"))
+        {
+            return new SnapshotSettlementVerdict(false, "waiting_for_player_turn");
         }
 
         var handCount = GetFirstPlayerCombatPileCount(snapshot, "hand");
@@ -355,22 +471,164 @@ internal static class BridgeGameApi
         var targetHandCount = totalDrawableCount.HasValue
             ? Math.Min(5, totalDrawableCount.Value)
             : (int?)null;
-        var nonAutomationActions = snapshot.Actions
-            .Where(action => !action.ActionId.StartsWith("automation:", StringComparison.Ordinal))
-            .ToArray();
-        var hasMeaningfulCombatAction = nonAutomationActions.Any(action => action.ActionId != "end_turn");
+        var nonAutomationActions = GetNonAutomationActions(snapshot);
+        var hasMeaningfulCombatAction =
+            nonAutomationActions.Any(action => !action.ActionId.Equals("end_turn", StringComparison.Ordinal));
 
-        return handCount.HasValue &&
-               targetHandCount.HasValue &&
-               handCount.Value >= targetHandCount.Value &&
-               (hasMeaningfulCombatAction || nonAutomationActions.Length > 0);
+        if (handCount.HasValue &&
+            targetHandCount.HasValue &&
+            handCount.Value >= targetHandCount.Value &&
+            (hasMeaningfulCombatAction || nonAutomationActions.Length > 0))
+        {
+            return new SnapshotSettlementVerdict(true, "player_turn_ready");
+        }
+
+        if (stablePolls >= EndTurnStablePollTarget &&
+            handCount.HasValue &&
+            handCount.Value > 0 &&
+            (hasMeaningfulCombatAction || nonAutomationActions.Length > 0))
+        {
+            return new SnapshotSettlementVerdict(true, "player_turn_stable_fallback");
+        }
+
+        return new SnapshotSettlementVerdict(false, "waiting_for_hand_fill");
     }
 
-    private static bool ShouldRequireCombatTurnReady(string actionId)
+    private static SnapshotSettlementVerdict GetMapTravelSettlementVerdict(
+        BridgeSnapshot snapshot,
+        int stablePolls)
     {
-        return actionId.Equals("main_menu:continue", StringComparison.Ordinal) ||
-               actionId.Equals("proceed", StringComparison.Ordinal) ||
-               actionId.StartsWith("map:", StringComparison.Ordinal);
+        if (snapshot.Fields.Screen.Equals("MAP", StringComparison.Ordinal))
+        {
+            var waitingReason = IsBooleanPropertyTrue(snapshot.Fields.Map, "is_traveling")
+                ? "waiting_for_map_travel_finish"
+                : "waiting_for_room_entry";
+            return new SnapshotSettlementVerdict(false, waitingReason);
+        }
+
+        var decisionSurfaceReadyReason = GetDecisionSurfaceReadyReason(snapshot);
+        if (decisionSurfaceReadyReason is not null &&
+            !decisionSurfaceReadyReason.Equals("map_ready", StringComparison.Ordinal))
+        {
+            return stablePolls >= ObservationStablePollTarget
+                ? new SnapshotSettlementVerdict(true, decisionSurfaceReadyReason)
+                : new SnapshotSettlementVerdict(false, $"waiting_for_stable_surface:{decisionSurfaceReadyReason}");
+        }
+
+        if (snapshot.Fields.Screen.Equals("COMBAT", StringComparison.Ordinal) ||
+            IsBooleanPropertyTrue(snapshot.Fields.Combat, "in_progress"))
+        {
+            return GetCombatActionSettlementVerdict(snapshot, stablePolls);
+        }
+
+        return new SnapshotSettlementVerdict(
+            false,
+            $"waiting_for_room_entry:{snapshot.Fields.Screen}");
+    }
+
+    private static string? GetDecisionSurfaceReadyReason(BridgeSnapshot snapshot)
+    {
+        var nonAutomationActions = GetNonAutomationActions(snapshot);
+
+        if (snapshot.Fields.Screen.Equals("MAIN_MENU", StringComparison.Ordinal) &&
+            nonAutomationActions.Any(action => action.ActionId.StartsWith("main_menu:", StringComparison.Ordinal)))
+        {
+            return "main_menu_ready";
+        }
+
+        if (snapshot.Fields.Screen.Equals("RUN_MODE_SELECTION", StringComparison.Ordinal) &&
+            nonAutomationActions.Any(action => action.ActionId.StartsWith("run_mode:", StringComparison.Ordinal)))
+        {
+            return "run_mode_selection_ready";
+        }
+
+        if (snapshot.Fields.Screen.Equals("CHARACTER_SELECT", StringComparison.Ordinal) &&
+            nonAutomationActions.Any(action => action.ActionId.StartsWith("character_select:", StringComparison.Ordinal)))
+        {
+            return "character_select_ready";
+        }
+
+        if (snapshot.Fields.Screen.Equals("ABANDON_RUN_CONFIRM", StringComparison.Ordinal) &&
+            nonAutomationActions.Any(action => action.ActionId.StartsWith("main_menu:", StringComparison.Ordinal)))
+        {
+            return "abandon_run_confirm_ready";
+        }
+
+        if (IsBooleanPropertyTrue(snapshot.Fields.CardSelection, "visible") &&
+            nonAutomationActions.Any(action => action.ActionId.StartsWith("card_selection:", StringComparison.Ordinal)))
+        {
+            return "card_selection_ready";
+        }
+
+        if (IsBooleanPropertyTrue(snapshot.Fields.CardRewardSelection, "visible") &&
+            nonAutomationActions.Any(action => action.ActionId.StartsWith("card_reward:", StringComparison.Ordinal)))
+        {
+            return "reward_card_selection_ready";
+        }
+
+        if ((IsBooleanPropertyTrue(snapshot.Fields.Rewards, "visible") ||
+             IsBooleanPropertyTrue(snapshot.Fields.Rewards, "terminal_proceed_visible")) &&
+            nonAutomationActions.Any(action =>
+                action.ActionId.StartsWith("reward:", StringComparison.Ordinal) ||
+                action.ActionId.Equals("proceed", StringComparison.Ordinal) ||
+                action.ActionId.StartsWith("discard_potion:", StringComparison.Ordinal)))
+        {
+            return "reward_flow_ready";
+        }
+
+        if (IsBooleanPropertyTrue(snapshot.Fields.DeckUpgradeSelection, "visible") &&
+            nonAutomationActions.Any(action => action.ActionId.StartsWith("deck_upgrade:", StringComparison.Ordinal)))
+        {
+            return "rest_site_upgrade_ready";
+        }
+
+        if ((IsBooleanPropertyTrue(snapshot.Fields.RestSite, "visible") ||
+             IsBooleanPropertyTrue(snapshot.Fields.RestSite, "proceed_visible")) &&
+            nonAutomationActions.Any(action => action.ActionId.StartsWith("rest_site:", StringComparison.Ordinal)))
+        {
+            return "rest_site_ready";
+        }
+
+        if (IsBooleanPropertyTrue(snapshot.Fields.EventOptions, "visible") &&
+            nonAutomationActions.Any(action => action.ActionId.StartsWith("event_option:", StringComparison.Ordinal)))
+        {
+            return "event_ready";
+        }
+
+        if ((IsBooleanPropertyTrue(snapshot.Fields.Shop, "visible") ||
+             IsBooleanPropertyTrue(snapshot.Fields.Shop, "is_open")) &&
+            nonAutomationActions.Any(action => action.ActionId.StartsWith("shop:", StringComparison.Ordinal)))
+        {
+            return "shop_ready";
+        }
+
+        if (nonAutomationActions.Any(action =>
+                action.ActionId.StartsWith("treasure:", StringComparison.Ordinal) ||
+                action.ActionId.StartsWith("treasure_relic:", StringComparison.Ordinal)))
+        {
+            return "treasure_ready";
+        }
+
+        if (IsMapReadySnapshot(snapshot))
+        {
+            return "map_ready";
+        }
+
+        return null;
+    }
+
+    private static bool IsMapReadySnapshot(BridgeSnapshot snapshot)
+    {
+        return IsBooleanPropertyTrue(snapshot.Fields.Map, "is_open") &&
+               !IsBooleanPropertyTrue(snapshot.Fields.Map, "is_traveling") &&
+               GetNonAutomationActions(snapshot).Any(action => action.ActionId.StartsWith("map:", StringComparison.Ordinal));
+    }
+
+    private static BridgeResolvedAction[] GetNonAutomationActions(BridgeSnapshot snapshot)
+    {
+        return snapshot.Actions
+            .Where(action => !action.ActionId.StartsWith("automation:", StringComparison.Ordinal))
+            .ToArray();
     }
 
     private static bool IsBooleanPropertyTrue(object? target, string propertyName)

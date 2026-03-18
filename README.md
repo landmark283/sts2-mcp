@@ -33,9 +33,11 @@ The server exposes the following tools to any MCP-compliant agent (like Claude D
 | Tool | Description |
 | :--- | :--- |
 | `sts2_get_state` | Fetches the full current game state (Screen, Health, Deck, Relics, etc.). |
+| `sts2_get_deck` | Returns the full master deck for lower-frequency strategic planning. |
 | `sts2_list_actions` | Lists all currently legal actions available to the player. |
-| `sts2_perform_action` | Executes a single action by its unique ID. |
+| `sts2_perform_action` | Executes a single action by its unique ID, with optional `return_state_after` for the full raw post-action bridge state. |
 | `sts2_play_card_sequence` | Plays multiple cards in order, with automatic hand re-indexing. |
+| `sts2_execute_combat_sequence` | Runs mixed combat sequences that can combine card plays, potion use, and `end_turn` in one call. |
 | `sts2_resolve_room_rewards` | Claims all gold/potions and optionally picks a card in one call. |
 | `sts2_resolve_rest_site` | Performs a rest/smith and proceeds back to the map. |
 | `sts2_resolve_card_selection` | Handles card pick/skip/transform screens perfectly. |
@@ -90,6 +92,11 @@ node .\packages\mcp-server\index.js
 
 The MCP server looks for the bridge session file automatically. You can override it via environment variables:
 - `STS2_BRIDGE_SESSION_FILE`: Path to a custom session JSON.
+
+Combat usage note:
+- Do not parallelize consecutive combat plays with repeated `sts2_perform_action` calls.
+- Use `sts2_play_card_sequence` for card-only turns.
+- Use `sts2_execute_combat_sequence` when a turn mixes card plays, potion use, or `end_turn`.
 
 ---
 
