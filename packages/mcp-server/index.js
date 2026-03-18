@@ -6,7 +6,7 @@ const path = require("path");
 const { setTimeout: delay } = require("timers/promises");
 
 const SERVER_NAME = "sts2";
-const SERVER_VERSION = "0.4.17";
+const SERVER_VERSION = "0.4.18";
 const FALLBACK_PROTOCOL_VERSION = "2025-03-26";
 const DEFAULT_LOG_FILE_NAME = "mcp-stdio.log";
 const MAX_LOG_PREVIEW = 600;
@@ -91,7 +91,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "sts2_perform_action",
     description:
-      "Execute one currently legal bridge action by action_id. Avoid parallel combat play-card calls; use sts2_play_card_sequence or sts2_execute_combat_sequence for consecutive combat actions. Set return_state_after=true to include the full post-action bridge state in the tool response.",
+      "Execute one currently legal bridge action by action_id. Avoid parallel combat play-card calls; use sts2_play_card_sequence or sts2_execute_combat_sequence for consecutive combat actions. Set return_state_after=true to include a compact post-action state summary in the tool response.",
     inputSchema: {
       type: "object",
       properties: {
@@ -189,7 +189,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "sts2_end_turn",
     description:
-      "Convenience wrapper around sts2_perform_action for the combat end_turn action. Set return_state_after=true to include the full post-action bridge state in the tool response.",
+      "Convenience wrapper around sts2_perform_action for the combat end_turn action. Set return_state_after=true to include a compact post-action state summary in the tool response.",
     inputSchema: {
       type: "object",
       properties: {
@@ -855,9 +855,11 @@ async function performActionTool(args) {
       }
     );
 
-    return asToolResult(
-      attachInteractionHints(
-        attachReturnStateAfterPayload(result, returnStateAfter, result?.state)
+    return asPrecompactedToolResult(
+      compactActionResultPayload(
+        attachInteractionHints(
+          attachReturnStateAfterPayload(result, returnStateAfter, result?.state)
+        )
       ),
       false
     );
@@ -911,9 +913,11 @@ async function endTurnTool(args) {
       }
     );
 
-    return asToolResult(
-      attachInteractionHints(
-        attachReturnStateAfterPayload(result, returnStateAfter, result?.state)
+    return asPrecompactedToolResult(
+      compactActionResultPayload(
+        attachInteractionHints(
+          attachReturnStateAfterPayload(result, returnStateAfter, result?.state)
+        )
       ),
       false
     );
@@ -1517,6 +1521,8 @@ function resolvePlannedCombatSequenceStep(planStep, state) {
 
 async function resolveRoomRewardsTool(args) {
   try {
+    const finalize = (payload) =>
+      asPrecompactedToolResult(compactRoomRewardsPayload(payload), false);
     const pickCardIndex = optionalInteger(args.pick_card_index, "pick_card_index");
     if (pickCardIndex !== undefined && pickCardIndex < 0) {
       throw new ToolPayloadError(
@@ -1549,7 +1555,7 @@ async function resolveRoomRewardsTool(args) {
     const initialRewardBundle = buildRewardBundle(state);
 
     if (!initialRewardBundle.in_reward_flow) {
-      return asToolResult(
+      return finalize(
         {
           ok: false,
           resolved: false,
@@ -1568,7 +1574,7 @@ async function resolveRoomRewardsTool(args) {
       takePotions
     });
     if (preflightBlocker) {
-      return asToolResult(
+      return finalize(
         {
           ok: false,
           resolved: false,
@@ -1590,7 +1596,7 @@ async function resolveRoomRewardsTool(args) {
       if (bundle.card_reward_selection.visible) {
         if (skipCardReward) {
           if (bundle.card_reward_selection.skip_visible !== true) {
-            return asToolResult(
+            return finalize(
               {
                 ok: false,
                 resolved: false,
@@ -1616,7 +1622,7 @@ async function resolveRoomRewardsTool(args) {
         }
 
         if (pickCardIndex === undefined) {
-          return asToolResult(
+          return finalize(
             {
               ok: false,
               resolved: false,
@@ -1631,7 +1637,7 @@ async function resolveRoomRewardsTool(args) {
         }
 
         if (pickCardIndex >= bundle.card_reward_selection.options.length) {
-          return asToolResult(
+          return finalize(
             {
               ok: false,
               resolved: false,
@@ -1714,7 +1720,7 @@ async function resolveRoomRewardsTool(args) {
 
     const finalRewardBundle = buildRewardBundle(state);
 
-    return asToolResult(
+    return finalize(
       {
         ok: true,
         resolved: !finalRewardBundle.in_reward_flow,
@@ -1734,6 +1740,8 @@ async function resolveRoomRewardsTool(args) {
 
 async function resolveRestSiteTool(args) {
   try {
+    const finalize = (payload) =>
+      asPrecompactedToolResult(compactRestSitePayload(payload), false);
     const optionIndex = optionalInteger(args.option_index, "option_index");
     const upgradeCardIndex = optionalInteger(args.upgrade_card_index, "upgrade_card_index");
     const autoProceed = optionalBoolean(args.auto_proceed, "auto_proceed") ?? true;
@@ -1763,7 +1771,7 @@ async function resolveRestSiteTool(args) {
     const initialRestSiteBundle = buildRestSiteBundle(state);
 
     if (!initialRestSiteBundle.in_rest_site_flow) {
-      return asToolResult(
+      return finalize(
         {
           ok: false,
           resolved: false,
@@ -1780,7 +1788,7 @@ async function resolveRestSiteTool(args) {
       !restSiteBundle.rest_site.visible &&
       restSiteBundle.deck_upgrade_selection.visible !== true
     ) {
-      return asToolResult(
+      return finalize(
         {
           ok: false,
           resolved: false,
@@ -1798,7 +1806,7 @@ async function resolveRestSiteTool(args) {
 
     if (!restSiteBundle.deck_upgrade_selection.visible) {
       if (optionIndex >= restSiteBundle.rest_site.options.length) {
-        return asToolResult(
+        return finalize(
           {
             ok: false,
             resolved: false,
@@ -1822,7 +1830,7 @@ async function resolveRestSiteTool(args) {
 
     if (restSiteBundle.deck_upgrade_selection.visible) {
       if (upgradeCardIndex === undefined) {
-        return asToolResult(
+        return finalize(
           {
             ok: false,
             resolved: false,
@@ -1837,7 +1845,7 @@ async function resolveRestSiteTool(args) {
       }
 
       if (upgradeCardIndex >= restSiteBundle.deck_upgrade_selection.options.length) {
-        return asToolResult(
+        return finalize(
           {
             ok: false,
             resolved: false,
@@ -1885,7 +1893,7 @@ async function resolveRestSiteTool(args) {
       restSiteBundle = buildRestSiteBundle(state);
     }
 
-    return asToolResult(
+    return finalize(
       {
         ok: true,
         resolved: isMapReadyState(state) || !restSiteBundle.in_rest_site_flow,
@@ -2365,6 +2373,8 @@ async function pickOptionTool(args) {
 
 async function travelToCoordinateTool(args) {
   try {
+    const finalize = (payload) =>
+      asPrecompactedToolResult(compactTravelToCoordinatePayload(payload), false);
     const col = optionalInteger(args.col, "col");
     const row = optionalInteger(args.row, "row");
     if (col === undefined || col < 0) {
@@ -2391,7 +2401,7 @@ async function travelToCoordinateTool(args) {
     const prepared = await prepareStateForMapTravel(session, initialState);
 
     if (prepared.blocker) {
-      return asToolResult(
+      return finalize(
         {
           ok: false,
           resolved: false,
@@ -2419,7 +2429,7 @@ async function travelToCoordinateTool(args) {
     const requestedCoordKey = toCoordKey(requestedCoord);
 
     if (!isMapReadyState(state)) {
-      return asToolResult(
+      return finalize(
         {
           ok: false,
           resolved: false,
@@ -2433,7 +2443,7 @@ async function travelToCoordinateTool(args) {
     }
 
     if (!settledSnapshot.mapActionKeys.includes(requestedCoordKey)) {
-      return asToolResult(
+      return finalize(
         {
           ok: false,
           resolved: false,
@@ -2455,7 +2465,7 @@ async function travelToCoordinateTool(args) {
       Number.isInteger(state?.state_version) ? state.state_version : undefined
     );
 
-    return asToolResult(
+    return finalize(
       {
         ok: true,
         resolved: true,
@@ -2589,7 +2599,8 @@ async function waitForChangeTool(args) {
 
 async function resolveShopVisitTool(args) {
   try {
-    const finalize = (payload) => asToolResult(attachInteractionHints(payload), false);
+    const finalize = (payload) =>
+      asPrecompactedToolResult(compactShopVisitPayload(attachInteractionHints(payload)), false);
     const purchases = normalizeShopPurchaseRequests(args.purchases);
     const removeCardTitle = optionalString(args.remove_card_title, "remove_card_title");
     const removeCardIndex = optionalInteger(args.remove_card_index, "remove_card_index");
@@ -4649,7 +4660,9 @@ function buildRestSiteBundle(state) {
   const deckUpgradeOptions = Array.isArray(state?.deck_upgrade_selection?.options)
     ? state.deck_upgrade_selection.options.map((option) => ({
         index: Number.isInteger(option?.index) ? option.index : null,
-        card: option?.card ?? null
+        card: option?.card ?? null,
+        upgrade_preview: option?.upgrade_preview ?? null,
+        is_selected: option?.is_selected === true
       }))
     : [];
   const nonAutomationActions = getNonAutomationActions(state);
@@ -4954,13 +4967,25 @@ function summarizeMapSnapshotStatusForAgent(snapshot) {
     return snapshot ?? null;
   }
 
-  return {
+  const summary = {
     settled: snapshot.settled === true,
-    reason: typeof snapshot.reason === "string" ? snapshot.reason : null,
-    poll_count: Number.isInteger(snapshot.poll_count) ? snapshot.poll_count : null,
-    frontier_action_match: snapshot.frontier_action_match === true,
-    state_action_state_version_match: snapshot.state_action_state_version_match === true
+    reason: typeof snapshot.reason === "string" ? snapshot.reason : null
   };
+
+  if (Number.isInteger(snapshot.poll_count) && snapshot.poll_count > 0) {
+    summary.poll_count = snapshot.poll_count;
+  }
+
+  if (snapshot.frontier_action_match !== true) {
+    summary.frontier_action_match = snapshot.frontier_action_match === true;
+  }
+
+  if (snapshot.state_action_state_version_match !== true) {
+    summary.state_action_state_version_match =
+      snapshot.state_action_state_version_match === true;
+  }
+
+  return summary;
 }
 
 async function prepareStateForMapTravel(session, initialState) {
@@ -6331,13 +6356,114 @@ function summarizeRestSiteBundleForAgent(bundle) {
       options: Array.isArray(deckUpgrade.options)
         ? deckUpgrade.options.map((option) => ({
             index: Number.isInteger(option?.index) ? option.index : null,
-            card: summarizeCardForAgent(option?.card)
+            card: summarizeCardForAgent(option?.card),
+            upgrade_preview: summarizeCardForAgent(option?.upgrade_preview),
+            is_selected: option?.is_selected === true
           }))
         : []
     },
     non_automation_action_ids: Array.isArray(bundle.non_automation_action_ids)
       ? bundle.non_automation_action_ids
       : []
+  };
+}
+
+function summarizeShopBundleForAgent(bundle) {
+  if (!isPlainObject(bundle)) {
+    return bundle;
+  }
+
+  const shop = isPlainObject(bundle.shop) ? bundle.shop : {};
+
+  return {
+    in_shop_flow: bundle.in_shop_flow === true,
+    screen: typeof bundle.screen === "string" ? bundle.screen : null,
+    shop: {
+      visible: shop.visible === true,
+      is_open: shop.is_open === true,
+      gold: Number.isFinite(shop.gold) ? shop.gold : null,
+      merchant_button_visible: shop.merchant_button_visible === true,
+      back_button_visible: shop.back_button_visible === true,
+      proceed_visible: shop.proceed_visible === true,
+      items: Array.isArray(shop.items)
+        ? shop.items.map(summarizeShopItemForAgent).filter((item) => item !== null)
+        : []
+    },
+    non_automation_action_ids: Array.isArray(bundle.non_automation_action_ids)
+      ? bundle.non_automation_action_ids
+      : []
+  };
+}
+
+function summarizeRestSiteBundleForResolutionAgent(bundle) {
+  if (!isPlainObject(bundle)) {
+    return bundle;
+  }
+
+  const restSite = isPlainObject(bundle.rest_site) ? bundle.rest_site : {};
+  const deckUpgrade = isPlainObject(bundle.deck_upgrade_selection)
+    ? bundle.deck_upgrade_selection
+    : {};
+  const screen = typeof bundle.screen === "string" ? bundle.screen : null;
+  const result = {};
+  if (screen) {
+    result.screen = screen;
+  }
+
+  if (deckUpgrade.visible === true) {
+    result.deck_upgrade_selection = {
+      options: Array.isArray(deckUpgrade.options)
+        ? deckUpgrade.options
+            .map((option, fallbackIndex) =>
+              summarizeDeckUpgradeChoiceForResolutionAgent(option, fallbackIndex)
+            )
+            .filter((option) => option !== null)
+        : []
+    };
+    return result;
+  }
+
+  if (
+    restSite.visible === true ||
+    typeof restSite.header === "string" ||
+    typeof restSite.description === "string" ||
+    Array.isArray(restSite.options)
+  ) {
+    result.rest_site = {
+      header: normalizeAgentText(restSite.header),
+      description: normalizeAgentText(restSite.description),
+      proceed_visible: restSite.proceed_visible === true,
+      options: Array.isArray(restSite.options)
+        ? restSite.options
+            .map((option) => summarizeIndexedOptionForAgent(option))
+            .filter((option) => option !== null)
+        : []
+    };
+  }
+
+  return result;
+}
+
+function summarizeShopBundleForResolutionAgent(bundle) {
+  if (!isPlainObject(bundle)) {
+    return bundle;
+  }
+
+  const shop = isPlainObject(bundle.shop) ? bundle.shop : {};
+  return {
+    in_shop_flow: bundle.in_shop_flow === true,
+    screen: typeof bundle.screen === "string" ? bundle.screen : null,
+    shop: {
+      visible: shop.visible === true,
+      is_open: shop.is_open === true,
+      gold: Number.isFinite(shop.gold) ? shop.gold : null,
+      merchant_button_visible: shop.merchant_button_visible === true,
+      back_button_visible: shop.back_button_visible === true,
+      proceed_visible: shop.proceed_visible === true,
+      items: Array.isArray(shop.items)
+        ? shop.items.map(summarizeShopItemForAgent).filter((item) => item !== null)
+        : []
+    }
   };
 }
 
@@ -6382,6 +6508,46 @@ function summarizeCardSelectionBundleForAgent(bundle) {
     non_automation_action_ids: Array.isArray(bundle.non_automation_action_ids)
       ? bundle.non_automation_action_ids
       : []
+  };
+}
+
+function summarizeCardSelectionBundleForResolutionAgent(bundle) {
+  if (!isPlainObject(bundle)) {
+    return bundle;
+  }
+
+  const cardSelection = isPlainObject(bundle.card_selection) ? bundle.card_selection : {};
+  return {
+    in_card_selection_flow: bundle.in_card_selection_flow === true,
+    screen: typeof bundle.screen === "string" ? bundle.screen : null,
+    card_selection: {
+      visible: cardSelection.visible === true,
+      screen_type:
+        typeof cardSelection.screen_type === "string" ? cardSelection.screen_type : null,
+      prompt: normalizeAgentText(cardSelection.prompt),
+      selected_count: Number.isFinite(cardSelection.selected_count)
+        ? cardSelection.selected_count
+        : null,
+      min_select: Number.isFinite(cardSelection.min_select) ? cardSelection.min_select : null,
+      max_select: Number.isFinite(cardSelection.max_select) ? cardSelection.max_select : null,
+      requires_manual_confirmation:
+        typeof cardSelection.requires_manual_confirmation === "boolean"
+          ? cardSelection.requires_manual_confirmation
+          : null,
+      cancelable:
+        typeof cardSelection.cancelable === "boolean" ? cardSelection.cancelable : null,
+      confirm_visible: cardSelection.confirm_visible === true,
+      cancel_visible: cardSelection.cancel_visible === true,
+      close_visible: cardSelection.close_visible === true,
+      skip_visible: cardSelection.skip_visible === true,
+      options: Array.isArray(cardSelection.options)
+        ? cardSelection.options
+            .map((option, fallbackIndex) =>
+              summarizeIndexedCardTitleChoiceForAgent(option, fallbackIndex)
+            )
+            .filter((option) => option !== null)
+        : []
+    }
   };
 }
 
@@ -6588,6 +6754,183 @@ function summarizeStateForAgent(state) {
   }
 
   return summary;
+}
+
+function summarizeActionStateForAgent(state) {
+  if (!isPlainObject(state)) {
+    return state;
+  }
+
+  const summary = summarizeStateForAgent(state);
+  if (!isPlainObject(summary)) {
+    return summary;
+  }
+
+  const result = {
+    screen: summary.screen,
+    state_version: summary.state_version
+  };
+
+  if (isPlainObject(summary.player)) {
+    result.player = {
+      current_hp: Number.isFinite(summary.player.current_hp) ? summary.player.current_hp : null,
+      max_hp: Number.isFinite(summary.player.max_hp) ? summary.player.max_hp : null,
+      block: Number.isFinite(summary.player.block) ? summary.player.block : 0,
+      powers: Array.isArray(summary.player.powers) ? summary.player.powers : [],
+      potions: Array.isArray(summary.player.potions) ? summary.player.potions : []
+    };
+  }
+
+  if (typeof summary.screen === "string" && summary.screen === "COMBAT") {
+    result.available_actions = summarizeCombatSequenceAvailableActions(getNonAutomationActions(state));
+  } else if (Array.isArray(summary.available_actions)) {
+    result.available_actions = summary.available_actions;
+  }
+
+  if (isPlainObject(summary.combat)) {
+    result.combat = {
+      in_progress: summary.combat.in_progress === true,
+      round_number: Number.isFinite(summary.combat.round_number)
+        ? summary.combat.round_number
+        : null,
+      current_side:
+        typeof summary.combat.current_side === "string" ? summary.combat.current_side : null,
+      is_play_phase: summary.combat.is_play_phase === true,
+      player_actions_disabled: summary.combat.player_actions_disabled === true,
+      energy: Number.isFinite(summary.combat.energy) ? summary.combat.energy : null,
+      max_energy: Number.isFinite(summary.combat.max_energy) ? summary.combat.max_energy : null,
+      hand: Array.isArray(summary.combat.hand) ? summary.combat.hand : [],
+      draw_pile_count: Number.isFinite(summary.combat.draw_pile_count)
+        ? summary.combat.draw_pile_count
+        : null,
+      discard_pile_count: Number.isFinite(summary.combat.discard_pile_count)
+        ? summary.combat.discard_pile_count
+        : null,
+      exhaust_pile_count: Number.isFinite(summary.combat.exhaust_pile_count)
+        ? summary.combat.exhaust_pile_count
+        : null,
+      summons: Array.isArray(summary.combat.summons) ? summary.combat.summons : [],
+      enemies: Array.isArray(summary.combat.enemies) ? summary.combat.enemies : []
+    };
+  }
+
+  if (isPlainObject(summary.run) && summary.screen !== "COMBAT") {
+    result.run = summary.run;
+  }
+
+  if (isPlainObject(summary.rewards)) {
+    result.rewards = summary.rewards;
+  }
+
+  if (isPlainObject(summary.rest_site)) {
+    result.rest_site = summary.rest_site;
+  }
+
+  if (isPlainObject(summary.card_selection)) {
+    result.card_selection = summary.card_selection;
+  }
+
+  if (isPlainObject(summary.map)) {
+    result.map = summary.map;
+  }
+
+  if (isPlainObject(summary.shop)) {
+    result.shop = summary.shop;
+  }
+
+  if (isPlainObject(summary.event_options)) {
+    result.event_options = summary.event_options;
+  }
+
+  return result;
+}
+
+function dedupeCompactedPayloadSections(payload) {
+  if (!isPlainObject(payload)) {
+    return payload;
+  }
+
+  if (isPlainObject(payload.state)) {
+    payload.state = removeDuplicatedStateSections(payload.state, {
+      reward: isPlainObject(payload.reward_bundle),
+      rest_site: isPlainObject(payload.rest_site_bundle),
+      card_selection:
+        isPlainObject(payload.card_selection_bundle) ||
+        isPlainObject(payload.current_card_selection_bundle) ||
+        isPlainObject(payload.initial_card_selection_bundle),
+      shop: isPlainObject(payload.shop_bundle),
+      available_actions:
+        isPlainObject(payload.reward_bundle) ||
+        isPlainObject(payload.rest_site_bundle) ||
+        isPlainObject(payload.card_selection_bundle) ||
+        isPlainObject(payload.current_card_selection_bundle) ||
+        isPlainObject(payload.initial_card_selection_bundle) ||
+        isPlainObject(payload.shop_bundle)
+    });
+  }
+
+  if (isPlainObject(payload.state_after)) {
+    payload.state_after = removeDuplicatedStateSections(payload.state_after, {
+      reward: isPlainObject(payload.reward_bundle),
+      rest_site: isPlainObject(payload.rest_site_bundle),
+      card_selection:
+        isPlainObject(payload.card_selection_bundle) ||
+        isPlainObject(payload.current_card_selection_bundle),
+      shop: isPlainObject(payload.shop_bundle),
+      available_actions:
+        isPlainObject(payload.reward_bundle) ||
+        isPlainObject(payload.rest_site_bundle) ||
+        isPlainObject(payload.card_selection_bundle) ||
+        isPlainObject(payload.current_card_selection_bundle) ||
+        isPlainObject(payload.shop_bundle)
+    });
+  }
+
+  if (isPlainObject(payload.final_state)) {
+    payload.final_state = removeDuplicatedStateSections(payload.final_state, {
+      reward: isPlainObject(payload.final_reward_bundle),
+      rest_site: false,
+      card_selection: isPlainObject(payload.final_card_selection_bundle),
+      shop: false,
+      available_actions:
+        isPlainObject(payload.final_reward_bundle) ||
+        isPlainObject(payload.final_card_selection_bundle)
+    });
+  }
+
+  return payload;
+}
+
+function removeDuplicatedStateSections(state, sections = {}) {
+  if (!isPlainObject(state)) {
+    return state;
+  }
+
+  const deduped = {
+    ...state
+  };
+
+  if (sections.reward) {
+    delete deduped.rewards;
+  }
+
+  if (sections.rest_site) {
+    delete deduped.rest_site;
+  }
+
+  if (sections.card_selection) {
+    delete deduped.card_selection;
+  }
+
+  if (sections.shop) {
+    delete deduped.shop;
+  }
+
+  if (sections.available_actions) {
+    delete deduped.available_actions;
+  }
+
+  return deduped;
 }
 
 function buildDeckPayloadForAgent(state) {
@@ -7640,9 +7983,17 @@ function compactPayloadForOutput(payload) {
   const result = {
     ...payload
   };
+  const stateAndStateAfterAreAliased =
+    isPlainObject(payload.state) &&
+    isPlainObject(payload.state_after) &&
+    payload.state === payload.state_after;
 
   if (isPlainObject(payload.state)) {
     result.state = summarizeStateForAgent(payload.state);
+  }
+
+  if (isPlainObject(payload.state_after)) {
+    result.state_after = summarizeStateForAgent(payload.state_after);
   }
 
   if (isPlainObject(payload.final_state)) {
@@ -7651,6 +8002,10 @@ function compactPayloadForOutput(payload) {
 
   if (isPlainObject(payload.reward_bundle)) {
     result.reward_bundle = summarizeRewardBundleForAgent(payload.reward_bundle);
+  }
+
+  if (isPlainObject(payload.final_reward_bundle)) {
+    result.final_reward_bundle = summarizeRewardBundleForAgent(payload.final_reward_bundle);
   }
 
   if (isPlainObject(payload.rest_site_bundle)) {
@@ -7673,6 +8028,10 @@ function compactPayloadForOutput(payload) {
     result.final_card_selection_bundle = summarizeCardSelectionBundleForAgent(payload.final_card_selection_bundle);
   }
 
+  if (isPlainObject(payload.shop_bundle)) {
+    result.shop_bundle = summarizeShopBundleForAgent(payload.shop_bundle);
+  }
+
   if (Array.isArray(payload.executed_actions)) {
     result.executed_actions = payload.executed_actions.map(summarizeExecutedAction);
   }
@@ -7683,6 +8042,303 @@ function compactPayloadForOutput(payload) {
 
   if (isPlainObject(payload.matched_action)) {
     result.matched_action = summarizeActionForAgent(payload.matched_action);
+  }
+
+  if (stateAndStateAfterAreAliased) {
+    delete result.state;
+  }
+
+  dedupeCompactedPayloadSections(result);
+
+  return result;
+}
+
+function compactActionResultPayload(payload) {
+  const rawState = isPlainObject(payload?.state) ? payload.state : null;
+  const rawStateAfter = isPlainObject(payload?.state_after) ? payload.state_after : null;
+  const compacted = compactPayloadForOutput(payload);
+  if (!isPlainObject(compacted)) {
+    return compacted;
+  }
+
+  const result = {
+    ...compacted
+  };
+
+  delete result.interaction_hints;
+  delete result.wait_after_ms;
+  delete result.state_hash_before;
+  delete result.state_hash_after;
+  delete result.state_changed;
+  delete result.actions;
+
+  if (Array.isArray(result.auto_executed_actions) && result.auto_executed_actions.length <= 0) {
+    delete result.auto_executed_actions;
+  }
+
+  if (result.post_action_settled === true) {
+    delete result.post_action_settled;
+    delete result.post_action_settle_reason;
+    delete result.post_action_settle_polls;
+  }
+
+  if (isPlainObject(rawStateAfter)) {
+    result.state_after = summarizeActionStateForAgent(rawStateAfter);
+    delete result.state;
+  } else if (isPlainObject(rawState)) {
+    result.state = summarizeActionStateForAgent(rawState);
+  }
+
+  if (isPlainObject(result.state_after)) {
+    delete result.state;
+  }
+
+  return result;
+}
+
+function compactRoomRewardsPayload(payload) {
+  const rawState = isPlainObject(payload?.state) ? payload.state : null;
+  const rawFinalState = isPlainObject(payload?.final_state) ? payload.final_state : null;
+  const compacted = compactPayloadForOutput(payload);
+  if (!isPlainObject(compacted)) {
+    return compacted;
+  }
+
+  const result = {
+    ...compacted
+  };
+
+  if (Array.isArray(result.claimed_rewards)) {
+    result.claimed_rewards = result.claimed_rewards
+      .map(summarizeClaimedRewardEntryForAgent)
+      .filter((entry) => entry !== null);
+    if (result.claimed_rewards.length <= 0) {
+      delete result.claimed_rewards;
+    }
+  }
+
+  if (isPlainObject(result.selected_card)) {
+    result.selected_card = summarizeSelectedCardForAgent(result.selected_card);
+    if (!isPlainObject(result.selected_card)) {
+      delete result.selected_card;
+    }
+  }
+
+  if (Array.isArray(result.executed_actions)) {
+    result.executed_actions = compactRewardResolverExecutedActions(result.executed_actions);
+    if (result.executed_actions.length <= 0) {
+      delete result.executed_actions;
+    }
+  }
+
+  if (isPlainObject(rawFinalState)) {
+    result.final_state = summarizeRewardResolutionStateForAgent(rawFinalState);
+    delete result.state;
+  } else if (isPlainObject(rawState)) {
+    result.state = summarizeRewardResolutionStateForAgent(rawState);
+  }
+
+  if (result.resolved === true) {
+    delete result.reward_bundle;
+    delete result.final_reward_bundle;
+  }
+
+  if (isPlainObject(result.final_state)) {
+    delete result.state;
+  }
+
+  return result;
+}
+
+function compactTravelToCoordinatePayload(payload) {
+  const rawState = isPlainObject(payload?.state) ? payload.state : null;
+  const rawFinalState = isPlainObject(payload?.final_state) ? payload.final_state : null;
+  const compacted = compactPayloadForOutput(payload);
+  if (!isPlainObject(compacted)) {
+    return compacted;
+  }
+
+  const result = {
+    ...compacted
+  };
+
+  if (Array.isArray(result.executed_actions)) {
+    result.executed_actions = compactTravelExecutedActions(result.executed_actions);
+    if (result.executed_actions.length <= 0) {
+      delete result.executed_actions;
+    }
+  }
+
+  if (isPlainObject(result.snapshot_status)) {
+    result.snapshot_status = summarizeMapSnapshotStatusForAgent(result.snapshot_status);
+  }
+
+  if (isPlainObject(rawFinalState)) {
+    result.final_state = summarizeTravelResolutionStateForAgent(rawFinalState);
+    delete result.state;
+  } else if (isPlainObject(rawState)) {
+    result.state = summarizeTravelResolutionStateForAgent(rawState);
+  }
+
+  if (isPlainObject(result.final_state)) {
+    delete result.state;
+  }
+
+  return result;
+}
+
+function compactRestSitePayload(payload) {
+  const rawState = isPlainObject(payload?.state) ? payload.state : null;
+  const rawFinalState = isPlainObject(payload?.final_state) ? payload.final_state : null;
+  const rawRestSiteBundle = isPlainObject(payload?.rest_site_bundle) ? payload.rest_site_bundle : null;
+  const compacted = compactPayloadForOutput(payload);
+  if (!isPlainObject(compacted)) {
+    return compacted;
+  }
+
+  const result = {
+    ...compacted
+  };
+
+  if (isPlainObject(rawRestSiteBundle)) {
+    result.rest_site_bundle = summarizeRestSiteBundleForResolutionAgent(rawRestSiteBundle);
+  } else if (isPlainObject(result.rest_site_bundle)) {
+    result.rest_site_bundle = summarizeRestSiteBundleForResolutionAgent(result.rest_site_bundle);
+  }
+
+  if (isPlainObject(result.selected_option)) {
+    result.selected_option = summarizeIndexedOptionForAgent(result.selected_option);
+  }
+  if (result.selected_option == null) {
+    delete result.selected_option;
+  }
+
+  if (isPlainObject(result.selected_upgrade_card)) {
+    result.selected_upgrade_card = summarizeIndexedCardChoiceForAgent(result.selected_upgrade_card);
+  }
+  if (result.selected_upgrade_card == null) {
+    delete result.selected_upgrade_card;
+  }
+
+  if (Array.isArray(result.executed_actions)) {
+    result.executed_actions = compactShopLikeExecutedActions(result.executed_actions);
+    if (result.executed_actions.length <= 0) {
+      delete result.executed_actions;
+    }
+  }
+
+  if (isPlainObject(rawFinalState)) {
+    result.final_state = summarizeRestSiteResolutionStateForAgent(rawFinalState);
+    delete result.state;
+  } else if (isPlainObject(rawState)) {
+    result.state = summarizeRestSiteResolutionStateForAgent(rawState);
+  }
+
+  if (result.resolved === true) {
+    delete result.rest_site_bundle;
+  }
+
+  if (isPlainObject(result.rest_site_bundle) && isPlainObject(result.state)) {
+    if (
+      typeof result.rest_site_bundle.screen === "string" &&
+      result.state.screen === result.rest_site_bundle.screen
+    ) {
+      delete result.state.screen;
+    }
+    delete result.state.available_actions;
+    delete result.state.rest_site;
+  }
+
+  if (isPlainObject(result.final_state)) {
+    delete result.state;
+  }
+
+  return result;
+}
+
+function compactShopVisitPayload(payload) {
+  const rawState = isPlainObject(payload?.state) ? payload.state : null;
+  const rawFinalState = isPlainObject(payload?.final_state) ? payload.final_state : null;
+  const compacted = compactPayloadForOutput(payload);
+  if (!isPlainObject(compacted)) {
+    return compacted;
+  }
+
+  const result = {
+    ...compacted
+  };
+
+  if (isPlainObject(result.shop_bundle)) {
+    result.shop_bundle = summarizeShopBundleForResolutionAgent(result.shop_bundle);
+  }
+
+  if (isPlainObject(result.card_selection_bundle)) {
+    result.card_selection_bundle = summarizeCardSelectionBundleForResolutionAgent(
+      result.card_selection_bundle
+    );
+  }
+
+  if (Array.isArray(result.available_cards)) {
+    result.available_cards = result.available_cards
+      .map((entry, fallbackIndex) => summarizeIndexedCardTitleChoiceForAgent(entry, fallbackIndex))
+      .filter((entry) => entry !== null);
+    if (result.available_cards.length <= 0) {
+      delete result.available_cards;
+    }
+  }
+
+  if (Array.isArray(result.purchase_plan)) {
+    result.purchase_plan = result.purchase_plan
+      .map(compactShopPurchasePlanStep)
+      .filter((step) => step !== null);
+    if (result.purchase_plan.length <= 0) {
+      delete result.purchase_plan;
+    }
+  }
+
+  if (Array.isArray(result.purchased_items)) {
+    result.purchased_items = result.purchased_items
+      .map(compactPurchasedShopItemEntry)
+      .filter((entry) => entry !== null);
+    if (result.purchased_items.length <= 0) {
+      delete result.purchased_items;
+    }
+  }
+
+  if (isPlainObject(result.removed_card)) {
+    result.removed_card = compactRemovedShopCard(result.removed_card);
+  }
+
+  if (Array.isArray(result.executed_actions)) {
+    result.executed_actions = compactShopLikeExecutedActions(result.executed_actions);
+    if (result.executed_actions.length <= 0) {
+      delete result.executed_actions;
+    }
+  }
+
+  if (isPlainObject(rawFinalState)) {
+    result.final_state = summarizeShopResolutionStateForAgent(rawFinalState);
+    delete result.state;
+  } else if (isPlainObject(rawState)) {
+    result.state = summarizeShopResolutionStateForAgent(rawState);
+  }
+
+  if (result.resolved === true) {
+    delete result.shop_bundle;
+    delete result.purchase_plan;
+  }
+
+  if (
+    (isPlainObject(result.shop_bundle) || isPlainObject(result.card_selection_bundle)) &&
+    isPlainObject(result.state)
+  ) {
+    delete result.state.available_actions;
+    delete result.state.shop;
+    delete result.state.card_selection;
+  }
+
+  if (isPlainObject(result.final_state)) {
+    delete result.state;
   }
 
   return result;
@@ -7854,6 +8510,614 @@ function compactCombatSequenceExecutedStep(step, options = {}) {
   }
 
   return compactStep;
+}
+
+function summarizeClaimedRewardEntryForAgent(entry) {
+  if (!isPlainObject(entry)) {
+    return null;
+  }
+
+  const reward = summarizeRewardForAgent(entry.reward);
+  if (!isPlainObject(reward)) {
+    return null;
+  }
+
+  if (reward.reward_type === "card") {
+    return {
+      reward_type: reward.reward_type,
+      description: reward.description,
+      can_skip: reward.can_skip === true
+    };
+  }
+
+  return reward;
+}
+
+function summarizeSelectedCardForAgent(selectedCard) {
+  if (!isPlainObject(selectedCard)) {
+    return null;
+  }
+
+  const card = summarizeCardForAgent(selectedCard.card);
+  const summary = {};
+
+  if (Number.isInteger(selectedCard.index)) {
+    summary.index = selectedCard.index;
+  }
+
+  if (card !== null) {
+    summary.card = card;
+  }
+
+  return Object.keys(summary).length > 0 ? summary : null;
+}
+
+function summarizeIndexedOptionForAgent(option) {
+  if (!isPlainObject(option)) {
+    return null;
+  }
+
+  const summary = {};
+  if (Number.isInteger(option.index)) {
+    summary.index = option.index;
+  }
+  if (typeof option.option_type === "string") {
+    summary.option_type = option.option_type;
+  }
+  if (typeof option.option_id === "string") {
+    summary.option_id = option.option_id;
+  }
+  if (typeof option.title === "string") {
+    summary.title = normalizeAgentText(option.title);
+  }
+  if (typeof option.description === "string") {
+    summary.description = normalizeAgentText(option.description);
+  }
+  return Object.keys(summary).length > 0 ? summary : null;
+}
+
+function summarizeIndexedCardChoiceForAgent(choice) {
+  if (!isPlainObject(choice)) {
+    return null;
+  }
+
+  const card = summarizeCardForAgent(choice.card);
+  const summary = {};
+  if (Number.isInteger(choice.index)) {
+    summary.index = choice.index;
+  }
+  if (card !== null) {
+    summary.card = card;
+  }
+  return Object.keys(summary).length > 0 ? summary : null;
+}
+
+function compactInlineAgentText(value) {
+  const normalized = normalizeAgentText(value);
+  if (!normalized) {
+    return null;
+  }
+
+  return normalized.replace(/\n+/g, " / ").replace(/[ \t]{2,}/g, " ").trim() || null;
+}
+
+function summarizeIndexedCardTitleChoiceForAgent(choice, fallbackIndex = null) {
+  if (!isPlainObject(choice)) {
+    return null;
+  }
+
+  const optionIndex = Number.isInteger(choice.index) ? choice.index : fallbackIndex;
+  const title = normalizeAgentText(choice?.card?.title ?? choice?.title);
+  const summary = {};
+  if (Number.isInteger(optionIndex)) {
+    summary.index = optionIndex;
+  }
+  if (title) {
+    summary.title = title;
+  }
+  if (choice.is_selected === true) {
+    summary.is_selected = true;
+  }
+  return Object.keys(summary).length > 0 ? summary : null;
+}
+
+function summarizeDeckUpgradeChoiceForResolutionAgent(choice, fallbackIndex = null) {
+  if (!isPlainObject(choice)) {
+    return null;
+  }
+
+  const optionIndex = Number.isInteger(choice.index) ? choice.index : fallbackIndex;
+  if (!Number.isInteger(optionIndex)) {
+    return null;
+  }
+
+  const baseCard = isPlainObject(choice.card) ? choice.card : null;
+  const previewCard = isPlainObject(choice.upgrade_preview) ? choice.upgrade_preview : null;
+  const baseTitle = compactInlineAgentText(baseCard?.title ?? choice?.title);
+  if (!baseTitle) {
+    return `${optionIndex}`;
+  }
+
+  const previewTitle = compactInlineAgentText(previewCard?.title);
+  const previewEffect =
+    compactInlineAgentText(previewCard?.description) ??
+    compactInlineAgentText(previewCard?.effect) ??
+    compactInlineAgentText(previewCard?.effect_preview?.summary);
+  const previewCost = Number.isInteger(previewCard?.cost)
+    ? previewCard.cost
+    : Number.isInteger(previewCard?.resolved_energy_cost)
+      ? previewCard.resolved_energy_cost
+      : Number.isInteger(previewCard?.canonical_energy_cost)
+        ? previewCard.canonical_energy_cost
+        : null;
+  const previewParts = [];
+  if (previewTitle && previewTitle !== baseTitle) {
+    previewParts.push(previewTitle);
+  }
+  if (previewCost !== null) {
+    previewParts.push(`${previewCost}费`);
+  }
+  if (previewEffect) {
+    previewParts.push(previewEffect);
+  }
+
+  const suffix = previewParts.length > 0 ? ` -> ${previewParts.join(" | ")}` : "";
+  return `${optionIndex}:${baseTitle}${suffix}`;
+}
+
+function compactRewardResolverExecutedActions(actions) {
+  if (!Array.isArray(actions)) {
+    return [];
+  }
+
+  return actions
+    .map((action) => compactRewardResolverExecutedAction(action))
+    .filter((action) => action !== null);
+}
+
+function compactRewardResolverExecutedAction(action) {
+  if (!isPlainObject(action)) {
+    return null;
+  }
+
+  const actionId = typeof action.action_id === "string" ? action.action_id : null;
+  if (!actionId) {
+    return null;
+  }
+
+  const autoExecutedActions =
+    Array.isArray(action.auto_executed_actions) && action.auto_executed_actions.length > 0
+      ? action.auto_executed_actions
+      : null;
+  const screenAfter = typeof action.screen_after === "string" ? action.screen_after : null;
+  const settleReason =
+    typeof action.post_action_settle_reason === "string" ? action.post_action_settle_reason : null;
+  const settlePolls =
+    Number.isInteger(action.post_action_settle_polls) && action.post_action_settle_polls > 0
+      ? action.post_action_settle_polls
+      : null;
+  const commonSettleReason =
+    settleReason === "reward_flow_ready" ||
+    settleReason === "reward_card_selection_ready" ||
+    settleReason === "map_ready";
+
+  if (
+    autoExecutedActions === null &&
+    screenAfter === null &&
+    settlePolls === null &&
+    (settleReason === null || commonSettleReason)
+  ) {
+    return actionId;
+  }
+
+  const summary = {
+    action_id: actionId
+  };
+
+  if (settleReason !== null && !commonSettleReason) {
+    summary.settled = settleReason;
+  }
+
+  if (settlePolls !== null) {
+    summary.polls = settlePolls;
+  }
+
+  if (screenAfter !== null) {
+    summary.screen_after = screenAfter;
+  }
+
+  if (autoExecutedActions !== null) {
+    summary.auto_executed_actions = autoExecutedActions;
+  }
+
+  return summary;
+}
+
+function compactShopLikeExecutedActions(actions) {
+  if (!Array.isArray(actions)) {
+    return [];
+  }
+
+  return actions
+    .map((action) => compactShopLikeExecutedAction(action))
+    .filter((action) => action !== null);
+}
+
+function compactShopLikeExecutedAction(action) {
+  if (!isPlainObject(action)) {
+    return null;
+  }
+
+  const actionId = typeof action.action_id === "string" ? action.action_id : null;
+  if (!actionId) {
+    return null;
+  }
+
+  const autoExecutedActions =
+    Array.isArray(action.auto_executed_actions) && action.auto_executed_actions.length > 0
+      ? action.auto_executed_actions
+      : null;
+  const settleReason =
+    typeof action.post_action_settle_reason === "string" ? action.post_action_settle_reason : null;
+  const settlePolls =
+    Number.isInteger(action.post_action_settle_polls) && action.post_action_settle_polls > 0
+      ? action.post_action_settle_polls
+      : null;
+  const commonSettleReason =
+    settleReason === null ||
+    settleReason === "shop_ready" ||
+    settleReason === "rest_site_upgrade_ready" ||
+    settleReason === "map_ready";
+
+  if (autoExecutedActions === null && settlePolls === null && commonSettleReason) {
+    return actionId;
+  }
+
+  const summary = {
+    action_id: actionId
+  };
+
+  if (settleReason !== null && !commonSettleReason) {
+    summary.settled = settleReason;
+  }
+
+  if (settlePolls !== null) {
+    summary.polls = settlePolls;
+  }
+
+  if (autoExecutedActions !== null) {
+    summary.auto_executed_actions = autoExecutedActions;
+  }
+
+  return summary;
+}
+
+function compactShopPurchasePlanStep(step) {
+  if (!isPlainObject(step)) {
+    return null;
+  }
+
+  const summary = {
+    sequence_index: Number.isInteger(step.sequence_index) ? step.sequence_index : null
+  };
+  const request = isPlainObject(step.request) ? step.request : null;
+  const item = isPlainObject(step.item) ? step.item : null;
+
+  if (request) {
+    if (typeof request.title === "string") {
+      summary.title = normalizeAgentText(request.title);
+    }
+    if (typeof request.item_kind === "string") {
+      summary.item_kind = request.item_kind;
+    }
+  }
+
+  if (item) {
+    if (typeof summary.title !== "string" && typeof item.title === "string") {
+      summary.title = normalizeAgentText(item.title);
+    }
+    if (typeof summary.item_kind !== "string" && typeof item.item_kind === "string") {
+      summary.item_kind = item.item_kind;
+    }
+    if (Number.isFinite(item.cost)) {
+      summary.cost = item.cost;
+    }
+  }
+
+  return summary;
+}
+
+function compactPurchasedShopItemEntry(entry) {
+  if (!isPlainObject(entry)) {
+    return null;
+  }
+
+  const item = isPlainObject(entry.item) ? entry.item : null;
+  const request = isPlainObject(entry.request) ? entry.request : null;
+  const summary = {};
+
+  if (Number.isInteger(entry.sequence_index)) {
+    summary.sequence_index = entry.sequence_index;
+  }
+
+  if (request && typeof request.title === "string") {
+    summary.requested_title = normalizeAgentText(request.title);
+  }
+
+  if (item && typeof item.title === "string") {
+    summary.title = normalizeAgentText(item.title);
+  }
+
+  if (item && typeof item.item_kind === "string") {
+    summary.item_kind = item.item_kind;
+  } else if (request && typeof request.item_kind === "string") {
+    summary.item_kind = request.item_kind;
+  }
+
+  if (item && Number.isFinite(item.cost)) {
+    summary.cost = item.cost;
+  }
+
+  if (typeof entry.match_type === "string" && entry.match_type !== "exact") {
+    summary.match = entry.match_type;
+  }
+
+  if (Number.isInteger(entry.compatible_candidate_count) && entry.compatible_candidate_count > 1) {
+    summary.candidates = entry.compatible_candidate_count;
+  }
+
+  return Object.keys(summary).length > 0 ? summary : null;
+}
+
+function compactRemovedShopCard(removedCard) {
+  if (!isPlainObject(removedCard)) {
+    return null;
+  }
+
+  const summary = {};
+  if (typeof removedCard.requested_title === "string") {
+    summary.requested_title = normalizeAgentText(removedCard.requested_title);
+  }
+  if (Number.isInteger(removedCard.requested_index)) {
+    summary.requested_index = removedCard.requested_index;
+  }
+  if (Number.isInteger(removedCard.selected_option_index)) {
+    summary.selected_option_index = removedCard.selected_option_index;
+  }
+  if (typeof removedCard.match_type === "string" && removedCard.match_type !== "title") {
+    summary.match = removedCard.match_type;
+  }
+  if (
+    Number.isInteger(removedCard.compatible_option_count) &&
+    removedCard.compatible_option_count > 1
+  ) {
+    summary.candidates = removedCard.compatible_option_count;
+  }
+  const card = summarizeCardForAgent(removedCard.card);
+  if (card !== null) {
+    summary.card = card;
+  }
+  return Object.keys(summary).length > 0 ? summary : null;
+}
+
+function summarizeRewardResolutionStateForAgent(state) {
+  if (!isPlainObject(state)) {
+    return state;
+  }
+
+  const summary = summarizeStateForAgent(state);
+  if (!isPlainObject(summary)) {
+    return summary;
+  }
+
+  const result = {
+    screen: summary.screen,
+    state_version: summary.state_version
+  };
+
+  if (isPlainObject(summary.player)) {
+    result.player = {
+      current_hp: Number.isFinite(summary.player.current_hp) ? summary.player.current_hp : null,
+      max_hp: Number.isFinite(summary.player.max_hp) ? summary.player.max_hp : null,
+      gold: Number.isFinite(summary.player.gold) ? summary.player.gold : null,
+      potions: Array.isArray(summary.player.potions) ? summary.player.potions : []
+    };
+  }
+
+  if (Array.isArray(summary.available_actions) && summary.screen !== "MAP") {
+    result.available_actions = summary.available_actions;
+  }
+
+  if (isPlainObject(summary.rewards)) {
+    result.rewards = summary.rewards;
+  }
+
+  if (isPlainObject(summary.card_selection)) {
+    result.card_selection = summary.card_selection;
+  }
+
+  if (isPlainObject(summary.map)) {
+    result.map = summary.map;
+  }
+
+  return result;
+}
+
+function summarizeRestSiteResolutionStateForAgent(state) {
+  if (!isPlainObject(state)) {
+    return state;
+  }
+
+  const summary = summarizeStateForAgent(state);
+  if (!isPlainObject(summary)) {
+    return summary;
+  }
+
+  const result = {
+    screen: summary.screen,
+    state_version: summary.state_version
+  };
+
+  if (isPlainObject(summary.player)) {
+    result.player = {
+      current_hp: Number.isFinite(summary.player.current_hp) ? summary.player.current_hp : null,
+      max_hp: Number.isFinite(summary.player.max_hp) ? summary.player.max_hp : null,
+      gold: Number.isFinite(summary.player.gold) ? summary.player.gold : null,
+      potions: Array.isArray(summary.player.potions) ? summary.player.potions : []
+    };
+  }
+
+  if (isPlainObject(summary.map)) {
+    result.map = summary.map;
+  }
+
+  return result;
+}
+
+function summarizeShopResolutionStateForAgent(state) {
+  if (!isPlainObject(state)) {
+    return state;
+  }
+
+  const summary = summarizeStateForAgent(state);
+  if (!isPlainObject(summary)) {
+    return summary;
+  }
+
+  const result = {
+    screen: summary.screen,
+    state_version: summary.state_version
+  };
+
+  if (isPlainObject(summary.player)) {
+    result.player = {
+      current_hp: Number.isFinite(summary.player.current_hp) ? summary.player.current_hp : null,
+      max_hp: Number.isFinite(summary.player.max_hp) ? summary.player.max_hp : null,
+      gold: Number.isFinite(summary.player.gold) ? summary.player.gold : null,
+      potions: Array.isArray(summary.player.potions) ? summary.player.potions : []
+    };
+  }
+
+  if (isPlainObject(summary.map)) {
+    result.map = summary.map;
+  }
+
+  return result;
+}
+
+function compactTravelExecutedActions(actions) {
+  if (!Array.isArray(actions)) {
+    return [];
+  }
+
+  return actions
+    .map((action) => compactTravelExecutedAction(action))
+    .filter((action) => action !== null);
+}
+
+function compactTravelExecutedAction(action) {
+  if (!isPlainObject(action)) {
+    return null;
+  }
+
+  const actionId = typeof action.action_id === "string" ? action.action_id : null;
+  if (!actionId) {
+    return null;
+  }
+
+  const autoExecutedActions =
+    Array.isArray(action.auto_executed_actions) && action.auto_executed_actions.length > 0
+      ? action.auto_executed_actions
+      : null;
+  const screenAfter = typeof action.screen_after === "string" ? action.screen_after : null;
+  const settleReason =
+    typeof action.post_action_settle_reason === "string" ? action.post_action_settle_reason : null;
+  const settlePolls =
+    Number.isInteger(action.post_action_settle_polls) && action.post_action_settle_polls > 0
+      ? action.post_action_settle_polls
+      : null;
+  const commonSettleReason =
+    settleReason === "reward_flow_ready" ||
+    settleReason === "map_ready" ||
+    settleReason === "player_turn_stable";
+
+  if (
+    autoExecutedActions === null &&
+    screenAfter === null &&
+    settlePolls === null &&
+    (settleReason === null || commonSettleReason)
+  ) {
+    return actionId;
+  }
+
+  const summary = {
+    action_id: actionId
+  };
+
+  if (settleReason !== null && !commonSettleReason) {
+    summary.settled = settleReason;
+  }
+
+  if (settlePolls !== null) {
+    summary.polls = settlePolls;
+  }
+
+  if (screenAfter !== null) {
+    summary.screen_after = screenAfter;
+  }
+
+  if (autoExecutedActions !== null) {
+    summary.auto_executed_actions = autoExecutedActions;
+  }
+
+  return summary;
+}
+
+function summarizeTravelResolutionStateForAgent(state) {
+  if (!isPlainObject(state)) {
+    return state;
+  }
+
+  if (state.screen === "COMBAT") {
+    return summarizeActionStateForAgent(state);
+  }
+
+  const summary = summarizeStateForAgent(state);
+  if (!isPlainObject(summary)) {
+    return summary;
+  }
+
+  const result = {
+    screen: summary.screen,
+    state_version: summary.state_version
+  };
+
+  if (isPlainObject(summary.player)) {
+    result.player = {
+      current_hp: Number.isFinite(summary.player.current_hp) ? summary.player.current_hp : null,
+      max_hp: Number.isFinite(summary.player.max_hp) ? summary.player.max_hp : null,
+      gold: Number.isFinite(summary.player.gold) ? summary.player.gold : null,
+      potions: Array.isArray(summary.player.potions) ? summary.player.potions : []
+    };
+  }
+
+  if (Array.isArray(summary.available_actions) && summary.screen !== "MAP") {
+    result.available_actions = summary.available_actions;
+  }
+
+  if (isPlainObject(summary.map)) {
+    result.map = summary.map;
+  }
+
+  if (isPlainObject(summary.rewards)) {
+    result.rewards = summary.rewards;
+  }
+
+  if (isPlainObject(summary.card_selection)) {
+    result.card_selection = summary.card_selection;
+  }
+
+  return result;
 }
 
 function summarizeCombatSequenceStateForAgent(state, initialState = null) {
@@ -8291,6 +9555,8 @@ function summarizeExecutedAction(result) {
     matched_action: summarizeActionForAgent(result?.matched_action),
     auto_executed_actions: Array.isArray(result?.auto_executed_actions)
       ? result.auto_executed_actions
+          .map((action) => summarizeAutoExecutedActionForAgent(action))
+          .filter((action) => action !== null)
       : [],
     post_action_settled: result?.post_action_settled ?? null,
     post_action_settle_reason: result?.post_action_settle_reason ?? null,
@@ -8298,6 +9564,29 @@ function summarizeExecutedAction(result) {
     state_version_after: result?.state_version_after ?? result?.state?.state_version ?? null,
     screen_after: result?.state?.screen ?? null
   };
+}
+
+function summarizeAutoExecutedActionForAgent(action) {
+  if (typeof action === "string") {
+    return action;
+  }
+
+  if (!isPlainObject(action)) {
+    return null;
+  }
+
+  const actionId = typeof action.action_id === "string" ? action.action_id : null;
+  if (!actionId) {
+    return null;
+  }
+
+  const source = typeof action.source === "string" ? action.source : null;
+  return source === null
+    ? actionId
+    : {
+        action_id: actionId,
+        source
+      };
 }
 
 function getSessionFilePath() {
@@ -8739,7 +10028,7 @@ function toolErrorPayload(error) {
   if (error instanceof BridgeHttpError) {
     const payload = error.details && error.details.payload;
     if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-      return payload;
+      return summarizeBridgeErrorPayload(payload);
     }
 
     return {
@@ -8764,6 +10053,64 @@ function toolErrorPayload(error) {
     error: "internal_error",
     message: error instanceof Error ? error.message : String(error)
   };
+}
+
+function summarizeBridgeErrorPayload(payload) {
+  if (!isPlainObject(payload)) {
+    return payload;
+  }
+
+  const result = compactPayloadForOutput(payload);
+  if (!isPlainObject(result)) {
+    return payload;
+  }
+
+  if (Array.isArray(payload.available_actions)) {
+    result.available_actions = summarizeActionsForAgent(filterNonAutomationActions(payload.available_actions));
+  }
+
+  if (isPlainObject(payload.current_state)) {
+    result.current_state = summarizeActionStateForAgent(payload.current_state);
+  }
+
+  if (isPlainObject(payload.state_after)) {
+    result.state_after = summarizeActionStateForAgent(payload.state_after);
+  }
+
+  if (isPlainObject(payload.state)) {
+    result.state = summarizeActionStateForAgent(payload.state);
+  }
+
+  if (isPlainObject(payload.current_reward_bundle)) {
+    result.current_reward_bundle = summarizeRewardBundleForAgent(payload.current_reward_bundle);
+  }
+
+  if (isPlainObject(payload.current_card_selection_bundle)) {
+    result.current_card_selection_bundle = summarizeCardSelectionBundleForAgent(
+      payload.current_card_selection_bundle
+    );
+  }
+
+  if (isPlainObject(result.current_state)) {
+    result.current_state = removeDuplicatedStateSections(result.current_state, {
+      reward:
+        isPlainObject(result.current_reward_bundle) || isPlainObject(result.reward_bundle),
+      rest_site: false,
+      card_selection:
+        isPlainObject(result.current_card_selection_bundle) ||
+        isPlainObject(result.card_selection_bundle),
+      shop: false,
+      available_actions:
+        isPlainObject(result.current_reward_bundle) ||
+        isPlainObject(result.reward_bundle) ||
+        isPlainObject(result.current_card_selection_bundle) ||
+        isPlainObject(result.card_selection_bundle)
+    });
+  }
+
+  dedupeCompactedPayloadSections(result);
+
+  return result;
 }
 
 function attachInteractionHints(payload) {
@@ -8834,7 +10181,7 @@ function asPrecompactedToolResult(payload, isError) {
     content: [
       {
         type: "text",
-        text: JSON.stringify(payload, null, 2)
+        text: JSON.stringify(payload)
       }
     ]
   };

@@ -2930,6 +2930,28 @@ internal static class BridgeGameApi
         };
     }
 
+    private static object? BuildCardUpgradePreviewPayload(CardModel? card)
+    {
+        if (card is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            var upgradedCard = card.CardScope.CloneCard(card);
+            upgradedCard.UpgradeInternal();
+            upgradedCard.UpgradePreviewType = card.Pile?.IsCombatPile == true
+                ? CardUpgradePreviewType.Combat
+                : CardUpgradePreviewType.Deck;
+            return BuildCardPayload(upgradedCard);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static string GetCardDescription(CardModel card, Creature? previewTarget)
     {
         try
@@ -3761,6 +3783,7 @@ internal static class BridgeGameApi
             {
                 index,
                 card = BuildCardPayload(holder.CardModel),
+                upgrade_preview = BuildCardUpgradePreviewPayload(holder.CardModel),
                 is_selected = IsDeckUpgradeCardSelected(deckUpgradeScreen, holder.CardModel)
             }).ToArray()
         };
