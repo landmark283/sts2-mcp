@@ -14,7 +14,7 @@ internal static class BridgeServer
     };
     private static readonly JsonSerializerOptions ResponseJsonOptions = new()
     {
-        WriteIndented = true
+        WriteIndented = false
     };
 
     private static HttpListener? _listener;
@@ -162,18 +162,6 @@ internal static class BridgeServer
                 return;
             }
 
-            if (method.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
-                path.Equals("/actions", StringComparison.OrdinalIgnoreCase))
-            {
-                BridgeDebugTrace.Write("http GET /actions authorize");
-                EnsureAuthorized(context.Request);
-                BridgeDebugTrace.Write("http GET /actions authorized");
-                var payload = await BridgeGameApi.GetActionsResponseAsync(cancellationToken);
-                await WriteJsonAsync(context.Response, HttpStatusCode.OK, payload, cancellationToken);
-                BridgeDebugTrace.Write("http GET /actions ok");
-                return;
-            }
-
             if (method.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 path.Equals("/action", StringComparison.OrdinalIgnoreCase))
             {
@@ -184,6 +172,17 @@ internal static class BridgeServer
                 var payload = await BridgeGameApi.PerformActionResponseAsync(request, cancellationToken);
                 await WriteJsonAsync(context.Response, HttpStatusCode.OK, payload, cancellationToken);
                 BridgeDebugTrace.Write("http POST /action ok");
+                return;
+            }
+
+            if (method.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                path.Equals("/events", StringComparison.OrdinalIgnoreCase))
+            {
+                BridgeDebugTrace.Write("http GET /events authorize");
+                EnsureAuthorized(context.Request);
+                BridgeDebugTrace.Write("http GET /events authorized");
+                await BridgeGameApi.StreamFrontierEventsAsync(context.Response, cancellationToken);
+                BridgeDebugTrace.Write("http GET /events closed");
                 return;
             }
 

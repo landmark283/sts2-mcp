@@ -1,5 +1,153 @@
 # Changelog
 
+## v0.7.12 - 2026-03-22
+
+Repository release: `v0.7.12`
+
+Bridge mod version: `0.7.12`
+
+Bridge state schema: `2026-03-20.1`
+
+MCP server version: `0.4.20`
+
+### Highlights
+
+- Replaced the MCP server's poll-heavy state sync path with a bridge frontier event stream plus event-driven wait helpers, which makes continuous combat actions noticeably faster and reduces stale-action windows.
+- Added post-action settlement on the MCP side so single actions and combat sequences now wait for the next stable actionable surface instead of returning too early while the bridge is still transitioning.
+- Added a full MCP-native knowledge and observation layer, so strategy content is queried through tools instead of being stuffed into prompt attachments.
+- Continued token reduction work across bridge and MCP payloads by switching bridge JSON output to compact formatting and expanding compact action/state summaries.
+
+### Bridge Mod Changes
+
+- Added authenticated `GET /events` support that streams frontier updates directly from the bridge.
+- Added frontier lifecycle hooks through `BridgeCoordinator` so the frontier store is reset on detach and pumped every main-thread tick.
+- Updated the bridge HTTP writer to emit compact JSON instead of indented JSON, reducing response size without changing semantics.
+- Bumped the bridge state schema to `2026-03-20.1`.
+- Exposed card star-cost metadata in bridge card payloads:
+- `canonical_star_cost`
+- `current_star_cost`
+- `has_star_cost_x`
+- Preserved `semantic_state_hash` in the hydrated state payload so MCP-side event followers can reason about stable semantic snapshots.
+
+### MCP Server Changes
+
+- Added a persistent bridge event client that follows `/events` and maintains a live cached frontier.
+- Added `sts2_wait_until_actionable`, an event-driven wait primitive that returns only when a stable actionable surface is available.
+- Reworked post-action settlement:
+- `performBridgeAction(...)` now settles by default instead of only waiting for the immediate action response.
+- Combat actions, `end_turn`, screen transitions, and map travel now use strategy-specific settlement logic.
+- Event-driven quiet-window settling now absorbs delayed follow-up surfaces such as discard selection, retain selection, reward cleanup, and next-turn hand refill.
+- Fixed one of the worst failure modes in combat sequencing:
+- when a sequence now runs into a blocker mid-turn, it returns partial progress with `ok: true`, `resolved: false`, `executed_steps`, and the current state instead of surfacing a misleading top-level failure.
+- Added monotonic state caching on the MCP side so older `state_version` snapshots from HTTP/SSE cannot overwrite newer cached state.
+- Added tool profiles so the same MCP server can expose `minimal`, `strategic`, or `debug` tool sets without turning the project into an agent framework.
+- Added MCP-native knowledge tools:
+- `sts2_get_knowledge`
+- `sts2_get_knowledge_topics`
+- `sts2_search_knowledge`
+- `sts2_read_knowledge_slice`
+- `sts2_list_knowledge_sections`
+- Added evidence-first observation tools:
+- `sts2_record_observation`
+- `sts2_list_observation_entities`
+- `sts2_read_observation_entity`
+- Added run journaling tools:
+- `sts2_journal_write`
+- `sts2_journal_read`
+- `sts2_journal_summarize`
+- `sts2_journal_get_summary`
+- `sts2_journal_list_runs`
+- Added canonical knowledge content under `packages/mcp-server/knowledge/` for route planning, deck building, card evaluation, combat, bosses, enemies, relics, events, and authoring workflow.
+
+### Live Validation
+
+- Live combat validation confirmed that a mixed sequence such as `中和 + 打击 + 打击 + 防御 + end_turn` now completes without the old mid-sequence `state_version_conflict` failure.
+- Live validation on `生存者` confirmed that:
+- single `sts2_perform_action` now returns the follow-up `CARD_SELECTION` surface instead of stopping too early on the previous `COMBAT` state.
+- `sts2_execute_combat_sequence` now stops cleanly at the discard selection with:
+- `resolved: false`
+- `reason: "card_selection_ready"`
+- `executed_count: 1`
+- the remaining steps still pending instead of being misreported as failed or accidentally executed.
+
+### Upgrade Notes
+
+- Restart the game after replacing `sts2-bridge.dll`, otherwise `/events`, schema `2026-03-20.1`, and the newer bridge payload fields will not exist in the running bridge process.
+- Restart any long-lived `sts2` MCP server process after updating `packages/mcp-server/index.js`, otherwise it will continue using the older polling and settlement logic.
+
+### Release Assets
+
+- `sts2-bridge-v0.7.12.dll`
+- `sts2-bridge-v0.7.12.zip`
+
+## v0.7.11 - 2026-03-19
+
+Repository release: `v0.7.11`
+
+Bridge mod version: `0.7.11`
+
+Bridge state schema: `2026-03-19.1`
+
+MCP server version: `0.4.19`
+
+### Highlights
+
+- Added full Crystal Sphere event support, including screen detection, compact event state, legal actions, and live-validated click execution.
+- Reduced false `state_version` churn by hashing semantic game state instead of volatile automation and expanded action payload trees.
+- Fixed multiple card-selection stability problems: drifting hand indices, missing confirm buttons on deck-card selection screens, and noisy completion errors.
+- Compressed Crystal Sphere responses down to the minimum actionable shape while keeping direct action-id reconstruction possible.
+
+### Bridge Mod Changes
+
+- Added `EVENT_CRYSTAL_SPHERE` screen detection in the bridge state capture path.
+- Added top-level `crystal_sphere` state payload with divination count, selected tool, grid size, hidden-cell count, and revealed item summaries.
+- Added Crystal Sphere event options and actions into the shared event surface so indexed option tooling can address the event without a dedicated new tool.
+- Fixed Crystal Sphere execution by routing through the screen-level handlers:
+- `SetSmallDivination`
+- `SetBigDivination`
+- `OnCellClicked`
+- `OnProceedButtonPressed`
+- This replaces the earlier no-op path that tried to click the cell/button nodes directly.
+- Introduced semantic state hashing via `CreateSemanticStateCore(...)` so transient fields like automation payloads, verbose action text, and other non-decision metadata no longer perturb `state_version`.
+- Stabilized card-selection option indexing by deriving combat-hand indices from the real hand pile order instead of pure visual order.
+- Added `selection_id` support to card-selection options so MCP-side rematching can survive index drift.
+- Added `NDeckCardSelectScreen`-aware confirm button resolution so two-step selection flows expose the correct confirm target after cards are chosen.
+- Treated benign `CompleteSelection` final-state exceptions as successful completion instead of surfacing a false internal error.
+- Fixed count-prefixed image-tag compaction so strings like `9[star icon]` are rendered as `9点星辉` instead of malformed numeric text.
+
+### MCP Server Changes
+
+- Added compact Crystal Sphere summaries to `sts2_get_state`, `sts2_perform_action(return_state_after=true)`, and `sts2_list_actions`.
+- Crystal Sphere responses now use a compact action map:
+- `controls`: short strings like `0:small*` and `1:big`
+- `cell_action_start_index`: the first `event_option:N` index for revealable cells
+- `cells`: compact coordinate list where `event_option:(start + offset)` maps to the corresponding coordinate
+- `revealed`: short strings like `4,0=gold:10`
+- Suppressed duplicate `event_options` expansion on the Crystal Sphere screen, because the same decision surface is already represented in `crystal_sphere.actions`.
+- Collapsed Crystal Sphere `sts2_list_actions` output into one `event_option_group` instead of enumerating every `event_option:N` row as a separate object.
+- `sts2_perform_action` compact post-action summaries now preserve `crystal_sphere` state, so event follow-up decisions do not require an immediate extra `get_state`.
+- `sts2_pick_option` and `sts2_resolve_card_selection` now use indexed-option helpers plus stable `selection_id` matching instead of assuming visible-option indices are fixed.
+- Added `star_cost` to agent-facing card summaries and compact combat action summaries.
+
+### Practical Result
+
+- Live validation on a fresh local MCP process confirmed Crystal Sphere tool switching and cell reveals now change the real game state.
+- Example live click: `event_option:2` advanced the event, reduced divinations from `2` to `1`, and updated the revealable-cell set as expected.
+- In the tested Crystal Sphere scene, compact response sizes were reduced to roughly:
+- `sts2_get_state`: ~`1.5k` chars
+- `sts2_list_actions`: ~`1.1k` chars
+- `sts2_perform_action(return_state_after=true)`: ~`1.6k` chars
+
+### Upgrade Notes
+
+- Restart the game after replacing `sts2-bridge.dll`, otherwise the new bridge payload fields and action wiring will not be loaded.
+- Restart any long-lived `sts2` MCP process after updating `packages/mcp-server/index.js`, otherwise it will keep using the older summary logic.
+
+### Release Assets
+
+- `sts2-bridge-v0.7.11.dll`
+- `sts2-bridge-v0.7.11.zip`
+
 ## v0.7.10 - 2026-03-19
 
 Repository release: `v0.7.10`

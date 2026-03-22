@@ -90,6 +90,8 @@ internal static class BridgeCoordinator
             _isAttached = false;
         }
 
+        BridgeGameApi.ResetFrontierState();
+
         if (waitersToCancel is null)
         {
             return;
@@ -213,6 +215,8 @@ internal static class BridgeCoordinator
         {
             BridgeDebugTrace.Write("coordinator processed queued work");
         }
+
+        BridgeGameApi.NotifyFrontierPumpTick();
 
         if (readyWaiters is null)
         {

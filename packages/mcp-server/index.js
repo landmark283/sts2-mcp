@@ -6,18 +6,25 @@ const path = require("path");
 const { setTimeout: delay } = require("timers/promises");
 
 const SERVER_NAME = "sts2";
-const SERVER_VERSION = "0.4.18";
+const SERVER_VERSION = "0.4.20";
 const FALLBACK_PROTOCOL_VERSION = "2025-03-26";
 const DEFAULT_LOG_FILE_NAME = "mcp-stdio.log";
 const MAX_LOG_PREVIEW = 600;
 const DEFAULT_HTTP_TIMEOUT_MS = 10000;
-const DEFAULT_ACTION_WAIT_MS = 1200;
+const DEFAULT_ACTION_WAIT_MS = 0;
 const MAX_ACTION_WAIT_MS = 5000;
 const DEFAULT_WAIT_TIMEOUT_MS = 20000;
 const MAX_WAIT_TIMEOUT_MS = 120000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const MIN_POLL_INTERVAL_MS = 100;
 const MAX_POLL_INTERVAL_MS = 2000;
+const BRIDGE_EVENT_RECONNECT_DELAY_MS = 300;
+const BRIDGE_EVENT_MAX_RECONNECT_DELAY_MS = 3000;
+const BRIDGE_EVENT_CACHE_MAX_AGE_MS = 1500;
+const ACTION_STATE_SYNC_TIMEOUT_MS = 500;
+const POST_ACTION_SETTLE_QUIET_WINDOW_MS = 80;
+const COMBAT_ACTION_SETTLE_QUIET_WINDOW_MS = 200;
+const END_TURN_SETTLE_QUIET_WINDOW_MS = 120;
 const END_TURN_SETTLE_TIMEOUT_MS = 8000;
 const END_TURN_SETTLE_POLL_INTERVAL_MS = 200;
 const END_TURN_STABLE_POLL_TARGET = 6;
@@ -31,6 +38,28 @@ const ROOM_EXIT_SETTLE_POLL_INTERVAL_MS = 200;
 const MAP_ROUTE_SETTLE_TIMEOUT_MS = 4000;
 const MAP_ROUTE_SETTLE_POLL_INTERVAL_MS = 200;
 const MAP_ROUTE_STABLE_POLL_TARGET = 2;
+const KNOWLEDGE_INPUT_TOPIC_ENUM = [
+  "route-planning",
+  "deck-building",
+  "card-tier-list",
+  "combat-tips",
+  "boss-guide",
+  "enemy-patterns",
+  "relics",
+  "events",
+  "knowledge-authoring",
+  "regent",
+  "routes",
+  "decks",
+  "cards",
+  "combat",
+  "bosses",
+  "enemies",
+  "templates",
+  "authoring"
+];
+const TOOL_PROFILE_NAMES = ["minimal", "strategic", "debug"];
+const OBSERVATION_DOMAIN_ENUM = ["cards", "relics", "events", "enemies"];
 
 const TOOL_DEFINITIONS = [
   {
@@ -66,7 +95,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "sts2_get_map_routes",
     description:
-      "Build a pruned future-only map route forest from the currently travelable frontier points, excluding the current node, past rows, and unreachable branches. Defaults to summary mode; use detail=full to include the full reachable node table.",
+      "Build a pruned future-only map route forest from the currently travelable frontier points, excluding the current node, past rows, and unreachable branches. Defaults to summary mode; use detail=full to include the full reachable node table. Strategy tip: prefer routes with more shops and campfires; elite fights have very low reward-to-risk ratio — avoid or minimize them.",
     inputSchema: {
       type: "object",
       properties: {
@@ -189,7 +218,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "sts2_end_turn",
     description:
-      "Convenience wrapper around sts2_perform_action for the combat end_turn action. Set return_state_after=true to include a compact post-action state summary in the tool response.",
+      "Convenience wrapper around sts2_perform_action for the combat end_turn action. Set return_state_after=true to include a compact post-action state summary in the tool response. Before ending: check for unplayed 0-cost cards and unused potions.",
     inputSchema: {
       type: "object",
       properties: {
@@ -214,7 +243,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "sts2_resolve_room_rewards",
     description:
-      "Inspect the current room-end rewards, optionally choose one card reward by index, claim safe rewards, and auto-advance through reward/proceed cleanup when possible.",
+      "Inspect the current room-end rewards, optionally choose one card reward by index, claim safe rewards, and auto-advance through reward/proceed cleanup when possible. Strategy tip: consider your current deck archetype before picking card rewards; choose cards that synergize with your build.",
     inputSchema: {
       type: "object",
       properties: {
@@ -241,7 +270,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "sts2_resolve_rest_site",
     description:
-      "Resolve a campfire in one tool call: choose rest/smith, optionally choose a smith upgrade target, then auto-advance back to the map when possible.",
+      "Resolve a campfire in one tool call: choose rest/smith, optionally choose a smith upgrade target, then auto-advance back to the map when possible. Strategy tip: rest if HP < 50%; consider smithing if HP > 70% and you have a key card to upgrade.",
     inputSchema: {
       type: "object",
       properties: {
@@ -405,7 +434,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "sts2_wait_for_change",
     description:
-      "Poll the bridge until the state_version or state_hash changes from a known baseline.",
+      "Wait until the bridge publishes a new state_version or state_hash beyond a known baseline.",
     inputSchema: {
       type: "object",
       properties: {
@@ -428,16 +457,453 @@ const TOOL_DEFINITIONS = [
       },
       additionalProperties: false
     }
+  },
+  {
+    name: "sts2_wait_until_actionable",
+    description:
+      "Wait until a non-automation decision surface is stable enough to act on. This follows the bridge frontier stream and returns when a stable actionable surface such as combat, reward, card selection, rest site, shop, map, or event becomes available.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        timeout_ms: {
+          type: "integer",
+          minimum: 1,
+          maximum: MAX_WAIT_TIMEOUT_MS
+        },
+        poll_interval_ms: {
+          type: "integer",
+          minimum: MIN_POLL_INTERVAL_MS,
+          maximum: MAX_POLL_INTERVAL_MS
+        },
+        stability_polls: {
+          type: "integer",
+          minimum: 1,
+          maximum: 10,
+          description:
+            "How many consecutive identical actionable snapshots are required before returning. Defaults to 2."
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_journal_write",
+    description:
+      "Append a markdown journal entry to the current run's log file. Use this to record combat outcomes, route decisions, card evaluations, and post-mortem notes. Each entry is persisted as a markdown section with floor, tags, and timestamp.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        entry: {
+          type: "string",
+          minLength: 1,
+          description: "The journal entry text (markdown supported)."
+        },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional tags like 'combat', 'death', 'route', 'upgrade', 'shop'."
+        },
+        floor: {
+          type: "integer",
+          minimum: 0,
+          description: "Floor number for this entry. Auto-detected from live bridge state when omitted."
+        }
+      },
+      required: ["entry"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_journal_read",
+    description:
+      "Read the current run's journal log. Returns the full markdown content or a filtered subset. Use this at the start of a new conversation to recall what happened in previous floors.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        last_n: {
+          type: "integer",
+          minimum: 1,
+          description: "Return only the last N entries."
+        },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          description: "Filter entries that contain any of these tags."
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_journal_summarize",
+    description:
+      "Write or update the current run's summary in meta.json. Call this after significant milestones (act completion, death, boss win) to persist a concise run overview.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        summary: {
+          type: "string",
+          minLength: 1,
+          description: "The run summary text."
+        },
+        result: {
+          type: "string",
+          enum: ["in_progress", "death", "victory"],
+          description: "Run result status."
+        },
+        floor: {
+          type: "integer",
+          minimum: 0,
+          description: "Current or final floor number."
+        }
+      },
+      required: ["summary"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_journal_get_summary",
+    description:
+      "Read the current run's summary and metadata from meta.json. Use this at conversation start to quickly recall the current run state.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_journal_list_runs",
+    description:
+      "List summaries of all historical runs from meta.json. Use this to review past run outcomes and learn from mistakes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        last_n: {
+          type: "integer",
+          minimum: 1,
+          description: "Return only the last N runs."
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_record_observation",
+    description:
+      "Append one provenance-tagged observation for a knowledge entity. Use this to accumulate card, relic, event, or enemy evidence before promoting it into canonical knowledge.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        domain: {
+          type: "string",
+          enum: OBSERVATION_DOMAIN_ENUM
+        },
+        entity_name: {
+          type: "string",
+          minLength: 1
+        },
+        observation: {
+          type: "string",
+          minLength: 1
+        },
+        source_type: {
+          type: "string",
+          enum: ["observed", "journaled", "inferred", "external"]
+        },
+        confidence: {
+          type: "string",
+          enum: ["low", "medium", "high"]
+        },
+        source_tool: {
+          type: "string",
+          minLength: 1
+        },
+        source_ref: {
+          type: "string",
+          minLength: 1
+        },
+        state_version: {
+          type: "integer"
+        },
+        tags: {
+          type: "array",
+          items: {
+            type: "string"
+          }
+        }
+      },
+      required: ["domain", "entity_name", "observation"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_list_observation_entities",
+    description:
+      "List recorded observation entities with counts and freshness. Use this before reading one entity log in detail.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        domain: {
+          type: "string",
+          enum: OBSERVATION_DOMAIN_ENUM
+        },
+        query: {
+          type: "string",
+          minLength: 1
+        },
+        max_results: {
+          type: "integer",
+          minimum: 1,
+          maximum: 200
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_read_observation_entity",
+    description:
+      "Read the observation log for one entity. Returns the full markdown log or only the last N entries.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        domain: {
+          type: "string",
+          enum: OBSERVATION_DOMAIN_ENUM
+        },
+        entity_name: {
+          type: "string",
+          minLength: 1
+        },
+        last_n: {
+          type: "integer",
+          minimum: 1
+        }
+      },
+      required: ["domain", "entity_name"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_get_knowledge",
+    description:
+      "Read a strategy knowledge file by topic. Canonical topics: route-planning, deck-building, card-tier-list, combat-tips, boss-guide, enemy-patterns, relics, events, knowledge-authoring. Aliases include regent, routes, decks, cards, combat, bosses, enemies, templates, and authoring. Returns the full markdown content of the requested knowledge file.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: {
+          type: "string",
+          enum: KNOWLEDGE_INPUT_TOPIC_ENUM,
+          description: "The knowledge topic to retrieve."
+        }
+      },
+      required: ["topic"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_get_knowledge_topics",
+    description:
+      "List available knowledge topics with aliases, domains, file paths, section counts, and short summaries. Use this before search/read tools when you want a precise entry point into the knowledge base.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_search_knowledge",
+    description:
+      "Search the knowledge base by keyword or regex. Returns matching lines with heading path and small context windows so callers can inspect precisely before reading a larger slice.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          minLength: 1,
+          description: "Keyword or regex pattern to search for."
+        },
+        topics: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: KNOWLEDGE_INPUT_TOPIC_ENUM
+          },
+          description: "Optional topic filter. When omitted, search all knowledge topics."
+        },
+        case_sensitive: {
+          type: "boolean",
+          description: "Use case-sensitive matching. Defaults to false."
+        },
+        regex: {
+          type: "boolean",
+          description: "Treat query as a JavaScript regular expression. Defaults to false."
+        },
+        context_before: {
+          type: "integer",
+          minimum: 0,
+          maximum: 20,
+          description: "How many lines of context to include before each match. Defaults to 1."
+        },
+        context_after: {
+          type: "integer",
+          minimum: 0,
+          maximum: 20,
+          description: "How many lines of context to include after each match. Defaults to 1."
+        },
+        max_results: {
+          type: "integer",
+          minimum: 1,
+          maximum: 100,
+          description: "Maximum number of matches to return. Defaults to 20."
+        }
+      },
+      required: ["query"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_read_knowledge_slice",
+    description:
+      "Read a precise slice from one knowledge topic. Supports an exact section_path array, a heading match, or an explicit line range, with optional max_lines truncation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: {
+          type: "string",
+          enum: KNOWLEDGE_INPUT_TOPIC_ENUM,
+          description: "The knowledge topic to read from."
+        },
+        section_path: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+          description:
+            "Exact heading path array to read, for example ['Act 1', 'Guardian']. Cannot be combined with heading/start_line/end_line."
+        },
+        heading: {
+          type: "string",
+          description:
+            "Exact section title or full heading path string to read. Cannot be combined with section_path/start_line/end_line."
+        },
+        occurrence: {
+          type: "integer",
+          minimum: 1,
+          maximum: 50,
+          description: "Which matching heading occurrence to read when heading is used. Defaults to 1."
+        },
+        case_sensitive: {
+          type: "boolean",
+          description: "Use case-sensitive heading matching. Defaults to false."
+        },
+        start_line: {
+          type: "integer",
+          minimum: 1,
+          description: "1-based start line for line-range reads."
+        },
+        end_line: {
+          type: "integer",
+          minimum: 1,
+          description: "1-based end line for line-range reads. Defaults to start_line when omitted."
+        },
+        max_lines: {
+          type: "integer",
+          minimum: 1,
+          maximum: 400,
+          description:
+            "Maximum number of lines to return from the matched section or requested line range. Defaults to the full selected range."
+        }
+      },
+      required: ["topic"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_list_knowledge_sections",
+    description:
+      "List headings for one or more knowledge topics, including heading path and line ranges. Useful before reading a narrow slice.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topics: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: KNOWLEDGE_INPUT_TOPIC_ENUM
+          },
+          description: "Optional topic filter. When omitted, list sections for all knowledge topics."
+        },
+        max_sections_per_topic: {
+          type: "integer",
+          minimum: 1,
+          maximum: 200,
+          description: "Maximum number of sections to return per topic. Defaults to 200."
+        }
+      },
+      additionalProperties: false
+    }
   }
 ];
+
+const TOOL_PROFILE_TOOL_NAMES = {
+  minimal: [
+    "sts2_get_bridge_status",
+    "sts2_get_state",
+    "sts2_list_actions",
+    "sts2_perform_action",
+    "sts2_end_turn",
+    "sts2_pick_option",
+    "sts2_resolve_room_rewards",
+    "sts2_resolve_rest_site",
+    "sts2_resolve_card_selection",
+    "sts2_resolve_shop_visit",
+    "sts2_travel_to_coordinate",
+    "sts2_wait_for_change",
+    "sts2_wait_until_actionable"
+  ],
+  strategic: [
+    "sts2_get_bridge_status",
+    "sts2_get_state",
+    "sts2_list_actions",
+    "sts2_get_map_routes",
+    "sts2_get_deck",
+    "sts2_perform_action",
+    "sts2_play_card_sequence",
+    "sts2_execute_combat_sequence",
+    "sts2_end_turn",
+    "sts2_resolve_room_rewards",
+    "sts2_resolve_rest_site",
+    "sts2_resolve_card_selection",
+    "sts2_pick_option",
+    "sts2_travel_to_coordinate",
+    "sts2_resolve_shop_visit",
+    "sts2_wait_for_change",
+    "sts2_wait_until_actionable",
+    "sts2_record_observation",
+    "sts2_list_observation_entities",
+    "sts2_read_observation_entity",
+    "sts2_get_knowledge",
+    "sts2_get_knowledge_topics",
+    "sts2_search_knowledge",
+    "sts2_read_knowledge_slice",
+    "sts2_list_knowledge_sections"
+  ],
+  debug: TOOL_DEFINITIONS.map((tool) => tool.name)
+};
+const ACTIVE_TOOL_PROFILE_NAME = resolveActiveToolProfileName();
+const ACTIVE_TOOL_NAME_SET = getAllowedToolNameSetForProfile(ACTIVE_TOOL_PROFILE_NAME);
 
 let incomingTextBuffer = "";
 let processingChain = Promise.resolve();
 let loggedFirstStdinChunk = false;
 let pendingMessageQueue = [];
+let activeBridgeEventClient = null;
 
 logInfo(
   `process started pid=${process.pid} node=${process.version} cwd=${process.cwd()}`
+);
+logInfo(
+  `tool_profile=${ACTIVE_TOOL_PROFILE_NAME} exposed_tools=${getExposedToolDefinitions().length}`
 );
 logDebug(`argv=${safeJson(process.argv)}`);
 logDebug(`session_file_path=${getSessionFilePath()}`);
@@ -470,6 +936,7 @@ process.stdin.on("data", (chunk) => {
 
 process.stdin.on("end", () => {
   logInfo("stdin ended");
+  activeBridgeEventClient?.close();
   process.exit(0);
 });
 
@@ -479,12 +946,18 @@ process.stdin.on("error", (error) => {
 
 process.on("uncaughtException", (error) => {
   logError("uncaught exception", error);
+  activeBridgeEventClient?.close();
   process.exit(1);
 });
 
 process.on("unhandledRejection", (reason) => {
   logError("unhandled rejection", reason);
+  activeBridgeEventClient?.close();
   process.exit(1);
+});
+
+process.on("exit", () => {
+  activeBridgeEventClient?.close();
 });
 
 async function processIncomingMessages() {
@@ -627,13 +1100,13 @@ async function handleMessage(message) {
             version: SERVER_VERSION
           },
           instructions:
-            "Use sts2_get_state and sts2_list_actions to observe the game, then execute only legal actions. For consecutive combat plays, prefer sts2_play_card_sequence or sts2_execute_combat_sequence instead of parallel sts2_perform_action calls."
+            `Current tool profile: ${ACTIVE_TOOL_PROFILE_NAME}. Use sts2_get_state and sts2_list_actions to observe the game, then execute only legal actions exposed by tools/list. Prefer higher-level sequence and resolver tools when this profile exposes them.`
         });
       case "ping":
         return writeResult(message.id, {});
       case "tools/list":
         return writeResult(message.id, {
-          tools: TOOL_DEFINITIONS
+          tools: getExposedToolDefinitions()
         });
       case "tools/call":
         return writeResult(message.id, await handleToolCall(message.params || {}));
@@ -649,6 +1122,19 @@ async function handleMessage(message) {
 async function handleToolCall(params) {
   const toolName = typeof params.name === "string" ? params.name : "";
   const args = isPlainObject(params.arguments) ? params.arguments : {};
+
+  if (!toolName || !ACTIVE_TOOL_NAME_SET.has(toolName)) {
+    return asToolResult(
+      {
+        ok: false,
+        error: "tool_unavailable_in_profile",
+        tool: toolName || null,
+        active_profile: ACTIVE_TOOL_PROFILE_NAME,
+        available_tools: getExposedToolDefinitions().map((tool) => tool.name)
+      },
+      true
+    );
+  }
 
   switch (toolName) {
     case "sts2_get_bridge_status":
@@ -683,6 +1169,34 @@ async function handleToolCall(params) {
       return await resolveShopVisitTool(args);
     case "sts2_wait_for_change":
       return await waitForChangeTool(args);
+    case "sts2_wait_until_actionable":
+      return await waitUntilActionableTool(args);
+    case "sts2_journal_write":
+      return await journalWriteTool(args);
+    case "sts2_journal_read":
+      return await journalReadTool(args);
+    case "sts2_journal_summarize":
+      return await journalSummarizeTool(args);
+    case "sts2_journal_get_summary":
+      return await journalGetSummaryTool(args);
+    case "sts2_journal_list_runs":
+      return await journalListRunsTool(args);
+    case "sts2_record_observation":
+      return await recordObservationTool(args);
+    case "sts2_list_observation_entities":
+      return await listObservationEntitiesTool(args);
+    case "sts2_read_observation_entity":
+      return await readObservationEntityTool(args);
+    case "sts2_get_knowledge":
+      return await getKnowledgeTool(args);
+    case "sts2_get_knowledge_topics":
+      return await getKnowledgeTopicsTool(args);
+    case "sts2_search_knowledge":
+      return await searchKnowledgeTool(args);
+    case "sts2_read_knowledge_slice":
+      return await readKnowledgeSliceTool(args);
+    case "sts2_list_knowledge_sections":
+      return await listKnowledgeSectionsTool(args);
     default:
       return asToolResult(
         {
@@ -693,6 +1207,51 @@ async function handleToolCall(params) {
         true
       );
   }
+}
+
+function normalizeToolProfileName(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (TOOL_PROFILE_NAMES.includes(normalized)) {
+    return normalized;
+  }
+  if (normalized === "full" || normalized === "default") {
+    return "debug";
+  }
+
+  return null;
+}
+
+function resolveActiveToolProfileName() {
+  const cliArgs = Array.isArray(process.argv) ? process.argv.slice(2) : [];
+  const cliProfileArg = cliArgs.find((arg) =>
+    typeof arg === "string" &&
+    (arg.startsWith("--profile=") || arg.startsWith("--tool-profile="))
+  );
+  const cliProfileValue = cliProfileArg
+    ? cliProfileArg.slice(cliProfileArg.indexOf("=") + 1)
+    : null;
+  const envProfileValue =
+    process.env.STS2_MCP_PROFILE || process.env.STS2_TOOL_PROFILE || null;
+
+  return (
+    normalizeToolProfileName(cliProfileValue) ??
+    normalizeToolProfileName(envProfileValue) ??
+    "debug"
+  );
+}
+
+function getAllowedToolNameSetForProfile(profileName) {
+  const normalizedProfile = normalizeToolProfileName(profileName) ?? "debug";
+  const toolNames = TOOL_PROFILE_TOOL_NAMES[normalizedProfile] ?? TOOL_PROFILE_TOOL_NAMES.debug;
+  return new Set(Array.isArray(toolNames) ? toolNames : []);
+}
+
+function getExposedToolDefinitions() {
+  return TOOL_DEFINITIONS.filter((tool) => ACTIVE_TOOL_NAME_SET.has(tool.name));
 }
 
 async function getBridgeStatus() {
@@ -769,10 +1328,8 @@ async function getBridgeStatus() {
 async function getStateTool() {
   try {
     const session = getLiveSession();
-    const response = await bridgeRequestJson(session, "state", {
-      method: "GET"
-    });
-    return asToolResult(attachInteractionHints(response.payload), false);
+    const state = await getBridgeState(session);
+    return asToolResult(attachInteractionHints(state), false);
   } catch (error) {
     return asToolResult(toolErrorPayload(error), true);
   }
@@ -781,10 +1338,8 @@ async function getStateTool() {
 async function getDeckTool() {
   try {
     const session = getLiveSession();
-    const response = await bridgeRequestJson(session, "state", {
-      method: "GET"
-    });
-    return asToolResult(buildDeckPayloadForAgent(response.payload), false);
+    const state = await getBridgeState(session);
+    return asToolResult(buildDeckPayloadForAgent(state), false);
   } catch (error) {
     return asToolResult(toolErrorPayload(error), true);
   }
@@ -793,10 +1348,17 @@ async function getDeckTool() {
 async function listActionsTool() {
   try {
     const session = getLiveSession();
-    const response = await bridgeRequestJson(session, "actions", {
-      method: "GET"
-    });
-    return asToolResult(response.payload, false);
+    const state = await getBridgeState(session);
+    return asToolResult(
+      {
+        ok: true,
+        state_version: Number.isInteger(state?.state_version) ? state.state_version : null,
+        state_hash: typeof state?.state_hash === "string" ? state.state_hash : null,
+        screen: typeof state?.screen === "string" ? state.screen : null,
+        actions: Array.isArray(state?.available_actions) ? state.available_actions : []
+      },
+      false
+    );
   } catch (error) {
     return asToolResult(toolErrorPayload(error), true);
   }
@@ -813,9 +1375,7 @@ async function getMapRoutesTool(args) {
         settled: settledSnapshot.settled,
         reason: settledSnapshot.reason,
         poll_count: settledSnapshot.poll_count,
-        frontier_action_match: settledSnapshot.frontier_action_match,
-        state_action_state_version_match:
-          settledSnapshot.state_action_state_version_match
+        frontier_action_match: settledSnapshot.frontier_action_match
       }
     });
     return asToolResult(payload, false);
@@ -851,7 +1411,8 @@ async function performActionTool(args) {
       waitAfterMs,
       expectedStateVersion,
       {
-        strictStateVersion
+        strictStateVersion,
+        settleAfterAction: true
       }
     );
 
@@ -909,7 +1470,8 @@ async function endTurnTool(args) {
       waitAfterMs,
       expectedStateVersion,
       {
-        strictStateVersion
+        strictStateVersion,
+        settleAfterAction: true
       }
     );
 
@@ -945,9 +1507,9 @@ async function runCombatSequenceTool(args, options = {}) {
         compactPlayCardSequencePayload(
           isPlainObject(payload) && isPlainObject(initialSequenceState)
             ? {
-                ...payload,
-                initial_state: initialSequenceState
-              }
+              ...payload,
+              initial_state: initialSequenceState
+            }
             : payload
         ),
         false
@@ -999,12 +1561,12 @@ async function runCombatSequenceTool(args, options = {}) {
 
     const initialStateVersionAdjusted =
       Number.isInteger(expectedStateVersion) &&
-      Number.isInteger(state?.state_version) &&
-      state.state_version !== expectedStateVersion
+        Number.isInteger(state?.state_version) &&
+        state.state_version !== expectedStateVersion
         ? {
-            expected_state_version: expectedStateVersion,
-            observed_state_version: state.state_version
-          }
+          expected_state_version: expectedStateVersion,
+          observed_state_version: state.state_version
+        }
         : null;
 
     if (strictStateVersion && initialStateVersionAdjusted) {
@@ -1150,86 +1712,114 @@ async function runCombatSequenceTool(args, options = {}) {
 
       let result = null;
       let stepAttempt = 0;
-      while (true) {
-        try {
-          result = await performBridgeAction(
-            session,
-            resolution.action.action_id,
-            waitAfterMs,
-            Number.isInteger(state?.state_version) ? state.state_version : undefined,
-            {
-              strictStateVersion
+      try {
+        while (true) {
+          try {
+            result = await performBridgeAction(
+              session,
+              resolution.action.action_id,
+              waitAfterMs,
+              Number.isInteger(state?.state_version) ? state.state_version : undefined,
+              {
+                strictStateVersion,
+                settleAfterAction: true
+              }
+            );
+            break;
+          } catch (error) {
+            if (
+              strictStateVersion ||
+              stepAttempt >= ACTION_STATE_VERSION_RETRY_LIMIT ||
+              !isRecoverableCombatSequenceExecutionError(error)
+            ) {
+              throw error;
             }
-          );
-          break;
-        } catch (error) {
-          if (
-            strictStateVersion ||
-            stepAttempt >= ACTION_STATE_VERSION_RETRY_LIMIT ||
-            !isRecoverableCombatSequenceExecutionError(error)
-          ) {
-            throw error;
-          }
 
-          state = await getBridgeState(session);
-          stepAttempt += 1;
-          const retryBlocker = getCombatSequenceContinuationBlocker(state, sequenceLabel);
-          if (retryBlocker) {
-            return finalize(
-              attachReturnStateAfterPayload(
-                {
-                  ok: true,
-                  resolved: false,
-                  reason: retryBlocker.reason,
-                  message: retryBlocker.message,
-                  requested_action_count: sequencePlan.length,
-                  executed_count: executedSteps.length,
-                  remaining_count: sequencePlan.length - executedSteps.length,
-                  next_sequence_index: sequenceIndex,
-                  requested_action_ids: actionIds,
-                  normalized_action_ids: normalizedActionIds,
-                  reordered_end_turn_to_last: reorderedEndTurnToLast,
-                  sequence_plan: sequencePlanOutput,
-                  executed_steps: executedSteps,
+            state = await getBridgeState(session);
+            stepAttempt += 1;
+            const retryBlocker = getCombatSequenceContinuationBlocker(state, sequenceLabel);
+            if (retryBlocker) {
+              return finalize(
+                attachReturnStateAfterPayload(
+                  {
+                    ok: true,
+                    resolved: false,
+                    reason: retryBlocker.reason,
+                    message: retryBlocker.message,
+                    requested_action_count: sequencePlan.length,
+                    executed_count: executedSteps.length,
+                    remaining_count: sequencePlan.length - executedSteps.length,
+                    next_sequence_index: sequenceIndex,
+                    requested_action_ids: actionIds,
+                    normalized_action_ids: normalizedActionIds,
+                    reordered_end_turn_to_last: reorderedEndTurnToLast,
+                    sequence_plan: sequencePlanOutput,
+                    executed_steps: executedSteps,
+                    state
+                  },
+                  returnStateAfter,
                   state
-                },
-                returnStateAfter,
-                state
-              )
-            );
-          }
+                )
+              );
+            }
 
-          const retryResolution = resolvePlannedCombatSequenceStep(planStep, state);
-          if (!retryResolution.action) {
-            return finalize(
-              attachReturnStateAfterPayload(
-                {
-                  ok: true,
-                  resolved: false,
-                  reason: "requested_combat_sequence_action_unavailable_after_retry",
-                  requested_action_count: sequencePlan.length,
-                  executed_count: executedSteps.length,
-                  remaining_count: sequencePlan.length - executedSteps.length,
-                  next_sequence_index: sequenceIndex,
-                  failed_step: summarizeCombatSequencePlanStep(planStep),
-                  requested_action_ids: actionIds,
-                  normalized_action_ids: normalizedActionIds,
-                  reordered_end_turn_to_last: reorderedEndTurnToLast,
-                  sequence_plan: sequencePlanOutput,
-                  executed_steps: executedSteps,
-                  available_actions: summarizeCombatSequenceAvailableActions(
-                    getCombatSequenceAvailableActions(state, allowedActionKinds)
-                  ),
+            const retryResolution = resolvePlannedCombatSequenceStep(planStep, state);
+            if (!retryResolution.action) {
+              return finalize(
+                attachReturnStateAfterPayload(
+                  {
+                    ok: true,
+                    resolved: false,
+                    reason: "requested_combat_sequence_action_unavailable_after_retry",
+                    requested_action_count: sequencePlan.length,
+                    executed_count: executedSteps.length,
+                    remaining_count: sequencePlan.length - executedSteps.length,
+                    next_sequence_index: sequenceIndex,
+                    failed_step: summarizeCombatSequencePlanStep(planStep),
+                    requested_action_ids: actionIds,
+                    normalized_action_ids: normalizedActionIds,
+                    reordered_end_turn_to_last: reorderedEndTurnToLast,
+                    sequence_plan: sequencePlanOutput,
+                    executed_steps: executedSteps,
+                    available_actions: summarizeCombatSequenceAvailableActions(
+                      getCombatSequenceAvailableActions(state, allowedActionKinds)
+                    ),
+                    state
+                  },
+                  returnStateAfter,
                   state
-                },
-                returnStateAfter,
-                state
-              )
-            );
-          }
+                )
+              );
+            }
 
-          resolution = retryResolution;
+            resolution = retryResolution;
+          }
         }
+      } catch (error) {
+        const failureState = await getBridgeState(session);
+        return finalize(
+          attachReturnStateAfterPayload(
+            {
+              ok: true,
+              resolved: false,
+              reason: "combat_sequence_execution_failed",
+              next_sequence_index: sequenceIndex,
+              failed_step: summarizeCombatSequencePlanStep(planStep),
+              requested_action_count: sequencePlan.length,
+              executed_count: executedSteps.length,
+              remaining_count: sequencePlan.length - executedSteps.length,
+              requested_action_ids: actionIds,
+              normalized_action_ids: normalizedActionIds,
+              reordered_end_turn_to_last: reorderedEndTurnToLast,
+              sequence_plan: sequencePlanOutput,
+              executed_steps: executedSteps,
+              failure: toolErrorPayload(error),
+              state: failureState
+            },
+            returnStateAfter,
+            failureState
+          )
+        );
       }
       executedSteps.push({
         sequence_index: sequenceIndex,
@@ -1613,7 +2203,7 @@ async function resolveRoomRewardsTool(args) {
           const skipCardResult = await performBridgeAction(
             session,
             "card_reward:skip",
-            1800,
+            DEFAULT_ACTION_WAIT_MS,
             Number.isInteger(state?.state_version) ? state.state_version : undefined
           );
           executedActions.push(summarizeExecutedAction(skipCardResult));
@@ -1657,7 +2247,7 @@ async function resolveRoomRewardsTool(args) {
         const cardResult = await performBridgeAction(
           session,
           cardActionId,
-          1800,
+          DEFAULT_ACTION_WAIT_MS,
           Number.isInteger(state?.state_version) ? state.state_version : undefined
         );
         executedActions.push(summarizeExecutedAction(cardResult));
@@ -1689,7 +2279,7 @@ async function resolveRoomRewardsTool(args) {
             const openCardRewardResult = await performBridgeAction(
               session,
               pendingCardReward.action_id,
-              1200,
+              DEFAULT_ACTION_WAIT_MS,
               Number.isInteger(state?.state_version) ? state.state_version : undefined
             );
             executedActions.push(summarizeExecutedAction(openCardRewardResult));
@@ -1704,7 +2294,7 @@ async function resolveRoomRewardsTool(args) {
       const rewardResult = await performBridgeAction(
         session,
         nextReward.action_id,
-        1200,
+        DEFAULT_ACTION_WAIT_MS,
         Number.isInteger(state?.state_version) ? state.state_version : undefined
       );
       executedActions.push(summarizeExecutedAction(rewardResult));
@@ -1820,7 +2410,11 @@ async function resolveRestSiteTool(args) {
       }
 
       selectedOption = restSiteBundle.rest_site.options[optionIndex];
-      const optionResult = await performBridgeAction(session, `rest_site:${optionIndex}`, 1800);
+      const optionResult = await performBridgeAction(
+        session,
+        `rest_site:${optionIndex}`,
+        DEFAULT_ACTION_WAIT_MS
+      );
       executedActions.push(summarizeExecutedAction(optionResult));
       state = optionResult.state;
       restSiteBundle = buildRestSiteBundle(state);
@@ -1864,7 +2458,7 @@ async function resolveRestSiteTool(args) {
       const upgradeResult = await performBridgeAction(
         session,
         `deck_upgrade:select:${upgradeCardIndex}`,
-        1800
+        DEFAULT_ACTION_WAIT_MS
       );
       executedActions.push(summarizeExecutedAction(upgradeResult));
       state = upgradeResult.state;
@@ -1878,7 +2472,7 @@ async function resolveRestSiteTool(args) {
         const confirmUpgradeResult = await performBridgeAction(
           session,
           "deck_upgrade:confirm",
-          1800
+          DEFAULT_ACTION_WAIT_MS
         );
         executedActions.push(summarizeExecutedAction(confirmUpgradeResult));
         state = confirmUpgradeResult.state;
@@ -2044,18 +2638,25 @@ async function resolveCardSelectionTool(args) {
       );
     }
 
-    if (
-      uniqueSelectIndices.some(
-        (index) => index >= initialCardSelectionBundle.card_selection.options.length
-      )
-    ) {
+    const initialOptionEntries = buildIndexedOptionEntries(
+      initialCardSelectionBundle.card_selection.options
+    );
+    const missingInitialIndices = uniqueSelectIndices.filter(
+      (requestedIndex) =>
+        !initialOptionEntries.some(
+          (entry) => entry.option_index === requestedIndex
+        )
+    );
+    if (missingInitialIndices.length > 0) {
       return asToolResult(
         {
           ok: false,
           resolved: false,
           reason: "card_selection_option_out_of_range",
-          requested_select_indices: uniqueSelectIndices,
-          option_count: initialCardSelectionBundle.card_selection.options.length,
+          requested_select_indices: missingInitialIndices,
+          available_option_indices: initialOptionEntries.map(
+            (entry) => entry.option_index
+          ),
           card_selection_bundle: initialCardSelectionBundle,
           state
         },
@@ -2086,10 +2687,24 @@ async function resolveCardSelectionTool(args) {
 
     const executedActions = [];
     const selectedCards = [];
+    const selectionPlans = uniqueSelectIndices.map((requestedIndex) => {
+      const initialEntry = findIndexedOptionEntry(
+        initialCardSelectionBundle.card_selection.options,
+        requestedIndex
+      );
 
-    // Select from highest to lowest so lower indices remain stable if the UI
-    // removes selected cards from the visible option list.
-    for (const requestedIndex of [...uniqueSelectIndices].sort((left, right) => right - left)) {
+      return {
+        requested_index: requestedIndex,
+        initial_option_index: initialEntry?.option_index ?? requestedIndex,
+        selection_id:
+          typeof initialEntry?.option?.selection_id === "string"
+            ? initialEntry.option.selection_id
+            : null,
+        card: initialEntry?.option?.card ?? null
+      };
+    });
+
+    for (const selectionPlan of selectionPlans) {
       const currentCardSelectionBundle = buildCardSelectionBundle(state);
       if (
         !currentCardSelectionBundle.in_card_selection_flow ||
@@ -2111,15 +2726,32 @@ async function resolveCardSelectionTool(args) {
         );
       }
 
-      const currentOptions = currentCardSelectionBundle.card_selection.options;
-      if (requestedIndex >= currentOptions.length) {
+      const currentOptionEntries = buildIndexedOptionEntries(
+        currentCardSelectionBundle.card_selection.options
+      );
+      let currentEntry =
+        selectionPlan.selection_id === null
+          ? null
+          : currentOptionEntries.find(
+            (entry) => entry.option?.selection_id === selectionPlan.selection_id
+          ) ?? null;
+
+      if (currentEntry === null) {
+        currentEntry = currentOptionEntries.find(
+          (entry) => entry.option_index === selectionPlan.initial_option_index
+        ) ?? null;
+      }
+
+      if (currentEntry === null) {
         return asToolResult(
           {
             ok: false,
             resolved: false,
             reason: "card_selection_option_out_of_range_after_reindex",
-            requested_index: requestedIndex,
-            current_option_count: currentOptions.length,
+            requested_index: selectionPlan.requested_index,
+            current_option_indices: currentOptionEntries.map(
+              (entry) => entry.option_index
+            ),
             selected_cards: selectedCards,
             executed_actions: executedActions,
             initial_card_selection_bundle: initialCardSelectionBundle,
@@ -2130,14 +2762,15 @@ async function resolveCardSelectionTool(args) {
         );
       }
 
-      const option = currentOptions[requestedIndex];
+      const option = currentEntry.option;
       if (option?.is_selected === true) {
         return asToolResult(
           {
             ok: false,
             resolved: false,
             reason: "card_selection_option_already_selected",
-            requested_index: requestedIndex,
+            requested_index: selectionPlan.requested_index,
+            resolved_index: currentEntry.option_index,
             selected_cards: selectedCards,
             executed_actions: executedActions,
             initial_card_selection_bundle: initialCardSelectionBundle,
@@ -2148,14 +2781,18 @@ async function resolveCardSelectionTool(args) {
         );
       }
 
-      const actionId = `card_selection:select:${requestedIndex}`;
+      const actionId =
+        typeof option?.action_id === "string" && option.action_id
+          ? option.action_id
+          : `card_selection:select:${currentEntry.option_index}`;
       if (!currentCardSelectionBundle.non_automation_action_ids.includes(actionId)) {
         return asToolResult(
           {
             ok: false,
             resolved: false,
             reason: "card_selection_action_unavailable",
-            requested_index: requestedIndex,
+            requested_index: selectionPlan.requested_index,
+            resolved_index: currentEntry.option_index,
             requested_action_id: actionId,
             selected_cards: selectedCards,
             executed_actions: executedActions,
@@ -2167,10 +2804,21 @@ async function resolveCardSelectionTool(args) {
         );
       }
 
-      const selectResult = await performBridgeAction(session, actionId, 1200);
+      const selectResult = await performBridgeAction(
+        session,
+        actionId,
+        DEFAULT_ACTION_WAIT_MS
+      );
       executedActions.push(summarizeExecutedAction(selectResult));
       selectedCards.push({
-        requested_index: requestedIndex,
+        requested_index: selectionPlan.requested_index,
+        selected_option_index: currentEntry.option_index,
+        match_type:
+          currentEntry.option_index === selectionPlan.requested_index
+            ? "index"
+            : selectionPlan.selection_id !== null
+              ? "selection_id"
+              : "reindexed",
         card: option?.card ?? null
       });
       state = selectResult.state;
@@ -2227,7 +2875,11 @@ async function resolveCardSelectionTool(args) {
           }
         }
 
-        const terminalResult = await performBridgeAction(session, terminalActionId, 1200);
+        const terminalResult = await performBridgeAction(
+          session,
+          terminalActionId,
+          DEFAULT_ACTION_WAIT_MS
+        );
         executedActions.push(summarizeExecutedAction(terminalResult));
         state = terminalResult.state;
         finalCardSelectionBundle = buildCardSelectionBundle(state);
@@ -2308,7 +2960,8 @@ async function pickOptionTool(args) {
       });
     }
 
-    if (index >= resolvedSurface.options.length) {
+    const optionEntry = findIndexedOptionEntry(resolvedSurface.options, index);
+    if (!optionEntry) {
       return asToolResult(
         {
           ok: false,
@@ -2317,7 +2970,9 @@ async function pickOptionTool(args) {
           requested_surface: surface,
           resolved_surface: resolvedSurface.surface,
           requested_index: index,
-          option_count: resolvedSurface.options.length,
+          available_option_indices: buildIndexedOptionEntries(
+            resolvedSurface.options
+          ).map((entry) => entry.option_index),
           available_surfaces: availableSurfaces,
           state
         },
@@ -2325,7 +2980,7 @@ async function pickOptionTool(args) {
       );
     }
 
-    const actionId = resolvedSurface.getActionId(index);
+    const actionId = resolvedSurface.getActionId(optionEntry.option_index);
     if (!isActionIdCurrentlyAvailable(state, actionId)) {
       return asToolResult(
         {
@@ -2335,6 +2990,7 @@ async function pickOptionTool(args) {
           requested_surface: surface,
           resolved_surface: resolvedSurface.surface,
           requested_index: index,
+          resolved_index: optionEntry.option_index,
           requested_action_id: actionId,
           available_surfaces: availableSurfaces,
           state
@@ -2346,7 +3002,7 @@ async function pickOptionTool(args) {
     const result = await performBridgeAction(
       session,
       actionId,
-      1200,
+      DEFAULT_ACTION_WAIT_MS,
       Number.isInteger(state?.state_version) ? state.state_version : undefined
     );
 
@@ -2357,9 +3013,10 @@ async function pickOptionTool(args) {
         requested_surface: surface,
         resolved_surface: resolvedSurface.surface,
         selected_index: index,
+        resolved_index: optionEntry.option_index,
         selected_option: summarizeIndexedOptionForAgent(
           resolvedSurface.surface,
-          resolvedSurface.options[index]
+          optionEntry.option
         ),
         executed_action: summarizeExecutedAction(result),
         final_state: result.state
@@ -2494,13 +3151,6 @@ async function waitForChangeTool(args) {
       MAX_WAIT_TIMEOUT_MS,
       "timeout_ms"
     );
-    const pollIntervalMs = clampInteger(
-      args.poll_interval_ms,
-      DEFAULT_POLL_INTERVAL_MS,
-      MIN_POLL_INTERVAL_MS,
-      MAX_POLL_INTERVAL_MS,
-      "poll_interval_ms"
-    );
 
     let baselineStateVersion = optionalInteger(
       args.baseline_state_version,
@@ -2508,10 +3158,7 @@ async function waitForChangeTool(args) {
     );
     let baselineStateHash = optionalString(args.baseline_state_hash, "baseline_state_hash");
 
-    const initialResponse = await bridgeRequestJson(session, "state", {
-      method: "GET"
-    });
-    const initialState = initialResponse.payload;
+    const initialState = await getBridgeState(session);
 
     if (baselineStateVersion === undefined && baselineStateHash === undefined) {
       baselineStateVersion = initialState.state_version;
@@ -2549,49 +3196,201 @@ async function waitForChangeTool(args) {
       );
     }
 
-    const deadline = Date.now() + timeoutMs;
-    let lastState = initialState;
-
-    while (Date.now() < deadline) {
-      await delay(pollIntervalMs);
-
-      const response = await bridgeRequestJson(session, "state", {
-        method: "GET"
+    try {
+      const changedState = await waitForBridgeStateEvent(session, {
+        timeout_ms: timeoutMs,
+        after_state_version:
+          baselineStateVersion !== undefined ? baselineStateVersion : undefined,
+        predicate: (candidateState) => {
+          const versionChanged =
+            baselineStateVersion !== undefined &&
+            candidateState?.state_version !== baselineStateVersion;
+          const hashChanged =
+            baselineStateHash !== undefined &&
+            candidateState?.state_hash !== baselineStateHash;
+          return versionChanged || hashChanged;
+        }
       });
-      lastState = response.payload;
 
       const versionChanged =
-        baselineStateVersion !== undefined && lastState.state_version !== baselineStateVersion;
-      const hashChanged =
-        baselineStateHash !== undefined && lastState.state_hash !== baselineStateHash;
+        baselineStateVersion !== undefined &&
+        changedState?.state_version !== baselineStateVersion;
+      return asToolResult(
+        {
+          ok: true,
+          changed: true,
+          reason: versionChanged ? "state_version_changed" : "state_hash_changed",
+          baseline_state_version: baselineStateVersion ?? null,
+          baseline_state_hash: baselineStateHash ?? null,
+          state: changedState
+        },
+        false
+      );
+    } catch (error) {
+      if (error instanceof ToolPayloadError && error.code === "bridge_event_wait_timeout") {
+        return asToolResult(
+          {
+            ok: false,
+            changed: false,
+            error: "timeout",
+            message: `State did not change within ${timeoutMs} ms.`,
+            baseline_state_version: baselineStateVersion ?? null,
+            baseline_state_hash: baselineStateHash ?? null,
+            state: ensureBridgeEventClient(session).getCachedState(Number.POSITIVE_INFINITY) ?? initialState
+          },
+          true
+        );
+      }
 
-      if (versionChanged || hashChanged) {
+      throw error;
+    }
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+function summarizeActionableWaitState(state) {
+  const screen = typeof state?.screen === "string" ? state.screen : null;
+  const nonAutomationActions = getNonAutomationActions(state);
+  const actionIds = nonAutomationActions
+    .map((action) => action?.action_id)
+    .filter((actionId) => typeof actionId === "string");
+  const rewardBundle = buildRewardBundle(state);
+  const cardSelectionBundle = buildCardSelectionBundle(state);
+  const restSiteBundle = buildRestSiteBundle(state);
+  const shopBundle = buildShopBundle(state);
+
+  let surface = null;
+  if (rewardBundle.in_reward_flow) {
+    surface = rewardBundle.card_reward_selection.visible === true ? "card_reward" : "reward";
+  } else if (cardSelectionBundle.in_card_selection_flow) {
+    surface = "card_selection";
+  } else if (restSiteBundle.in_rest_site_flow) {
+    surface =
+      restSiteBundle.deck_upgrade_selection?.visible === true ? "deck_upgrade" : "rest_site";
+  } else if (shopBundle.in_shop_flow) {
+    surface = "shop";
+  } else if (state?.event_options?.visible === true) {
+    surface = isCrystalSphereScreen(screen) ? "event_crystal_sphere" : "event";
+  } else if (isMapReadyState(state)) {
+    surface = "map";
+  } else if (
+    screen === "COMBAT" &&
+    state?.combat?.in_progress === true &&
+    state?.combat?.is_play_phase === true &&
+    state?.combat?.player_actions_disabled !== true
+  ) {
+    surface = "combat";
+  } else if (actionIds.length > 0) {
+    surface = "actions";
+  }
+
+  const summary = {
+    screen,
+    surface,
+    action_count: actionIds.length,
+    action_ids: actionIds
+  };
+
+  if (surface === "card_selection") {
+    summary.selected_count = cardSelectionBundle.card_selection?.selected_count ?? null;
+    summary.min_select = cardSelectionBundle.card_selection?.min_select ?? null;
+    summary.max_select = cardSelectionBundle.card_selection?.max_select ?? null;
+  } else if (surface === "reward" || surface === "card_reward") {
+    summary.reward_count = Array.isArray(rewardBundle.rewards?.entries)
+      ? rewardBundle.rewards.entries.length
+      : 0;
+    summary.card_reward_option_count = Array.isArray(rewardBundle.card_reward_selection?.options)
+      ? rewardBundle.card_reward_selection.options.length
+      : 0;
+  } else if (surface === "rest_site" || surface === "deck_upgrade") {
+    summary.rest_option_count = Array.isArray(restSiteBundle.rest_site?.options)
+      ? restSiteBundle.rest_site.options.length
+      : 0;
+    summary.upgrade_option_count = Array.isArray(restSiteBundle.deck_upgrade_selection?.options)
+      ? restSiteBundle.deck_upgrade_selection.options.length
+      : 0;
+  } else if (surface === "shop") {
+    summary.shop_item_count = Array.isArray(shopBundle.shop?.items)
+      ? shopBundle.shop.items.length
+      : 0;
+  }
+
+  const actionable =
+    actionIds.length > 0 &&
+    (typeof surface === "string" && surface.length > 0 || actionIds.length > 0);
+
+  return {
+    actionable,
+    screen,
+    surface,
+    action_count: actionIds.length,
+    fingerprint: JSON.stringify(summary)
+  };
+}
+
+async function waitUntilActionableTool(args) {
+  try {
+    const session = getLiveSession();
+    const timeoutMs = clampInteger(
+      args.timeout_ms,
+      DEFAULT_WAIT_TIMEOUT_MS,
+      1,
+      MAX_WAIT_TIMEOUT_MS,
+      "timeout_ms"
+    );
+    const initialState = await getBridgeState(session);
+    const initialAnalysis = summarizeActionableWaitState(initialState);
+    if (initialAnalysis.actionable) {
+      return asToolResult(
+        {
+          ok: true,
+          actionable: true,
+          surface: initialAnalysis.surface,
+          event_driven: true,
+          state: initialState
+        },
+        false
+      );
+    }
+
+    try {
+      const actionableState = await waitForBridgeStateEvent(session, {
+        timeout_ms: timeoutMs,
+        after_state_version: getStateVersionValue(initialState) ?? undefined,
+        predicate: (candidateState) => summarizeActionableWaitState(candidateState).actionable
+      });
+      const analysis = summarizeActionableWaitState(actionableState);
+      return asToolResult(
+        {
+          ok: true,
+          actionable: true,
+          surface: analysis.surface,
+          event_driven: true,
+          state: actionableState
+        },
+        false
+      );
+    } catch (error) {
+      if (error instanceof ToolPayloadError && error.code === "bridge_event_wait_timeout") {
+        const lastState =
+          ensureBridgeEventClient(session).getCachedState(Number.POSITIVE_INFINITY) ?? initialState;
+        const lastAnalysis = summarizeActionableWaitState(lastState);
         return asToolResult(
           {
             ok: true,
-            changed: true,
-            reason: versionChanged ? "state_version_changed" : "state_hash_changed",
-            baseline_state_version: baselineStateVersion ?? null,
-            baseline_state_hash: baselineStateHash ?? null,
+            actionable: false,
+            timed_out: true,
+            event_driven: true,
+            surface: lastAnalysis.surface,
             state: lastState
           },
           false
         );
       }
-    }
 
-    return asToolResult(
-      {
-        ok: false,
-        changed: false,
-        error: "timeout",
-        message: `State did not change within ${timeoutMs} ms.`,
-        baseline_state_version: baselineStateVersion ?? null,
-        baseline_state_hash: baselineStateHash ?? null,
-        state: lastState
-      },
-      true
-    );
+      throw error;
+    }
   } catch (error) {
     return asToolResult(toolErrorPayload(error), true);
   }
@@ -2867,17 +3666,7 @@ async function resolveShopVisitTool(args) {
 }
 
 async function getBridgeState(session) {
-  const response = await bridgeRequestJson(session, "state", {
-    method: "GET"
-  });
-  return response.payload;
-}
-
-async function getBridgeActions(session) {
-  const response = await bridgeRequestJson(session, "actions", {
-    method: "GET"
-  });
-  return response.payload;
+  return await getLatestBridgeState(session);
 }
 
 async function waitForStableMapRouteSnapshot(session) {
@@ -2887,15 +3676,14 @@ async function waitForStableMapRouteSnapshot(session) {
 
   const initialVerdict = getMapRouteSnapshotVerdict(snapshot, stablePolls);
   if (initialVerdict.settled) {
-    return {
-      ...initialVerdict,
-      state: snapshot.state,
-      frontierKeys: snapshot.frontierKeys,
-      mapActionKeys: snapshot.mapActionKeys,
-      currentCoordKey: snapshot.currentCoordKey,
-      frontier_action_match: snapshot.frontier_action_match,
-      state_action_state_version_match: snapshot.state_action_state_version_match
-    };
+      return {
+        ...initialVerdict,
+        state: snapshot.state,
+        frontierKeys: snapshot.frontierKeys,
+        mapActionKeys: snapshot.mapActionKeys,
+        currentCoordKey: snapshot.currentCoordKey,
+        frontier_action_match: snapshot.frontier_action_match
+      };
   }
 
   const startedAt = Date.now();
@@ -2911,17 +3699,15 @@ async function waitForStableMapRouteSnapshot(session) {
 
     const verdict = getMapRouteSnapshotVerdict(snapshot, stablePolls);
     if (verdict.settled) {
-      return {
-        ...verdict,
-        poll_count: pollCount,
-        state: snapshot.state,
-        frontierKeys: snapshot.frontierKeys,
-        mapActionKeys: snapshot.mapActionKeys,
-        currentCoordKey: snapshot.currentCoordKey,
-        frontier_action_match: snapshot.frontier_action_match,
-        state_action_state_version_match:
-          snapshot.state_action_state_version_match
-      };
+        return {
+          ...verdict,
+          poll_count: pollCount,
+          state: snapshot.state,
+          frontierKeys: snapshot.frontierKeys,
+          mapActionKeys: snapshot.mapActionKeys,
+          currentCoordKey: snapshot.currentCoordKey,
+          frontier_action_match: snapshot.frontier_action_match
+        };
     }
   }
 
@@ -2933,34 +3719,23 @@ async function waitForStableMapRouteSnapshot(session) {
     frontierKeys: snapshot.frontierKeys,
     mapActionKeys: snapshot.mapActionKeys,
     currentCoordKey: snapshot.currentCoordKey,
-    frontier_action_match: snapshot.frontier_action_match,
-    state_action_state_version_match: snapshot.state_action_state_version_match
+    frontier_action_match: snapshot.frontier_action_match
   };
 }
 
 async function captureMapRouteSnapshot(session) {
-  const [state, actionsPayload] = await Promise.all([
-    getBridgeState(session),
-    getBridgeActions(session)
-  ]);
-  return buildMapRouteSnapshot(state, actionsPayload);
+  const state = await getBridgeState(session);
+  return buildMapRouteSnapshot(state);
 }
 
-function buildMapRouteSnapshot(state, actionsPayload) {
+function buildMapRouteSnapshot(state) {
   const frontierKeys = extractTravelableMapKeysFromState(state);
-  const mapActionKeys = extractMapActionKeys(actionsPayload);
+  const mapActionKeys = extractMapActionKeys(state);
   const currentCoord = extractMapCurrentCoord(state);
   const currentCoordKey = toCoordKey(currentCoord);
   const stateVersion = Number.isInteger(state?.state_version)
     ? state.state_version
     : null;
-  const actionStateVersion = Number.isInteger(actionsPayload?.state_version)
-    ? actionsPayload.state_version
-    : null;
-  const stateActionStateVersionMatch =
-    stateVersion === null ||
-    actionStateVersion === null ||
-    stateVersion === actionStateVersion;
   const frontierActionMatch = areCoordKeySetsEqual(frontierKeys, mapActionKeys);
   const fingerprint = JSON.stringify({
     screen: typeof state?.screen === "string" ? state.screen : null,
@@ -2969,18 +3744,15 @@ function buildMapRouteSnapshot(state, actionsPayload) {
     current_coord_key: currentCoordKey,
     frontier_keys: frontierKeys,
     map_action_keys: mapActionKeys,
-    state_version: stateVersion,
-    action_state_version: actionStateVersion
+    state_version: stateVersion
   });
 
   return {
     state,
-    actions_payload: actionsPayload,
     frontierKeys,
     mapActionKeys,
     currentCoordKey,
     frontier_action_match: frontierActionMatch,
-    state_action_state_version_match: stateActionStateVersionMatch,
     fingerprint
   };
 }
@@ -3016,13 +3788,6 @@ function getMapRouteSnapshotVerdict(snapshot, stablePolls) {
     };
   }
 
-  if (!snapshot.state_action_state_version_match) {
-    return {
-      settled: false,
-      reason: "waiting_for_state_action_version_match"
-    };
-  }
-
   if (!snapshot.frontier_action_match) {
     return {
       settled: false,
@@ -3052,16 +3817,20 @@ async function performBridgeAction(
   options = {}
 ) {
   const strictStateVersion = options?.strictStateVersion === true;
+  const settleAfterAction = options?.settleAfterAction !== false;
   let currentExpectedStateVersion = Number.isInteger(expectedStateVersion)
     ? expectedStateVersion
     : undefined;
   let recoveredFromStateVersionConflict = null;
+  const bridgeEventClient = ensureBridgeEventClient(session);
+  await bridgeEventClient.start();
 
   for (let attempt = 0; attempt <= ACTION_STATE_VERSION_RETRY_LIMIT; attempt += 1) {
-    const stateVersion =
-      Number.isInteger(currentExpectedStateVersion)
-        ? currentExpectedStateVersion
-        : (await getBridgeState(session)).state_version;
+    const stateVersion = await resolveExpectedActionStateVersion(
+      session,
+      bridgeEventClient,
+      currentExpectedStateVersion
+    );
 
     try {
       const response = await bridgeRequestJson(session, "action", {
@@ -3074,7 +3843,26 @@ async function performBridgeAction(
         timeoutMs: DEFAULT_HTTP_TIMEOUT_MS + waitAfterMs + 5000
       });
 
-      const settledResult = await maybeSettleAfterAction(session, actionId, response.payload);
+      let settledResult = response.payload;
+      settledResult.state = await resolveBridgeActionState(
+        session,
+        bridgeEventClient,
+        settledResult
+      );
+      if (!Number.isInteger(settledResult?.state_version_after)) {
+        settledResult.state_version_after = getStateVersionValue(settledResult.state);
+      }
+      if (
+        typeof settledResult?.screen_after !== "string" &&
+        typeof settledResult?.state?.screen === "string"
+      ) {
+        settledResult.screen_after = settledResult.state.screen;
+      }
+
+      if (settleAfterAction) {
+        settledResult = await maybeSettleAfterAction(session, actionId, settledResult);
+      }
+
       if (recoveredFromStateVersionConflict) {
         settledResult.recovered_from_state_version_conflict =
           recoveredFromStateVersionConflict;
@@ -3090,7 +3878,9 @@ async function performBridgeAction(
         throw error;
       }
 
-      const latestState = await getBridgeState(session);
+      const latestState = await getLatestBridgeState(session, {
+        force_refresh: true
+      });
       const latestStateVersion = Number.isInteger(latestState?.state_version)
         ? latestState.state_version
         : null;
@@ -3120,6 +3910,57 @@ async function performBridgeAction(
       expected_state_version: expectedStateVersion ?? null
     }
   );
+}
+
+async function resolveExpectedActionStateVersion(
+  session,
+  bridgeEventClient,
+  currentExpectedStateVersion
+) {
+  if (Number.isInteger(currentExpectedStateVersion)) {
+    return currentExpectedStateVersion;
+  }
+
+  const cachedStateVersion = getStateVersionValue(
+    bridgeEventClient.getCachedState(Number.POSITIVE_INFINITY)
+  );
+  if (Number.isInteger(cachedStateVersion)) {
+    return cachedStateVersion;
+  }
+
+  return getStateVersionValue(await getLatestBridgeState(session));
+}
+
+async function resolveBridgeActionState(session, bridgeEventClient, actionResult) {
+  if (isPlainObject(actionResult?.state)) {
+    return bridgeEventClient.ingestState(actionResult.state) ?? actionResult.state;
+  }
+
+  const targetStateVersion = Number.isInteger(actionResult?.state_version_after)
+    ? actionResult.state_version_after
+    : null;
+  if (targetStateVersion !== null) {
+    const cachedState = bridgeEventClient.getCachedState(Number.POSITIVE_INFINITY);
+    if (getStateVersionValue(cachedState) >= targetStateVersion) {
+      return cachedState;
+    }
+
+    try {
+      return await bridgeEventClient.waitForState({
+        timeout_ms: ACTION_STATE_SYNC_TIMEOUT_MS,
+        predicate: (candidateState) =>
+          getStateVersionValue(candidateState) >= targetStateVersion
+      });
+    } catch (error) {
+      if (!(error instanceof ToolPayloadError) || error.code !== "bridge_event_wait_timeout") {
+        throw error;
+      }
+    }
+  }
+
+  return await getLatestBridgeState(session, {
+    force_refresh: true
+  });
 }
 
 async function maybeSettleAfterAction(session, actionId, result) {
@@ -3154,6 +3995,88 @@ async function maybeSettleAfterAction(session, actionId, result) {
     post_action_settle_reason: settled.reason,
     post_action_settle_polls: settled.poll_count
   };
+}
+
+function getSettleTimeoutMs(strategy) {
+  switch (strategy) {
+    case "end_turn":
+      return END_TURN_SETTLE_TIMEOUT_MS;
+    case "combat_action":
+      return COMBAT_ACTION_SETTLE_TIMEOUT_MS;
+    case "screen_transition":
+    case "map_travel":
+      return ROOM_EXIT_SETTLE_TIMEOUT_MS;
+    default:
+      return DEFAULT_WAIT_TIMEOUT_MS;
+  }
+}
+
+function getSettleQuietWindowMs(strategy) {
+  switch (strategy) {
+    case "end_turn":
+      return END_TURN_SETTLE_QUIET_WINDOW_MS;
+    case "combat_action":
+      return COMBAT_ACTION_SETTLE_QUIET_WINDOW_MS;
+    case "screen_transition":
+    case "map_travel":
+      return POST_ACTION_SETTLE_QUIET_WINDOW_MS;
+    default:
+      return POST_ACTION_SETTLE_QUIET_WINDOW_MS;
+  }
+}
+
+function getSettleStablePollTarget(strategy) {
+  switch (strategy) {
+    case "end_turn":
+      return END_TURN_STABLE_POLL_TARGET;
+    case "combat_action":
+    case "map_travel":
+      return COMBAT_ACTION_STABLE_POLL_TARGET;
+    default:
+      return 0;
+  }
+}
+
+function evaluatePostActionSettlement(strategy, actionId, state, initialScreen, stablePolls) {
+  switch (strategy) {
+    case "end_turn":
+      return getEndTurnSettlementVerdict(state, stablePolls);
+    case "combat_action":
+      return getCombatActionSettlementVerdict(state, stablePolls);
+    case "screen_transition":
+      return getScreenTransitionSettlementVerdict(
+        actionId,
+        state,
+        initialScreen,
+        stablePolls
+      );
+    case "map_travel":
+      return getMapTravelSettlementVerdict(state, stablePolls);
+    default:
+      return {
+        settled: true,
+        reason: "unsupported_settle_strategy"
+      };
+  }
+}
+
+async function waitForNextStateAfterVersion(session, afterStateVersion, timeoutMs) {
+  if (!Number.isInteger(afterStateVersion) || timeoutMs <= 0) {
+    return null;
+  }
+
+  try {
+    return await waitForBridgeStateEvent(session, {
+      timeout_ms: timeoutMs,
+      after_state_version: afterStateVersion
+    });
+  } catch (error) {
+    if (error instanceof ToolPayloadError && error.code === "bridge_event_wait_timeout") {
+      return null;
+    }
+
+    throw error;
+  }
 }
 
 function getPostActionSettleStrategy(actionId) {
@@ -3192,138 +4115,66 @@ function getPostActionSettleStrategy(actionId) {
   return null;
 }
 
-async function waitForEndTurnSettlement(session, initialState) {
-  let state = initialState;
-  let stablePolls = 0;
-  let previousHash = typeof state?.state_hash === "string" ? state.state_hash : null;
-
-  const initialVerdict = getEndTurnSettlementVerdict(state, stablePolls);
-  if (initialVerdict.settled) {
-    return {
-      settled: true,
-      reason: initialVerdict.reason,
-      poll_count: 0,
-      state
-    };
-  }
-
+async function waitForPostActionSettlement(session, strategy, initialState, options = {}) {
+  let state = isPlainObject(initialState) ? initialState : await getBridgeState(session);
+  const actionId = typeof options.actionId === "string" ? options.actionId : null;
+  const initialScreen =
+    typeof options.initialScreen === "string"
+      ? options.initialScreen
+      : typeof state?.screen === "string"
+        ? state.screen
+        : null;
+  const timeoutMs = getSettleTimeoutMs(strategy);
+  const quietWindowMs = getSettleQuietWindowMs(strategy);
+  const stablePollTarget = getSettleStablePollTarget(strategy);
   const startedAt = Date.now();
   let pollCount = 0;
-  while (Date.now() - startedAt < END_TURN_SETTLE_TIMEOUT_MS) {
-    await delay(END_TURN_SETTLE_POLL_INTERVAL_MS);
-    pollCount += 1;
-    state = await getBridgeState(session);
 
-    const currentHash = typeof state?.state_hash === "string" ? state.state_hash : null;
-    stablePolls = currentHash !== null && currentHash === previousHash ? stablePolls + 1 : 0;
-    previousHash = currentHash;
-
-    const verdict = getEndTurnSettlementVerdict(state, stablePolls);
-    if (verdict.settled) {
-      return {
-        settled: true,
-        reason: verdict.reason,
-        poll_count: pollCount,
-        state
-      };
-    }
-  }
-
-  return {
-    settled: false,
-    reason: "timeout",
-    poll_count: pollCount,
-    state
-  };
-}
-
-async function waitForCombatActionSettlement(session, initialState) {
-  let state = initialState;
-  let stablePolls = 0;
-  let previousHash = typeof state?.state_hash === "string" ? state.state_hash : null;
-
-  const initialVerdict = getCombatActionSettlementVerdict(state, stablePolls);
-  if (initialVerdict.settled) {
-    return {
-      settled: true,
-      reason: initialVerdict.reason,
-      poll_count: 0,
-      state
-    };
-  }
-
-  const startedAt = Date.now();
-  let pollCount = 0;
-  while (Date.now() - startedAt < COMBAT_ACTION_SETTLE_TIMEOUT_MS) {
-    await delay(COMBAT_ACTION_SETTLE_POLL_INTERVAL_MS);
-    pollCount += 1;
-    state = await getBridgeState(session);
-
-    const currentHash = typeof state?.state_hash === "string" ? state.state_hash : null;
-    stablePolls = currentHash !== null && currentHash === previousHash ? stablePolls + 1 : 0;
-    previousHash = currentHash;
-
-    const verdict = getCombatActionSettlementVerdict(state, stablePolls);
-    if (verdict.settled) {
-      return {
-        settled: true,
-        reason: verdict.reason,
-        poll_count: pollCount,
-        state
-      };
-    }
-  }
-
-  return {
-    settled: false,
-    reason: "timeout",
-    poll_count: pollCount,
-    state
-  };
-}
-
-async function waitForScreenTransitionSettlement(session, actionId, initialState) {
-  let state = initialState;
-  const initialScreen = typeof initialState?.screen === "string" ? initialState.screen : null;
-  let stablePolls = 0;
-  let previousHash = typeof initialState?.state_hash === "string" ? initialState.state_hash : null;
-
-  const initialVerdict = getScreenTransitionSettlementVerdict(
-    actionId,
-    state,
-    initialScreen,
-    stablePolls
-  );
-  if (initialVerdict.settled) {
-    return {
-      settled: true,
-      reason: initialVerdict.reason,
-      poll_count: 0,
-      state
-    };
-  }
-
-  const startedAt = Date.now();
-  let pollCount = 0;
-  while (Date.now() - startedAt < ROOM_EXIT_SETTLE_TIMEOUT_MS) {
-    await delay(ROOM_EXIT_SETTLE_POLL_INTERVAL_MS);
-    pollCount += 1;
-    state = await getBridgeState(session);
-
-    const currentHash = typeof state?.state_hash === "string" ? state.state_hash : null;
-    stablePolls = currentHash !== null && currentHash === previousHash ? stablePolls + 1 : 0;
-    previousHash = currentHash;
-
-    const verdict = getScreenTransitionSettlementVerdict(
+  while (Date.now() - startedAt < timeoutMs) {
+    const immediateVerdict = evaluatePostActionSettlement(
+      strategy,
       actionId,
       state,
       initialScreen,
-      stablePolls
+      0
     );
-    if (verdict.settled) {
+
+    const remainingMs = Math.max(0, timeoutMs - (Date.now() - startedAt));
+    if (remainingMs <= 0) {
+      break;
+    }
+
+    const nextState = await waitForNextStateAfterVersion(
+      session,
+      getStateVersionValue(state),
+      Math.min(quietWindowMs, remainingMs)
+    );
+    if (isPlainObject(nextState)) {
+      state = nextState;
+      pollCount += 1;
+      continue;
+    }
+
+    if (immediateVerdict.settled) {
       return {
         settled: true,
-        reason: verdict.reason,
+        reason: immediateVerdict.reason,
+        poll_count: pollCount,
+        state
+      };
+    }
+
+    const quietVerdict = evaluatePostActionSettlement(
+      strategy,
+      actionId,
+      state,
+      initialScreen,
+      stablePollTarget
+    );
+    if (quietVerdict.settled) {
+      return {
+        settled: true,
+        reason: quietVerdict.reason,
         poll_count: pollCount,
         state
       };
@@ -3338,49 +4189,22 @@ async function waitForScreenTransitionSettlement(session, actionId, initialState
   };
 }
 
+async function waitForEndTurnSettlement(session, initialState) {
+  return await waitForPostActionSettlement(session, "end_turn", initialState);
+}
+
+async function waitForCombatActionSettlement(session, initialState) {
+  return await waitForPostActionSettlement(session, "combat_action", initialState);
+}
+
+async function waitForScreenTransitionSettlement(session, actionId, initialState) {
+  return await waitForPostActionSettlement(session, "screen_transition", initialState, {
+    actionId
+  });
+}
+
 async function waitForMapTravelSettlement(session, initialState) {
-  let state = initialState;
-  let stablePolls = 0;
-  let previousHash = typeof initialState?.state_hash === "string" ? initialState.state_hash : null;
-
-  const initialVerdict = getMapTravelSettlementVerdict(state, stablePolls);
-  if (initialVerdict.settled) {
-    return {
-      settled: true,
-      reason: initialVerdict.reason,
-      poll_count: 0,
-      state
-    };
-  }
-
-  const startedAt = Date.now();
-  let pollCount = 0;
-  while (Date.now() - startedAt < END_TURN_SETTLE_TIMEOUT_MS) {
-    await delay(END_TURN_SETTLE_POLL_INTERVAL_MS);
-    pollCount += 1;
-    state = await getBridgeState(session);
-
-    const currentHash = typeof state?.state_hash === "string" ? state.state_hash : null;
-    stablePolls = currentHash !== null && currentHash === previousHash ? stablePolls + 1 : 0;
-    previousHash = currentHash;
-
-    const verdict = getMapTravelSettlementVerdict(state, stablePolls);
-    if (verdict.settled) {
-      return {
-        settled: true,
-        reason: verdict.reason,
-        poll_count: pollCount,
-        state
-      };
-    }
-  }
-
-  return {
-    settled: false,
-    reason: "timeout",
-    poll_count: pollCount,
-    state
-  };
+  return await waitForPostActionSettlement(session, "map_travel", initialState);
 }
 
 function getScreenTransitionSettlementVerdict(actionId, state, initialScreen, stablePolls = 0) {
@@ -3845,9 +4669,9 @@ function getPileCount(pile) {
 function getNonAutomationActions(state) {
   return Array.isArray(state?.available_actions)
     ? state.available_actions.filter(
-        (action) =>
-          typeof action?.action_id === "string" && !action.action_id.startsWith("automation:")
-      )
+      (action) =>
+        typeof action?.action_id === "string" && !action.action_id.startsWith("automation:")
+    )
     : [];
 }
 
@@ -3897,6 +4721,7 @@ function buildPlannedPlayCardSequenceStep(action, sequenceIndex, requestedAction
         : action.action_id,
     player_index: Number.isInteger(action?.player_index) ? action.player_index : null,
     initial_hand_index: Number.isInteger(action?.hand_index) ? action.hand_index : null,
+    card_ref: typeof action?.card_ref === "string" ? action.card_ref : null,
     card: summarizeCardForAgent(action?.card),
     target: {
       action_suffix: targetActionSuffix,
@@ -4091,8 +4916,10 @@ function parseRequestedPlayCardActionId(actionId) {
   }
 
   const playerIndex = Number.parseInt(parts[1], 10);
-  const handIndex = Number.parseInt(parts[2], 10);
-  if (!Number.isInteger(playerIndex) || !Number.isInteger(handIndex)) {
+  const rawCardRef = parts[2].trim();
+  const handIndex = Number.parseInt(rawCardRef, 10);
+  const hasCardRef = rawCardRef.length > 0;
+  if (!Number.isInteger(playerIndex) || !hasCardRef) {
     return null;
   }
 
@@ -4100,7 +4927,8 @@ function parseRequestedPlayCardActionId(actionId) {
   return {
     action_id: actionId.trim(),
     player_index: playerIndex,
-    hand_index: handIndex,
+    hand_index: Number.isInteger(handIndex) ? handIndex : null,
+    card_ref: rawCardRef,
     target_suffix: rawTargetSuffix || null
   };
 }
@@ -4117,7 +4945,19 @@ function doesRequestedPlayCardActionIdMatchAction(parsedActionId, action) {
     return false;
   }
 
-  if (Number.isInteger(action?.hand_index) && action.hand_index !== parsedActionId.hand_index) {
+  if (
+    typeof parsedActionId?.card_ref === "string" &&
+    typeof action?.card_ref === "string" &&
+    action.card_ref !== parsedActionId.card_ref
+  ) {
+    return false;
+  }
+
+  if (
+    Number.isInteger(parsedActionId?.hand_index) &&
+    Number.isInteger(action?.hand_index) &&
+    action.hand_index !== parsedActionId.hand_index
+  ) {
     return false;
   }
 
@@ -4176,7 +5016,15 @@ function scoreRequestedPlayCardActionIdMatch(parsedActionId, action) {
     score += 8;
   }
 
-  if (Number.isInteger(action?.hand_index) && action.hand_index === parsedActionId.hand_index) {
+  if (typeof action?.card_ref === "string" && action.card_ref === parsedActionId.card_ref) {
+    score += 20;
+  }
+
+  if (
+    Number.isInteger(action?.hand_index) &&
+    Number.isInteger(parsedActionId?.hand_index) &&
+    action.hand_index === parsedActionId.hand_index
+  ) {
     score += 12;
   }
 
@@ -4203,6 +5051,14 @@ function scorePlayCardActionAgainstPlanStep(action, planStep) {
     : null;
   if (actionHandIndex !== null && planHandIndex !== null) {
     score += 20 - Math.min(Math.abs(actionHandIndex - planHandIndex), 20);
+  }
+
+  if (
+    typeof action?.card_ref === "string" &&
+    typeof planStep?.card_ref === "string" &&
+    action.card_ref === planStep.card_ref
+  ) {
+    score += 30;
   }
 
   if (
@@ -4588,26 +5444,26 @@ function buildUsePotionActionFingerprint(action) {
 function buildRewardBundle(state) {
   const rewards = Array.isArray(state?.rewards?.rewards)
     ? state.rewards.rewards.map((entry) => ({
-        index: Number.isInteger(entry?.index) ? entry.index : null,
-        action_id:
-          Number.isInteger(entry?.index) && Number.isInteger(entry?.index)
-            ? `reward:${entry.index}`
-            : null,
-        reward: entry?.reward ?? null
-      }))
+      index: Number.isInteger(entry?.index) ? entry.index : null,
+      action_id:
+        Number.isInteger(entry?.index) && Number.isInteger(entry?.index)
+          ? `reward:${entry.index}`
+          : null,
+      reward: entry?.reward ?? null
+    }))
     : [];
   const cardRewardSelectionOptions = Array.isArray(state?.card_reward_selection?.options)
     ? state.card_reward_selection.options.map((option) => ({
-        index: Number.isInteger(option?.index) ? option.index : null,
-        card: option?.card ?? null
-      }))
+      index: Number.isInteger(option?.index) ? option.index : null,
+      card: option?.card ?? null
+    }))
     : [];
   const potionSlots = Array.isArray(state?.players?.[0]?.potions)
     ? state.players[0].potions.map((potion, index) => ({
-        index,
-        potion,
-        is_empty: potion?.empty === true
-      }))
+      index,
+      potion,
+      is_empty: potion?.empty === true
+    }))
     : [];
   const hasProceed = Array.isArray(state?.available_actions)
     ? state.available_actions.some((action) => action?.action_id === "proceed")
@@ -4650,20 +5506,20 @@ function buildRestSiteBundle(state) {
   const deckUpgradeVisible = state?.deck_upgrade_selection?.visible === true;
   const restSiteOptions = Array.isArray(state?.rest_site?.options)
     ? state.rest_site.options.map((option) => ({
-        index: Number.isInteger(option?.index) ? option.index : null,
-        option_id: option?.option_id ?? null,
-        option_type: option?.option_type ?? null,
-        title: option?.title ?? null,
-        description: option?.description ?? null
-      }))
+      index: Number.isInteger(option?.index) ? option.index : null,
+      option_id: option?.option_id ?? null,
+      option_type: option?.option_type ?? null,
+      title: option?.title ?? null,
+      description: option?.description ?? null
+    }))
     : [];
   const deckUpgradeOptions = Array.isArray(state?.deck_upgrade_selection?.options)
     ? state.deck_upgrade_selection.options.map((option) => ({
-        index: Number.isInteger(option?.index) ? option.index : null,
-        card: option?.card ?? null,
-        upgrade_preview: option?.upgrade_preview ?? null,
-        is_selected: option?.is_selected === true
-      }))
+      index: Number.isInteger(option?.index) ? option.index : null,
+      card: option?.card ?? null,
+      upgrade_preview: option?.upgrade_preview ?? null,
+      is_selected: option?.is_selected === true
+    }))
     : [];
   const nonAutomationActions = getNonAutomationActions(state);
 
@@ -4696,10 +5552,13 @@ function buildCardSelectionBundle(state) {
   const rawCardSelection = isPlainObject(state?.card_selection) ? state.card_selection : {};
   const options = Array.isArray(rawCardSelection.options)
     ? rawCardSelection.options.map((option) => ({
-        index: Number.isInteger(option?.index) ? option.index : null,
-        card: option?.card ?? null,
-        is_selected: option?.is_selected === true
-      }))
+      index: Number.isInteger(option?.index) ? option.index : null,
+      action_id: typeof option?.action_id === "string" ? option.action_id : null,
+      selection_id:
+        typeof option?.selection_id === "string" ? option.selection_id : null,
+      card: option?.card ?? null,
+      is_selected: option?.is_selected === true
+    }))
     : [];
   const nonAutomationActionIds = getNonAutomationActions(state)
     .map((action) => action?.action_id)
@@ -4744,22 +5603,45 @@ function buildCardSelectionBundle(state) {
   };
 }
 
+function buildIndexedOptionEntries(options) {
+  if (!Array.isArray(options)) {
+    return [];
+  }
+
+  return options.map((option, fallbackIndex) => ({
+    option,
+    option_index: Number.isInteger(option?.index) ? option.index : fallbackIndex
+  }));
+}
+
+function findIndexedOptionEntry(options, requestedIndex) {
+  if (!Number.isInteger(requestedIndex)) {
+    return null;
+  }
+
+  return (
+    buildIndexedOptionEntries(options).find(
+      (entry) => entry.option_index === requestedIndex
+    ) ?? null
+  );
+}
+
 function buildShopBundle(state) {
   const screen = typeof state?.screen === "string" ? state.screen : null;
   const rawShop = isPlainObject(state?.shop) ? state.shop : {};
   const items = Array.isArray(rawShop.items)
     ? rawShop.items.map((item) => ({
-        index: Number.isInteger(item?.index) ? item.index : null,
-        item_kind: typeof item?.item_kind === "string" ? item.item_kind : null,
-        title: typeof item?.title === "string" ? item.title : null,
-        description: typeof item?.description === "string" ? item.description : null,
-        cost: Number.isFinite(item?.cost) ? item.cost : null,
-        is_affordable: item?.is_affordable === true,
-        used: typeof item?.used === "boolean" ? item.used : null,
-        card: item?.card ?? null,
-        relic: item?.relic ?? null,
-        potion: item?.potion ?? null
-      }))
+      index: Number.isInteger(item?.index) ? item.index : null,
+      item_kind: typeof item?.item_kind === "string" ? item.item_kind : null,
+      title: typeof item?.title === "string" ? item.title : null,
+      description: typeof item?.description === "string" ? item.description : null,
+      cost: Number.isFinite(item?.cost) ? item.cost : null,
+      is_affordable: item?.is_affordable === true,
+      used: typeof item?.used === "boolean" ? item.used : null,
+      card: item?.card ?? null,
+      relic: item?.relic ?? null,
+      potion: item?.potion ?? null
+    }))
     : [];
   const nonAutomationActionIds = getNonAutomationActions(state)
     .map((action) => action?.action_id)
@@ -4856,7 +5738,14 @@ function getIndexedOptionSurfaces(state) {
       selected_count: cardSelectionBundle.card_selection.selected_count,
       options: cardSelectionBundle.card_selection.options,
       getActionId(index) {
-        return `card_selection:select:${index}`;
+        const option = Array.isArray(cardSelectionBundle.card_selection.options)
+          ? cardSelectionBundle.card_selection.options.find(
+            (entry) => Number.isInteger(entry?.index) && entry.index === index
+          )
+          : null;
+        return typeof option?.action_id === "string" && option.action_id
+          ? option.action_id
+          : `card_selection:select:${index}`;
       }
     });
   }
@@ -4943,23 +5832,343 @@ function summarizeIndexedOptionForAgent(surface, option) {
   }
 
   if (surface === "event") {
-    return {
-      index: Number.isInteger(option.index) ? option.index : null,
-      title: normalizeAgentText(option.title),
-      description: normalizeAgentText(option.description),
-      is_proceed: option.is_proceed === true,
-      glossary: Array.isArray(option.glossary)
-        ? option.glossary
-            .map((entry) => ({
-              title: normalizeAgentText(entry?.title),
-              description: normalizeAgentText(entry?.description)
-            }))
-            .filter((entry) => entry.title || entry.description)
-        : undefined
-    };
+    return summarizeEventOptionForAgent(option);
   }
 
   return option;
+}
+
+function summarizeEventOptionForAgent(option) {
+  if (!isPlainObject(option)) {
+    return null;
+  }
+
+  const summary = {
+    index: Number.isInteger(option.index) ? option.index : null,
+    option_type: typeof option.option_type === "string" ? option.option_type : null,
+    option_id: typeof option.option_id === "string" ? option.option_id : null,
+    title: normalizeAgentText(option.title),
+    description: normalizeAgentText(option.description),
+    is_proceed: option.is_proceed === true
+  };
+
+  if (option.is_selected === true) {
+    summary.is_selected = true;
+  }
+
+  if (typeof option.is_enabled === "boolean") {
+    summary.is_enabled = option.is_enabled === true;
+  }
+
+  if (option.action_available === true) {
+    summary.action_available = true;
+  }
+
+  if (typeof option.divination_size === "string" && option.divination_size.trim()) {
+    summary.divination_size = option.divination_size.trim();
+  }
+
+  const coord = summarizeCrystalSphereCoordForAgent(option?.coord);
+  if (coord) {
+    summary.coord = coord;
+  }
+
+  if (option?.is_highlighted === true) {
+    summary.is_highlighted = true;
+  }
+
+  if (Array.isArray(option?.glossary)) {
+    const glossary = option.glossary
+      .map((entry) => ({
+        title: normalizeAgentText(entry?.title),
+        description: normalizeAgentText(entry?.description)
+      }))
+      .filter((entry) => entry.title || entry.description);
+    if (glossary.length > 0) {
+      summary.glossary = glossary;
+    }
+  }
+
+  return summary;
+}
+
+function isCrystalSphereScreen(screen) {
+  return screen === "EVENT_CRYSTAL_SPHERE";
+}
+
+function isCrystalSphereEventOption(option) {
+  return (
+    isPlainObject(option) &&
+    (typeof option.option_type === "string" &&
+      option.option_type.startsWith("crystal_sphere_") ||
+      typeof option.option_id === "string" &&
+      option.option_id.startsWith("crystal_sphere:"))
+  );
+}
+
+function isCrystalSphereEventOptionAction(action) {
+  return (
+    isPlainObject(action) &&
+    typeof action.kind === "string" &&
+    action.kind === "event_option" &&
+    isCrystalSphereEventOption(action.option)
+  );
+}
+
+function getCrystalSphereOptionIndex(option, fallbackIndex = null) {
+  if (Number.isInteger(option?.index)) {
+    return option.index;
+  }
+
+  return Number.isInteger(fallbackIndex) ? fallbackIndex : null;
+}
+
+function summarizeCrystalSphereControlActionForAgent(option, fallbackIndex = null) {
+  if (!isCrystalSphereEventOption(option)) {
+    return null;
+  }
+
+  const index = getCrystalSphereOptionIndex(option, fallbackIndex);
+  if (!Number.isInteger(index)) {
+    return null;
+  }
+
+  const optionType = typeof option.option_type === "string" ? option.option_type : "";
+  let name = null;
+  if (optionType === "crystal_sphere_small_divination") {
+    name = "small";
+  } else if (optionType === "crystal_sphere_big_divination") {
+    name = "big";
+  } else if (optionType === "crystal_sphere_proceed") {
+    name = "proceed";
+  }
+
+  if (name === null) {
+    return null;
+  }
+
+  return `${index}:${name}${option.is_selected === true ? "*" : ""}`;
+}
+
+function summarizeCrystalSphereCellActionForAgent(option, fallbackIndex = null) {
+  if (!isCrystalSphereEventOption(option) || option.option_type !== "crystal_sphere_cell") {
+    return null;
+  }
+
+  const index = getCrystalSphereOptionIndex(option, fallbackIndex);
+  const coord = summarizeCrystalSphereCoordForAgent(option.coord);
+  if (!Number.isInteger(index) || coord === null) {
+    return null;
+  }
+
+  return `${index}:${coord}`;
+}
+
+function summarizeCrystalSphereActionGroupsForAgent(optionsOrActions) {
+  const entries = Array.isArray(optionsOrActions) ? optionsOrActions : [];
+  const controls = [];
+  const cells = [];
+  let cellActionStartIndex = null;
+  let proceed = null;
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    const option = isPlainObject(entry?.option) ? entry.option : entry;
+    if (!isCrystalSphereEventOption(option)) {
+      continue;
+    }
+
+    const control = summarizeCrystalSphereControlActionForAgent(option, index);
+    if (control !== null) {
+      if (control.includes(":proceed")) {
+        proceed = control;
+      } else {
+        controls.push(control);
+      }
+      continue;
+    }
+
+    const cellIndex = getCrystalSphereOptionIndex(option, index);
+    const cellCoord = summarizeCrystalSphereCoordForAgent(option.coord);
+    if (Number.isInteger(cellIndex) && cellCoord !== null) {
+      if (cellActionStartIndex === null) {
+        cellActionStartIndex = cellIndex;
+      }
+      cells.push(cellCoord);
+    }
+  }
+
+  const summary = {};
+  if (controls.length > 0) {
+    summary.controls = controls;
+  }
+  if (proceed !== null) {
+    summary.proceed = proceed;
+  }
+  if (cells.length > 0) {
+    summary.cell_action_start_index = cellActionStartIndex;
+    summary.cells = cells;
+  }
+
+  return Object.keys(summary).length > 0 ? summary : null;
+}
+
+function summarizeCrystalSphereCoordForAgent(coord) {
+  if (!isPlainObject(coord)) {
+    return null;
+  }
+
+  if (!Number.isInteger(coord.x) || !Number.isInteger(coord.y)) {
+    return null;
+  }
+
+  return `${coord.x},${coord.y}`;
+}
+
+function summarizeCrystalSphereItemForAgent(item) {
+  if (!isPlainObject(item)) {
+    return null;
+  }
+
+  const summary = {
+    item_type: typeof item.item_type === "string" ? item.item_type : null
+  };
+
+  const title = normalizeAgentText(item.title);
+  if (title) {
+    summary.title = title;
+  }
+
+  if (Number.isFinite(item.amount)) {
+    summary.amount = item.amount;
+  }
+
+  if (typeof item.rarity === "string" && item.rarity.trim()) {
+    summary.rarity = item.rarity.trim();
+  }
+
+  if (item.is_good === true) {
+    summary.is_good = true;
+  }
+
+  return summary;
+}
+
+function summarizeCrystalSphereRevealedCellForAgent(coord, item) {
+  if (typeof coord !== "string" || coord.length <= 0 || !isPlainObject(item)) {
+    return null;
+  }
+
+  const itemType =
+    typeof item.item_type === "string" && item.item_type.trim()
+      ? item.item_type.trim()
+      : "item";
+  if (Number.isFinite(item.amount)) {
+    return `${coord}=${itemType}:${item.amount}`;
+  }
+
+  const title = normalizeAgentText(item.title);
+  if (title) {
+    return `${coord}=${itemType}:${title}`;
+  }
+
+  if (typeof item.rarity === "string" && item.rarity.trim()) {
+    return `${coord}=${itemType}:${item.rarity.trim()}`;
+  }
+
+  return `${coord}=${itemType}`;
+}
+
+function summarizeCrystalSphereControlForAgent(control) {
+  if (!isPlainObject(control) || control.visible !== true) {
+    return null;
+  }
+
+  const summary = {
+    enabled: control.enabled === true,
+    action_available: control.action_available === true
+  };
+
+  if (control.is_selected === true) {
+    summary.is_selected = true;
+  }
+
+  const label = normalizeAgentText(control.label);
+  if (label) {
+    summary.label = label;
+  }
+
+  if (typeof control.divination_size === "string" && control.divination_size.trim()) {
+    summary.divination_size = control.divination_size.trim();
+  }
+
+  return summary;
+}
+
+function summarizeCrystalSphereGridSizeForAgent(gridSize) {
+  if (!isPlainObject(gridSize)) {
+    return null;
+  }
+
+  if (!Number.isInteger(gridSize.width) || !Number.isInteger(gridSize.height)) {
+    return null;
+  }
+
+  return `${gridSize.width}x${gridSize.height}`;
+}
+
+function summarizeCrystalSphereForAgent(crystalSphere, eventOptions = null) {
+  if (!isPlainObject(crystalSphere) || crystalSphere.visible !== true) {
+    return null;
+  }
+
+  const cells = Array.isArray(crystalSphere.cells)
+    ? crystalSphere.cells.filter((cell) => isPlainObject(cell))
+    : [];
+  const revealedCells = [];
+  let hiddenCellCount = 0;
+
+  for (const cell of cells) {
+    const coord =
+      Number.isInteger(cell.x) && Number.isInteger(cell.y)
+        ? `${cell.x},${cell.y}`
+        : null;
+
+    if (cell.is_hidden === true) {
+      hiddenCellCount += 1;
+    }
+
+    if (coord) {
+      const item = summarizeCrystalSphereItemForAgent(cell.revealed_item);
+      if (item !== null) {
+        const revealed = summarizeCrystalSphereRevealedCellForAgent(coord, item);
+        if (revealed !== null) {
+          revealedCells.push(revealed);
+        }
+      }
+    }
+  }
+
+  const summary = {
+    divinations_left: Number.isFinite(crystalSphere.divinations_left)
+      ? crystalSphere.divinations_left
+      : null,
+    current_tool:
+      typeof crystalSphere.current_tool === "string" ? crystalSphere.current_tool : null,
+    grid_size: summarizeCrystalSphereGridSizeForAgent(crystalSphere.grid_size),
+    hidden_cell_count: hiddenCellCount
+  };
+
+  const actions = summarizeCrystalSphereActionGroupsForAgent(eventOptions);
+  if (actions !== null) {
+    summary.actions = actions;
+  }
+
+  if (revealedCells.length > 0) {
+    summary.revealed = revealedCells;
+  }
+
+  return summary;
 }
 
 function summarizeMapSnapshotStatusForAgent(snapshot) {
@@ -4978,11 +6187,6 @@ function summarizeMapSnapshotStatusForAgent(snapshot) {
 
   if (snapshot.frontier_action_match !== true) {
     summary.frontier_action_match = snapshot.frontier_action_match === true;
-  }
-
-  if (snapshot.state_action_state_version_match !== true) {
-    summary.state_action_state_version_match =
-      snapshot.state_action_state_version_match === true;
   }
 
   return summary;
@@ -5685,7 +6889,11 @@ async function maybeResolveShopCardRemovalSelection(session, state, options) {
     };
   }
 
-  const selectActionId = `card_selection:select:${selectionResolution.option.index}`;
+  const selectActionId =
+    typeof selectionResolution.option?.action_id === "string" &&
+    selectionResolution.option.action_id
+      ? selectionResolution.option.action_id
+      : `card_selection:select:${selectionResolution.option.index}`;
   if (!cardSelectionBundle.non_automation_action_ids.includes(selectActionId)) {
     return {
       performed: false,
@@ -5835,7 +7043,7 @@ function collapseImageTagMarkers(text) {
     "点能量",
     true
   );
-  collapsed = collapseKnownImageTagMarkers(collapsed, "star", "点星辉");
+  collapsed = collapseKnownImageTagMarkers(collapsed, "star", "点星辉", true);
 
   const markerPattern = new RegExp(
     `${escapeRegex(IMAGE_TAG_MARKER_PREFIX)}([^>]+)${escapeRegex(
@@ -6028,14 +7236,40 @@ function filterNonAutomationActions(actions) {
   );
 }
 
-function summarizeActionsForAgent(actions) {
+function summarizeActionsForAgent(actions, screen = null) {
   if (!Array.isArray(actions)) {
     return [];
   }
 
-  return actions
-    .map(summarizeActionForAgent)
-    .filter((action) => action !== null);
+  if (isCrystalSphereScreen(screen)) {
+    const otherActions = [];
+    const crystalSphereOptions = [];
+
+    for (const action of actions) {
+      if (isCrystalSphereEventOptionAction(action)) {
+        crystalSphereOptions.push(action);
+        continue;
+      }
+
+      const summary = summarizeActionForAgent(action);
+      if (summary !== null) {
+        otherActions.push(summary);
+      }
+    }
+
+    const crystalSphereGroup = summarizeCrystalSphereActionGroupsForAgent(crystalSphereOptions);
+    if (crystalSphereGroup !== null) {
+      otherActions.push({
+        kind: "event_option_group",
+        group: "crystal_sphere",
+        ...crystalSphereGroup
+      });
+    }
+
+    return otherActions;
+  }
+
+  return actions.map(summarizeActionForAgent).filter((action) => action !== null);
 }
 
 function shouldIncludeCardDescriptionAlongsideEffect(description, effect) {
@@ -6068,6 +7302,7 @@ function summarizeCardForAgent(card) {
     title: normalizeAgentText(card.title),
     cost: Number.isInteger(card.resolved_energy_cost) ? card.resolved_energy_cost : null
   };
+  const starCost = readAgentCardStarCost(card);
 
   const effect = typeof card?.effect_preview?.summary === "string"
     ? normalizeAgentText(card.effect_preview.summary)
@@ -6084,6 +7319,10 @@ function summarizeCardForAgent(card) {
     summary.target = card.target_type;
   }
 
+  if (starCost !== null) {
+    summary.star_cost = starCost;
+  }
+
   if (effect && effect.trim()) {
     summary.effect = effect;
   }
@@ -6093,6 +7332,22 @@ function summarizeCardForAgent(card) {
   }
 
   return summary;
+}
+
+function readAgentCardStarCost(card) {
+  if (!isPlainObject(card)) {
+    return null;
+  }
+
+  if (card.has_star_cost_x === true) {
+    return "X";
+  }
+
+  if (Number.isInteger(card.current_star_cost) && card.current_star_cost >= 0) {
+    return card.current_star_cost;
+  }
+
+  return null;
 }
 
 function summarizePowerForAgent(power) {
@@ -6291,10 +7546,10 @@ function summarizeRewardBundleForAgent(bundle) {
       terminal_proceed_visible: rewards.terminal_proceed_visible === true,
       entries: Array.isArray(rewards.entries)
         ? rewards.entries.map((entry) => ({
-            index: Number.isInteger(entry?.index) ? entry.index : null,
-            action_id: typeof entry?.action_id === "string" ? entry.action_id : null,
-            reward: summarizeRewardForAgent(entry?.reward)
-          }))
+          index: Number.isInteger(entry?.index) ? entry.index : null,
+          action_id: typeof entry?.action_id === "string" ? entry.action_id : null,
+          reward: summarizeRewardForAgent(entry?.reward)
+        }))
         : []
     },
     card_reward_selection: {
@@ -6302,19 +7557,19 @@ function summarizeRewardBundleForAgent(bundle) {
       skip_visible: cardRewardSelection.skip_visible === true,
       options: Array.isArray(cardRewardSelection.options)
         ? cardRewardSelection.options.map((option) => ({
-            index: Number.isInteger(option?.index) ? option.index : null,
-            card: summarizeCardForAgent(option?.card)
-          }))
+          index: Number.isInteger(option?.index) ? option.index : null,
+          card: summarizeCardForAgent(option?.card)
+        }))
         : []
     },
     potion_slots: Array.isArray(bundle.potion_slots)
       ? bundle.potion_slots.map((slot) => ({
-          index: Number.isInteger(slot?.index) ? slot.index : null,
-          is_empty: slot?.is_empty === true,
-          ...(slot?.is_empty === true
-            ? {}
-            : { potion: summarizePotionForAgent(slot?.potion) })
-        }))
+        index: Number.isInteger(slot?.index) ? slot.index : null,
+        is_empty: slot?.is_empty === true,
+        ...(slot?.is_empty === true
+          ? {}
+          : { potion: summarizePotionForAgent(slot?.potion) })
+      }))
       : [],
     empty_potion_slot_count: Number.isFinite(bundle.empty_potion_slot_count)
       ? bundle.empty_potion_slot_count
@@ -6344,22 +7599,22 @@ function summarizeRestSiteBundleForAgent(bundle) {
       proceed_visible: restSite.proceed_visible === true,
       options: Array.isArray(restSite.options)
         ? restSite.options.map((option) => ({
-            index: Number.isInteger(option?.index) ? option.index : null,
-            option_type: typeof option?.option_type === "string" ? option.option_type : null,
-            title: normalizeAgentText(option?.title),
-            description: normalizeAgentText(option?.description)
-          }))
+          index: Number.isInteger(option?.index) ? option.index : null,
+          option_type: typeof option?.option_type === "string" ? option.option_type : null,
+          title: normalizeAgentText(option?.title),
+          description: normalizeAgentText(option?.description)
+        }))
         : []
     },
     deck_upgrade_selection: {
       visible: deckUpgrade.visible === true,
       options: Array.isArray(deckUpgrade.options)
         ? deckUpgrade.options.map((option) => ({
-            index: Number.isInteger(option?.index) ? option.index : null,
-            card: summarizeCardForAgent(option?.card),
-            upgrade_preview: summarizeCardForAgent(option?.upgrade_preview),
-            is_selected: option?.is_selected === true
-          }))
+          index: Number.isInteger(option?.index) ? option.index : null,
+          card: summarizeCardForAgent(option?.card),
+          upgrade_preview: summarizeCardForAgent(option?.upgrade_preview),
+          is_selected: option?.is_selected === true
+        }))
         : []
     },
     non_automation_action_ids: Array.isArray(bundle.non_automation_action_ids)
@@ -6414,10 +7669,10 @@ function summarizeRestSiteBundleForResolutionAgent(bundle) {
     result.deck_upgrade_selection = {
       options: Array.isArray(deckUpgrade.options)
         ? deckUpgrade.options
-            .map((option, fallbackIndex) =>
-              summarizeDeckUpgradeChoiceForResolutionAgent(option, fallbackIndex)
-            )
-            .filter((option) => option !== null)
+          .map((option, fallbackIndex) =>
+            summarizeDeckUpgradeChoiceForResolutionAgent(option, fallbackIndex)
+          )
+          .filter((option) => option !== null)
         : []
     };
     return result;
@@ -6435,8 +7690,8 @@ function summarizeRestSiteBundleForResolutionAgent(bundle) {
       proceed_visible: restSite.proceed_visible === true,
       options: Array.isArray(restSite.options)
         ? restSite.options
-            .map((option) => summarizeIndexedOptionForAgent(option))
-            .filter((option) => option !== null)
+          .map((option) => summarizeGenericIndexedOptionForAgent(option))
+          .filter((option) => option !== null)
         : []
     };
   }
@@ -6499,10 +7754,10 @@ function summarizeCardSelectionBundleForAgent(bundle) {
       skip_visible: cardSelection.skip_visible === true,
       options: Array.isArray(cardSelection.options)
         ? cardSelection.options.map((option) => ({
-            index: Number.isInteger(option?.index) ? option.index : null,
-            is_selected: option?.is_selected === true,
-            card: summarizeCardForAgent(option?.card)
-          }))
+          index: Number.isInteger(option?.index) ? option.index : null,
+          is_selected: option?.is_selected === true,
+          card: summarizeCardForAgent(option?.card)
+        }))
         : []
     },
     non_automation_action_ids: Array.isArray(bundle.non_automation_action_ids)
@@ -6542,10 +7797,10 @@ function summarizeCardSelectionBundleForResolutionAgent(bundle) {
       skip_visible: cardSelection.skip_visible === true,
       options: Array.isArray(cardSelection.options)
         ? cardSelection.options
-            .map((option, fallbackIndex) =>
-              summarizeIndexedCardTitleChoiceForAgent(option, fallbackIndex)
-            )
-            .filter((option) => option !== null)
+          .map((option, fallbackIndex) =>
+            summarizeIndexedCardTitleChoiceForAgent(option, fallbackIndex)
+          )
+          .filter((option) => option !== null)
         : []
     }
   };
@@ -6556,6 +7811,7 @@ function summarizeStateForAgent(state) {
     return state;
   }
 
+  const screen = typeof state.screen === "string" ? state.screen : null;
   const player = state?.players?.[0];
   const playerCreature = isPlainObject(player?.creature) ? player.creature : {};
   const playerCombat = isPlainObject(player?.combat) ? player.combat : {};
@@ -6563,9 +7819,20 @@ function summarizeStateForAgent(state) {
   const run = isPlainObject(state.run) ? state.run : {};
   const map = isPlainObject(state.map) ? state.map : {};
   const shop = isPlainObject(state.shop) ? state.shop : {};
+  const nonAutomationActions = getNonAutomationActions(state);
+  const crystalSphere = summarizeCrystalSphereForAgent(
+    state?.crystal_sphere,
+    state?.event_options?.options
+  );
+  const summarizedAvailableActions = summarizeActionsForAgent(
+    isCrystalSphereScreen(screen)
+      ? nonAutomationActions.filter((action) => !isCrystalSphereEventOptionAction(action))
+      : nonAutomationActions,
+    screen
+  );
 
   const summary = {
-    screen: typeof state.screen === "string" ? state.screen : null,
+    screen,
     state_version: Number.isFinite(state.state_version) ? state.state_version : null,
     run: {
       act: typeof run?.act?.title === "string" ? run.act.title : null,
@@ -6587,8 +7854,8 @@ function summarizeStateForAgent(state) {
       block: Number.isFinite(playerCreature.block) ? playerCreature.block : 0,
       powers: Array.isArray(playerCreature.powers)
         ? playerCreature.powers
-            .map(summarizePowerForAgent)
-            .filter((power) => power !== null)
+          .map(summarizePowerForAgent)
+          .filter((power) => power !== null)
         : [],
       gold: Number.isFinite(player?.gold) ? player.gold : null,
       potions: Array.isArray(player?.potions)
@@ -6597,23 +7864,26 @@ function summarizeStateForAgent(state) {
       relics: Array.isArray(player?.relics)
         ? player.relics.map((relic) => summarizeRelicForAgent(relic)).filter((relic) => relic !== null)
         : []
-    },
-    available_actions: summarizeActionsForAgent(getNonAutomationActions(state))
+    }
   };
+
+  if (summarizedAvailableActions.length > 0) {
+    summary.available_actions = summarizedAvailableActions;
+  }
 
   if (combat.in_progress === true || Array.isArray(playerCombat?.hand?.cards)) {
     const playerCombatId = Number.isFinite(playerCreature?.combat_id) ? playerCreature.combat_id : null;
     const playerName = normalizeAgentText(playerCreature?.name);
     const summons = Array.isArray(combat.player_creatures)
       ? combat.player_creatures
-          .map(summarizeCreatureForAgent)
-          .filter(
-            (creature) =>
-              creature !== null &&
-              (playerCombatId !== null
-                ? creature.combat_id !== playerCombatId
-                : normalizeAgentText(creature?.name) !== playerName)
-          )
+        .map(summarizeCreatureForAgent)
+        .filter(
+          (creature) =>
+            creature !== null &&
+            (playerCombatId !== null
+              ? creature.combat_id !== playerCombatId
+              : normalizeAgentText(creature?.name) !== playerName)
+        )
       : [];
     summary.combat = {
       in_progress: combat.in_progress === true,
@@ -6623,6 +7893,7 @@ function summarizeStateForAgent(state) {
       player_actions_disabled: combat.player_actions_disabled === true,
       energy: Number.isFinite(playerCombat.energy) ? playerCombat.energy : null,
       max_energy: Number.isFinite(playerCombat.max_energy) ? playerCombat.max_energy : null,
+      stars: Number.isFinite(playerCombat.stars) ? playerCombat.stars : null,
       hand: Array.isArray(playerCombat?.hand?.cards)
         ? playerCombat.hand.cards.map(summarizeCardForAgent).filter((card) => card !== null)
         : [],
@@ -6631,9 +7902,9 @@ function summarizeStateForAgent(state) {
         : null,
       draw_top: Array.isArray(playerCombat?.draw_pile?.cards)
         ? playerCombat.draw_pile.cards
-            .slice(0, 3)
-            .map(summarizeCardForAgent)
-            .filter((card) => card !== null)
+          .slice(0, 3)
+          .map(summarizeCardForAgent)
+          .filter((card) => card !== null)
         : [],
       discard_pile_count: Number.isFinite(playerCombat?.discard_pile?.count)
         ? playerCombat.discard_pile.count
@@ -6647,17 +7918,17 @@ function summarizeStateForAgent(state) {
         : [],
       target_index_map: Array.isArray(combat.target_index_map)
         ? combat.target_index_map
-            .map((entry) => ({
-              action_suffixes: Array.isArray(entry?.action_suffixes)
-                ? entry.action_suffixes.filter((value) => typeof value === "string")
-                : [],
-              combat_id: Number.isFinite(entry?.combat_id) ? entry.combat_id : null,
-              name: normalizeAgentText(entry?.name),
-              side: typeof entry?.side === "string" ? entry.side : null,
-              is_enemy: entry?.is_enemy === true,
-              is_alive: entry?.is_alive === true
-            }))
-            .filter((entry) => entry.combat_id !== null || entry.name !== null)
+          .map((entry) => ({
+            action_suffixes: Array.isArray(entry?.action_suffixes)
+              ? entry.action_suffixes.filter((value) => typeof value === "string")
+              : [],
+            combat_id: Number.isFinite(entry?.combat_id) ? entry.combat_id : null,
+            name: normalizeAgentText(entry?.name),
+            side: typeof entry?.side === "string" ? entry.side : null,
+            is_enemy: entry?.is_enemy === true,
+            is_alive: entry?.is_alive === true
+          }))
+          .filter((entry) => entry.combat_id !== null || entry.name !== null)
         : []
     };
   }
@@ -6685,11 +7956,11 @@ function summarizeStateForAgent(state) {
       current_coord: isPlainObject(map.current_coord) ? map.current_coord : null,
       travelable_points: Array.isArray(map.points)
         ? map.points
-            .filter((point) => point?.is_travelable === true || point?.state === "Travelable")
-            .map((point) => ({
-              coord: isPlainObject(point?.coord) ? point.coord : null,
-              point_type: typeof point?.point_type === "string" ? point.point_type : null
-            }))
+          .filter((point) => point?.is_travelable === true || point?.state === "Travelable")
+          .map((point) => ({
+            coord: isPlainObject(point?.coord) ? point.coord : null,
+            point_type: typeof point?.point_type === "string" ? point.point_type : null
+          }))
         : []
     };
   }
@@ -6700,27 +7971,27 @@ function summarizeStateForAgent(state) {
       gold: Number.isFinite(shop.gold) ? shop.gold : null,
       items: Array.isArray(shop.items)
         ? shop.items
-            .map((item) => summarizeShopItemForAgent(item))
-            .filter((item) => item !== null)
+          .map((item) => summarizeShopItemForAgent(item))
+          .filter((item) => item !== null)
         : []
     };
   }
 
-  if (state?.event_options?.visible === true) {
+  if (state?.event_options?.visible === true && !isCrystalSphereScreen(screen)) {
     const visibleGlossary = Array.isArray(state.event_options.visible_glossary)
       ? state.event_options.visible_glossary
-          .map((entry) => ({
-            title: normalizeAgentText(entry?.title),
-            description: normalizeAgentText(entry?.description)
-          }))
-          .filter((entry) => entry.title || entry.description)
+        .map((entry) => ({
+          title: normalizeAgentText(entry?.title),
+          description: normalizeAgentText(entry?.description)
+        }))
+        .filter((entry) => entry.title || entry.description)
       : [];
     const visibleGlossaryTexts = Array.isArray(
       state.event_options.visible_glossary_texts
     )
       ? state.event_options.visible_glossary_texts
-          .map((text) => normalizeAgentText(text))
-          .filter((text) => typeof text === "string" && text.length > 0)
+        .map((text) => normalizeAgentText(text))
+        .filter((text) => typeof text === "string" && text.length > 0)
       : [];
     summary.event_options = {
       visible: true,
@@ -6735,22 +8006,15 @@ function summarizeStateForAgent(state) {
           ? visibleGlossaryTexts
           : undefined,
       options: Array.isArray(state.event_options.options)
-        ? state.event_options.options.map((option) => ({
-            index: Number.isInteger(option?.index) ? option.index : null,
-            title: normalizeAgentText(option?.title),
-            description: normalizeAgentText(option?.description),
-            is_proceed: option?.is_proceed === true,
-            glossary: Array.isArray(option?.glossary)
-              ? option.glossary
-                  .map((entry) => ({
-                    title: normalizeAgentText(entry?.title),
-                    description: normalizeAgentText(entry?.description)
-                  }))
-                  .filter((entry) => entry.title || entry.description)
-              : undefined
-          }))
+        ? state.event_options.options
+          .map((option) => summarizeEventOptionForAgent(option))
+          .filter((option) => option !== null)
         : []
     };
+  }
+
+  if (crystalSphere !== null) {
+    summary.crystal_sphere = crystalSphere;
   }
 
   return summary;
@@ -6799,6 +8063,7 @@ function summarizeActionStateForAgent(state) {
       player_actions_disabled: summary.combat.player_actions_disabled === true,
       energy: Number.isFinite(summary.combat.energy) ? summary.combat.energy : null,
       max_energy: Number.isFinite(summary.combat.max_energy) ? summary.combat.max_energy : null,
+      stars: Number.isFinite(summary.combat.stars) ? summary.combat.stars : null,
       hand: Array.isArray(summary.combat.hand) ? summary.combat.hand : [],
       draw_pile_count: Number.isFinite(summary.combat.draw_pile_count)
         ? summary.combat.draw_pile_count
@@ -6840,6 +8105,10 @@ function summarizeActionStateForAgent(state) {
 
   if (isPlainObject(summary.event_options)) {
     result.event_options = summary.event_options;
+  }
+
+  if (isPlainObject(summary.crystal_sphere)) {
+    result.crystal_sphere = summary.crystal_sphere;
   }
 
   return result;
@@ -7128,12 +8397,12 @@ function buildMapRoutesPayload(state, options = {}) {
       is_travelable: point.is_travelable === true || point.state === "Travelable",
       children: Array.isArray(point.children)
         ? point.children
-            .filter((child) => isPlainObject(child))
-            .map((child) => ({
-              col: Number.isFinite(child.col) ? child.col : null,
-              row: Number.isFinite(child.row) ? child.row : null
-            }))
-            .filter((child) => child.col !== null && child.row !== null)
+          .filter((child) => isPlainObject(child))
+          .map((child) => ({
+            col: Number.isFinite(child.col) ? child.col : null,
+            row: Number.isFinite(child.row) ? child.row : null
+          }))
+          .filter((child) => child.col !== null && child.row !== null)
         : []
     }))
     .filter((point) => point.coord.col !== null && point.coord.row !== null);
@@ -7208,8 +8477,6 @@ function buildMapRoutesPayload(state, options = {}) {
     snapshot_settle_reason: snapshotStatus?.reason ?? null,
     snapshot_settle_polls: snapshotStatus?.poll_count ?? null,
     frontier_action_match: snapshotStatus?.frontier_action_match ?? null,
-    state_action_state_version_match:
-      snapshotStatus?.state_action_state_version_match ?? null,
     route_root_count: routeRoots.length,
     route_node_count: routeNodes.length,
     route_roots: routeRoots,
@@ -7743,12 +9010,12 @@ function extractTravelableMapKeysFromState(state) {
     .sort(compareCoordKeys);
 }
 
-function extractMapActionKeys(actionsPayload) {
-  if (!isPlainObject(actionsPayload) || !Array.isArray(actionsPayload.actions)) {
+function extractMapActionKeys(state) {
+  if (!isPlainObject(state) || !Array.isArray(state.available_actions)) {
     return [];
   }
 
-  const keys = actionsPayload.actions
+  const keys = state.available_actions
     .filter(
       (action) =>
         isPlainObject(action) &&
@@ -7976,7 +9243,10 @@ function compactPayloadForOutput(payload) {
       schema_version: typeof payload.schema_version === "string" ? payload.schema_version : null,
       state_version: Number.isFinite(payload.state_version) ? payload.state_version : null,
       screen: typeof payload.screen === "string" ? payload.screen : null,
-      actions: summarizeActionsForAgent(filterNonAutomationActions(payload.actions))
+      actions: summarizeActionsForAgent(
+        filterNonAutomationActions(payload.actions),
+        typeof payload.screen === "string" ? payload.screen : null
+      )
     };
   }
 
@@ -8037,7 +9307,16 @@ function compactPayloadForOutput(payload) {
   }
 
   if (Array.isArray(payload.actions)) {
-    result.actions = summarizeActionsForAgent(payload.actions);
+    result.actions = summarizeActionsForAgent(
+      payload.actions,
+      typeof payload.screen === "string"
+        ? payload.screen
+        : typeof payload?.state_after?.screen === "string"
+          ? payload.state_after.screen
+          : typeof payload?.state?.screen === "string"
+            ? payload.state.screen
+            : null
+    );
   }
 
   if (isPlainObject(payload.matched_action)) {
@@ -8207,7 +9486,7 @@ function compactRestSitePayload(payload) {
   }
 
   if (isPlainObject(result.selected_option)) {
-    result.selected_option = summarizeIndexedOptionForAgent(result.selected_option);
+    result.selected_option = summarizeGenericIndexedOptionForAgent(result.selected_option);
   }
   if (result.selected_option == null) {
     delete result.selected_option;
@@ -8352,12 +9631,12 @@ function compactPlayCardSequencePayload(payload) {
   const rawStateAfter = isPlainObject(payload?.state_after) ? payload.state_after : null;
   const payloadWithoutInitialState = isPlainObject(payload)
     ? (() => {
-        const cloned = {
-          ...payload
-        };
-        delete cloned.initial_state;
-        return cloned;
-      })()
+      const cloned = {
+        ...payload
+      };
+      delete cloned.initial_state;
+      return cloned;
+    })()
     : payload;
   const compacted = compactPayloadForOutput(payloadWithoutInitialState);
   if (!isPlainObject(compacted)) {
@@ -8471,7 +9750,7 @@ function compactCombatSequenceExecutedStep(step, options = {}) {
       : null;
   const autoExecutedActions =
     Array.isArray(step?.execution?.auto_executed_actions) &&
-    step.execution.auto_executed_actions.length > 0
+      step.execution.auto_executed_actions.length > 0
       ? step.execution.auto_executed_actions
       : null;
 
@@ -8552,7 +9831,7 @@ function summarizeSelectedCardForAgent(selectedCard) {
   return Object.keys(summary).length > 0 ? summary : null;
 }
 
-function summarizeIndexedOptionForAgent(option) {
+function summarizeGenericIndexedOptionForAgent(option) {
   if (!isPlainObject(option)) {
     return null;
   }
@@ -9136,7 +10415,8 @@ function summarizeCombatSequenceStateForAgent(state, initialState = null) {
       current_hp: Number.isFinite(playerCreature.current_hp) ? playerCreature.current_hp : null,
       max_hp: Number.isFinite(playerCreature.max_hp) ? playerCreature.max_hp : null,
       energy: Number.isFinite(playerCombat.energy) ? playerCombat.energy : null,
-      max_energy: Number.isFinite(playerCombat.max_energy) ? playerCombat.max_energy : null
+      max_energy: Number.isFinite(playerCombat.max_energy) ? playerCombat.max_energy : null,
+      stars: Number.isFinite(playerCombat.stars) ? playerCombat.stars : null
     },
     enemy_changes: summarizeCombatSequenceEnemyChanges(initialState, state),
     available_actions: summarizeCombatSequenceAvailableActions(getNonAutomationActions(state))
@@ -9280,6 +10560,10 @@ function summarizeCombatSequenceAvailableAction(action) {
     if (Number.isInteger(action.card.resolved_energy_cost)) {
       summary.cost = action.card.resolved_energy_cost;
     }
+    const starCost = readAgentCardStarCost(action.card);
+    if (starCost !== null) {
+      summary.star_cost = starCost;
+    }
   } else if (typeof action?.potion?.title === "string" && action.potion.title.trim()) {
     summary.title = normalizeAgentText(action.potion.title);
   } else if (typeof action.label === "string" && action.label.trim()) {
@@ -9343,8 +10627,8 @@ function getRewardResolutionBlocker(rewardBundle, options) {
   const hasVisibleCardSelection = rewardBundle.card_reward_selection.visible;
 
   if ((cardRewardEntry || hasVisibleCardSelection) &&
-      options.pickCardIndex === undefined &&
-      !options.skipCardReward) {
+    options.pickCardIndex === undefined &&
+    !options.skipCardReward) {
     return {
       reason: "card_choice_required",
       message:
@@ -9366,9 +10650,9 @@ function getRewardResolutionBlocker(rewardBundle, options) {
   }
 
   if (options.claimAllSafeRewards &&
-      options.takePotions &&
-      potionRewards.length > 0 &&
-      rewardBundle.empty_potion_slot_count <= 0) {
+    options.takePotions &&
+    potionRewards.length > 0 &&
+    rewardBundle.empty_potion_slot_count <= 0) {
     return {
       reason: "potion_slots_full",
       message:
@@ -9455,7 +10739,11 @@ async function autoAdvanceProceedChain(session, initialState) {
 
     const baselineStateVersion = state?.state_version ?? null;
     const baselineStateHash = state?.state_hash ?? null;
-    const result = await performBridgeAction(session, "proceed", 1800);
+    const result = await performBridgeAction(
+      session,
+      "proceed",
+      DEFAULT_ACTION_WAIT_MS
+    );
     executedActions.push(summarizeExecutedAction(result));
     state = result.state;
 
@@ -9491,7 +10779,11 @@ async function autoAdvanceRestSiteProceedChain(session, initialState) {
       break;
     }
 
-    const result = await performBridgeAction(session, "rest_site:proceed", 1800);
+    const result = await performBridgeAction(
+      session,
+      "rest_site:proceed",
+      DEFAULT_ACTION_WAIT_MS
+    );
     executedActions.push(summarizeExecutedAction(result));
     state = await waitForRoomExitSettlement(
       session,
@@ -9555,8 +10847,8 @@ function summarizeExecutedAction(result) {
     matched_action: summarizeActionForAgent(result?.matched_action),
     auto_executed_actions: Array.isArray(result?.auto_executed_actions)
       ? result.auto_executed_actions
-          .map((action) => summarizeAutoExecutedActionForAgent(action))
-          .filter((action) => action !== null)
+        .map((action) => summarizeAutoExecutedActionForAgent(action))
+        .filter((action) => action !== null)
       : [],
     post_action_settled: result?.post_action_settled ?? null,
     post_action_settle_reason: result?.post_action_settle_reason ?? null,
@@ -9584,9 +10876,9 @@ function summarizeAutoExecutedActionForAgent(action) {
   return source === null
     ? actionId
     : {
-        action_id: actionId,
-        source
-      };
+      action_id: actionId,
+      source
+    };
 }
 
 function getSessionFilePath() {
@@ -9674,9 +10966,406 @@ function readSessionFile(sessionFilePath) {
 function buildAuthHeaders(session) {
   return session.token
     ? {
-        Authorization: `Bearer ${session.token}`
-      }
+      Authorization: `Bearer ${session.token}`
+    }
     : {};
+}
+
+function getBridgeSessionKey(session) {
+  return JSON.stringify({
+    session_id: typeof session?.session_id === "string" ? session.session_id : null,
+    base_url: typeof session?.base_url === "string" ? session.base_url : null,
+    token: typeof session?.token === "string" ? session.token : null,
+    pid: Number.isInteger(session?.pid) ? session.pid : null
+  });
+}
+
+function getStateVersionValue(state) {
+  return Number.isInteger(state?.state_version) ? state.state_version : null;
+}
+
+function chooseNewerBridgeState(currentState, candidateState) {
+  if (!isPlainObject(candidateState)) {
+    return isPlainObject(currentState) ? currentState : null;
+  }
+
+  if (!isPlainObject(currentState)) {
+    return candidateState;
+  }
+
+  const currentVersion = getStateVersionValue(currentState);
+  const candidateVersion = getStateVersionValue(candidateState);
+  if (currentVersion !== null && candidateVersion !== null) {
+    if (candidateVersion > currentVersion) {
+      return candidateState;
+    }
+
+    if (candidateVersion < currentVersion) {
+      return currentState;
+    }
+
+    return candidateState;
+  }
+
+  if (candidateVersion !== null) {
+    return candidateState;
+  }
+
+  if (currentVersion !== null) {
+    return currentState;
+  }
+
+  return candidateState;
+}
+
+class BridgeEventClient {
+  constructor(session) {
+    this.sessionKey = getBridgeSessionKey(session);
+    this.session = session;
+    this.closed = false;
+    this.started = false;
+    this.connectPromise = null;
+    this.abortController = null;
+    this.latestState = null;
+    this.latestStateReceivedAt = 0;
+    this.waiters = new Set();
+  }
+
+  updateSession(session) {
+    this.session = session;
+  }
+
+  async start() {
+    if (this.closed) {
+      throw new ToolPayloadError(
+        "bridge_event_client_closed",
+        "Bridge event client was already closed."
+      );
+    }
+
+    if (this.started) {
+      return;
+    }
+
+    this.started = true;
+    this.abortController = new AbortController();
+    this.connectPromise = this.runLoop();
+  }
+
+  close() {
+    if (this.closed) {
+      return;
+    }
+
+    this.closed = true;
+    if (this.abortController) {
+      this.abortController.abort();
+    }
+
+    for (const waiter of this.waiters) {
+      clearTimeout(waiter.timeoutHandle);
+      waiter.reject(
+        new ToolPayloadError(
+          "bridge_event_stream_closed",
+          "Bridge event stream client was closed."
+        )
+      );
+    }
+
+    this.waiters.clear();
+  }
+
+  getCachedState(maxAgeMs = BRIDGE_EVENT_CACHE_MAX_AGE_MS) {
+    if (!isPlainObject(this.latestState)) {
+      return null;
+    }
+
+    if (!Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
+      return this.latestState;
+    }
+
+    return Date.now() - this.latestStateReceivedAt <= maxAgeMs
+      ? this.latestState
+      : null;
+  }
+
+  ingestState(state) {
+    if (!isPlainObject(state)) {
+      return null;
+    }
+
+    const adoptedState = chooseNewerBridgeState(this.latestState, state);
+    if (!isPlainObject(adoptedState)) {
+      return null;
+    }
+
+    if (adoptedState !== this.latestState) {
+      this.latestState = adoptedState;
+      this.latestStateReceivedAt = Date.now();
+      this.resolveWaiters(adoptedState);
+      return adoptedState;
+    }
+
+    const currentVersion = getStateVersionValue(this.latestState);
+    const incomingVersion = getStateVersionValue(state);
+    const shouldRefreshTimestamp =
+      incomingVersion === null ||
+      currentVersion === null ||
+      incomingVersion === currentVersion;
+
+    if (shouldRefreshTimestamp) {
+      this.latestStateReceivedAt = Date.now();
+      this.resolveWaiters(this.latestState);
+    }
+
+    return this.latestState;
+  }
+
+  async waitForState(options = {}) {
+    const predicate =
+      typeof options.predicate === "function" ? options.predicate : () => true;
+    const afterStateVersion = Number.isInteger(options.after_state_version)
+      ? options.after_state_version
+      : null;
+    const timeoutMs =
+      Number.isInteger(options.timeout_ms) && options.timeout_ms > 0
+        ? options.timeout_ms
+        : DEFAULT_WAIT_TIMEOUT_MS;
+
+    const currentState = this.getCachedState(Number.POSITIVE_INFINITY);
+    if (
+      isPlainObject(currentState) &&
+      this.doesStateMatchWait(currentState, predicate, afterStateVersion)
+    ) {
+      return currentState;
+    }
+
+    return await new Promise((resolve, reject) => {
+      const waiter = {
+        predicate,
+        afterStateVersion,
+        resolve: (state) => {
+          clearTimeout(waiter.timeoutHandle);
+          this.waiters.delete(waiter);
+          resolve(state);
+        },
+        reject: (error) => {
+          clearTimeout(waiter.timeoutHandle);
+          this.waiters.delete(waiter);
+          reject(error);
+        },
+        timeoutHandle: setTimeout(() => {
+          waiter.reject(
+            new ToolPayloadError(
+              "bridge_event_wait_timeout",
+              `Bridge event stream did not produce a matching state within ${timeoutMs} ms.`,
+              {
+                timeout_ms: timeoutMs,
+                after_state_version: afterStateVersion
+              }
+            )
+          );
+        }, timeoutMs)
+      };
+
+      this.waiters.add(waiter);
+    });
+  }
+
+  doesStateMatchWait(state, predicate, afterStateVersion) {
+    const stateVersion = getStateVersionValue(state);
+    if (afterStateVersion !== null && (!Number.isInteger(stateVersion) || stateVersion <= afterStateVersion)) {
+      return false;
+    }
+
+    return predicate(state) === true;
+  }
+
+  resolveWaiters(state) {
+    for (const waiter of [...this.waiters]) {
+      if (this.doesStateMatchWait(state, waiter.predicate, waiter.afterStateVersion)) {
+        waiter.resolve(state);
+      }
+    }
+  }
+
+  async runLoop() {
+    let reconnectDelayMs = BRIDGE_EVENT_RECONNECT_DELAY_MS;
+    while (!this.closed) {
+      try {
+        await this.connectOnce();
+        reconnectDelayMs = BRIDGE_EVENT_RECONNECT_DELAY_MS;
+      } catch (error) {
+        if (this.closed || error?.name === "AbortError") {
+          return;
+        }
+
+        logDebug(
+          `bridge event stream reconnect scheduled delay_ms=${reconnectDelayMs} error=${sanitizeForLog(error instanceof Error ? error.message : String(error))}`
+        );
+        await delay(reconnectDelayMs);
+        reconnectDelayMs = Math.min(
+          reconnectDelayMs * 2,
+          BRIDGE_EVENT_MAX_RECONNECT_DELAY_MS
+        );
+      }
+    }
+  }
+
+  async connectOnce() {
+    const url = new URL("events", ensureTrailingSlash(this.session.base_url)).toString();
+    const response = await fetch(url, {
+      method: "GET",
+      headers: buildAuthHeaders(this.session),
+      signal: this.abortController.signal
+    });
+
+    if (!response.ok) {
+      const payload = await readJsonResponseBody(response);
+      throw new BridgeHttpError(
+        response.status,
+        payload && typeof payload.error === "string" ? payload.error : "bridge_http_error",
+        payload && typeof payload.message === "string"
+          ? payload.message
+          : `Bridge event stream failed with status ${response.status}.`,
+        {
+          url,
+          method: "GET",
+          status: response.status,
+          payload
+        }
+      );
+    }
+
+    if (!response.body) {
+      throw new ToolPayloadError(
+        "bridge_event_stream_missing_body",
+        "Bridge event stream response did not include a body.",
+        {
+          url
+        }
+      );
+    }
+
+    await consumeSseStream(response.body, (event) => {
+      if (event.event !== "frontier") {
+        return;
+      }
+
+      let payload = null;
+      try {
+        payload = event.data ? JSON.parse(event.data) : null;
+      } catch (error) {
+        logDebug(
+          `bridge event stream payload parse failed error=${sanitizeForLog(error instanceof Error ? error.message : String(error))}`
+        );
+        return;
+      }
+
+      const state = isPlainObject(payload?.state) ? payload.state : null;
+      if (state) {
+        this.ingestState(state);
+      }
+    });
+  }
+}
+
+function ensureBridgeEventClient(session) {
+  const sessionKey = getBridgeSessionKey(session);
+  if (activeBridgeEventClient && activeBridgeEventClient.sessionKey !== sessionKey) {
+    activeBridgeEventClient.close();
+    activeBridgeEventClient = null;
+  }
+
+  if (!activeBridgeEventClient) {
+    activeBridgeEventClient = new BridgeEventClient(session);
+  } else {
+    activeBridgeEventClient.updateSession(session);
+  }
+
+  return activeBridgeEventClient;
+}
+
+async function getLatestBridgeState(session, options = {}) {
+  const client = ensureBridgeEventClient(session);
+  await client.start();
+
+  const forceRefresh = options.force_refresh === true;
+  const cachedState = forceRefresh ? null : client.getCachedState();
+  if (cachedState) {
+    return cachedState;
+  }
+
+  const response = await bridgeRequestJson(session, "state", {
+    method: "GET"
+  });
+  return client.ingestState(response.payload) ?? response.payload;
+}
+
+async function waitForBridgeStateEvent(session, options = {}) {
+  const client = ensureBridgeEventClient(session);
+  await client.start();
+  return await client.waitForState(options);
+}
+
+async function consumeSseStream(stream, onEvent) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    buffer = buffer.replace(/\r\n/g, "\n");
+
+    while (true) {
+      const delimiterIndex = buffer.indexOf("\n\n");
+      if (delimiterIndex < 0) {
+        break;
+      }
+
+      const rawEvent = buffer.slice(0, delimiterIndex);
+      buffer = buffer.slice(delimiterIndex + 2);
+      const parsedEvent = parseSseEvent(rawEvent);
+      if (parsedEvent) {
+        onEvent(parsedEvent);
+      }
+    }
+  }
+}
+
+function parseSseEvent(rawEvent) {
+  if (typeof rawEvent !== "string" || rawEvent.length <= 0) {
+    return null;
+  }
+
+  const lines = rawEvent.split("\n");
+  let eventName = "message";
+  const dataLines = [];
+
+  for (const line of lines) {
+    if (!line || line.startsWith(":")) {
+      continue;
+    }
+
+    if (line.startsWith("event:")) {
+      eventName = line.slice("event:".length).trim() || "message";
+      continue;
+    }
+
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice("data:".length).trimStart());
+    }
+  }
+
+  return {
+    event: eventName,
+    data: dataLines.join("\n")
+  };
 }
 
 async function bridgeRequestJson(session, endpointPath, options) {
@@ -10066,7 +11755,16 @@ function summarizeBridgeErrorPayload(payload) {
   }
 
   if (Array.isArray(payload.available_actions)) {
-    result.available_actions = summarizeActionsForAgent(filterNonAutomationActions(payload.available_actions));
+    result.available_actions = summarizeActionsForAgent(
+      filterNonAutomationActions(payload.available_actions),
+      typeof payload?.current_state?.screen === "string"
+        ? payload.current_state.screen
+        : typeof payload?.state_after?.screen === "string"
+          ? payload.state_after.screen
+          : typeof payload?.state?.screen === "string"
+            ? payload.state.screen
+            : null
+    );
   }
 
   if (isPlainObject(payload.current_state)) {
@@ -10164,14 +11862,49 @@ function attachInteractionHints(payload) {
 
   return Object.keys(hints).length > 0
     ? {
-        ...payload,
-        interaction_hints: hints
-      }
+      ...payload,
+      interaction_hints: hints
+    }
     : payload;
 }
 
+function compactPayloadForMinimalProfile(value) {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+
+  if (Array.isArray(value)) {
+    const items = value
+      .map((entry) => compactPayloadForMinimalProfile(entry))
+      .filter((entry) => entry !== undefined);
+    return items.length > 0 ? items : undefined;
+  }
+
+  if (isPlainObject(value)) {
+    const result = {};
+    for (const [key, entry] of Object.entries(value)) {
+      const compactedEntry = compactPayloadForMinimalProfile(entry);
+      if (compactedEntry === undefined) {
+        continue;
+      }
+      result[key] = compactedEntry;
+    }
+    return Object.keys(result).length > 0 ? result : undefined;
+  }
+
+  if (typeof value === "string" && value.length <= 0) {
+    return undefined;
+  }
+
+  return value;
+}
+
 function asToolResult(payload, isError) {
-  const finalPayload = isError ? payload : compactPayloadForOutput(payload);
+  const compactedPayload = isError ? payload : compactPayloadForOutput(payload);
+  const finalPayload =
+    !isError && ACTIVE_TOOL_PROFILE_NAME === "minimal"
+      ? compactPayloadForMinimalProfile(compactedPayload) ?? {}
+      : compactedPayload;
   return asPrecompactedToolResult(finalPayload, isError);
 }
 
@@ -10273,6 +12006,1831 @@ function safeJson(value) {
     return JSON.stringify(value);
   } catch (error) {
     return JSON.stringify(String(value));
+  }
+}
+
+// ── Journal & Knowledge Tools ──────────────────────────────────────────────
+
+const JOURNAL_ENTRY_START_MARKER = "<!-- sts2-journal-entry";
+const JOURNAL_ENTRY_END_MARKER = "<!-- /sts2-journal-entry -->";
+const JOURNAL_FILE_NAME_PATTERN = /^[A-Za-z0-9._-]+\.md$/;
+
+function getJournalDir() {
+  const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  return path.join(appData, "SlayTheSpire2", "bridge", "journal");
+}
+
+function getMetaFilePath() {
+  return path.join(getJournalDir(), "meta.json");
+}
+
+function createEmptyJournalMeta() {
+  return {
+    active_run: null,
+    active_run_closed: false,
+    summary: "",
+    character: "",
+    runs: []
+  };
+}
+
+function normalizeJournalFileName(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!JOURNAL_FILE_NAME_PATTERN.test(trimmed)) {
+    return null;
+  }
+
+  return trimmed;
+}
+
+function normalizeJournalRunEntry(entry) {
+  if (!isPlainObject(entry)) {
+    return null;
+  }
+
+  const file = normalizeJournalFileName(entry.file);
+  if (file === null) {
+    return null;
+  }
+
+  return {
+    file,
+    character:
+      typeof entry.character === "string" && entry.character.trim()
+        ? entry.character.trim()
+        : "Unknown",
+    result:
+      entry.result === "death" || entry.result === "victory" || entry.result === "in_progress"
+        ? entry.result
+        : "in_progress",
+    floor: Number.isInteger(entry.floor) && entry.floor >= 0 ? entry.floor : 0,
+    summary: typeof entry.summary === "string" ? entry.summary : "",
+    started_at: typeof entry.started_at === "string" ? entry.started_at : null,
+    updated_at: typeof entry.updated_at === "string" ? entry.updated_at : null
+  };
+}
+
+function normalizeJournalMeta(meta) {
+  const normalized = createEmptyJournalMeta();
+  if (!isPlainObject(meta)) {
+    return normalized;
+  }
+
+  normalized.active_run = normalizeJournalFileName(meta.active_run);
+  normalized.active_run_closed = meta.active_run_closed === true;
+  normalized.summary = typeof meta.summary === "string" ? meta.summary : "";
+  normalized.character = typeof meta.character === "string" ? meta.character : "";
+  normalized.runs = Array.isArray(meta.runs)
+    ? meta.runs
+      .map((entry) => normalizeJournalRunEntry(entry))
+      .filter((entry) => entry !== null)
+    : [];
+
+  return normalized;
+}
+
+function readMeta() {
+  const metaPath = getMetaFilePath();
+  if (!fs.existsSync(metaPath)) {
+    return createEmptyJournalMeta();
+  }
+
+  try {
+    return normalizeJournalMeta(JSON.parse(fs.readFileSync(metaPath, "utf8")));
+  } catch (error) {
+    logError("failed to read journal meta.json", error);
+    return createEmptyJournalMeta();
+  }
+}
+
+function writeMeta(meta) {
+  const journalDir = getJournalDir();
+  fs.mkdirSync(journalDir, { recursive: true });
+  fs.writeFileSync(
+    getMetaFilePath(),
+    JSON.stringify(normalizeJournalMeta(meta), null, 2),
+    "utf8"
+  );
+}
+
+function resolveJournalFilePath(fileName) {
+  const normalizedFileName = normalizeJournalFileName(fileName);
+  if (normalizedFileName === null) {
+    throw new ToolPayloadError(
+      "invalid_journal_file",
+      "Journal metadata references an invalid active_run file name.",
+      {
+        active_run: fileName
+      }
+    );
+  }
+
+  return path.join(getJournalDir(), normalizedFileName);
+}
+
+async function tryGetCurrentRunContext() {
+  try {
+    const session = getLiveSession();
+    const state = await getBridgeState(session);
+    const player = isPlainObject(state?.players?.[0]) ? state.players[0] : null;
+    const run = isPlainObject(state?.run) ? state.run : null;
+
+    return {
+      state,
+      character: normalizeAgentText(player?.character?.title) ?? null,
+      total_floor: Number.isInteger(run?.total_floor) ? run.total_floor : null,
+      act_floor: Number.isInteger(run?.act_floor) ? run.act_floor : null,
+      act: normalizeAgentText(run?.act?.title) ?? null,
+      is_game_over: run?.is_game_over === true
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+function upsertJournalRunEntry(meta, fileName, fields = {}) {
+  const normalizedFileName = normalizeJournalFileName(fileName);
+  if (normalizedFileName === null) {
+    return null;
+  }
+
+  let runEntry = meta.runs.find((entry) => entry.file === normalizedFileName) ?? null;
+  if (runEntry === null) {
+    runEntry = normalizeJournalRunEntry({
+      file: normalizedFileName,
+      character: "Unknown",
+      result: "in_progress",
+      floor: 0,
+      summary: "",
+      started_at: fields.started_at ?? new Date().toISOString(),
+      updated_at: fields.updated_at ?? new Date().toISOString()
+    });
+    meta.runs.push(runEntry);
+  }
+
+  if (typeof fields.character === "string" && fields.character.trim()) {
+    runEntry.character = fields.character.trim();
+  }
+  if (typeof fields.result === "string" && fields.result.trim()) {
+    runEntry.result = fields.result;
+  }
+  if (Number.isInteger(fields.floor) && fields.floor >= 0) {
+    runEntry.floor = fields.floor;
+  }
+  if (typeof fields.summary === "string") {
+    runEntry.summary = fields.summary;
+  }
+  if (typeof fields.started_at === "string" && fields.started_at.trim()) {
+    runEntry.started_at = fields.started_at;
+  }
+  if (typeof fields.updated_at === "string" && fields.updated_at.trim()) {
+    runEntry.updated_at = fields.updated_at;
+  }
+
+  return runEntry;
+}
+
+function buildRunJournalPreamble(runContext, startedAt) {
+  const lines = [
+    "# Run Journal",
+    "",
+    `Started: ${startedAt}`
+  ];
+
+  if (typeof runContext?.character === "string" && runContext.character.trim()) {
+    lines.push(`Character: ${runContext.character.trim()}`);
+  }
+  if (Number.isInteger(runContext?.total_floor) && runContext.total_floor >= 0) {
+    lines.push(`Start Floor: ${runContext.total_floor}`);
+  }
+  if (typeof runContext?.act === "string" && runContext.act.trim()) {
+    lines.push(`Act: ${runContext.act.trim()}`);
+  }
+
+  lines.push("", "");
+  return lines.join("\n");
+}
+
+async function prepareActiveJournal(options = {}) {
+  const allowCreate = options.allowCreate !== false;
+  const createWithoutRunContext = options.createWithoutRunContext === true;
+  const meta = readMeta();
+  const runContext =
+    options.runContext !== undefined ? options.runContext : await tryGetCurrentRunContext();
+  const nowIso = new Date().toISOString();
+
+  let filePath = null;
+  if (meta.active_run !== null) {
+    try {
+      filePath = resolveJournalFilePath(meta.active_run);
+    } catch (error) {
+      meta.active_run = null;
+      filePath = null;
+    }
+  }
+
+  const shouldRotateClosedRun =
+    meta.active_run_closed === true &&
+    runContext !== null &&
+    runContext.is_game_over !== true;
+  const activeRunMissing = filePath === null || !fs.existsSync(filePath);
+  const shouldCreateRun =
+    allowCreate &&
+    (activeRunMissing || shouldRotateClosedRun) &&
+    (runContext !== null || createWithoutRunContext);
+
+  if (shouldCreateRun) {
+    const filename = `run_${nowIso.replace(/[:.]/g, "-").slice(0, 19)}.md`;
+    filePath = resolveJournalFilePath(filename);
+    fs.mkdirSync(getJournalDir(), { recursive: true });
+    fs.writeFileSync(filePath, buildRunJournalPreamble(runContext, nowIso), "utf8");
+    meta.active_run = filename;
+    meta.active_run_closed = false;
+    meta.summary = "";
+    meta.character =
+      typeof runContext?.character === "string" && runContext.character.trim()
+        ? runContext.character.trim()
+        : "";
+    upsertJournalRunEntry(meta, filename, {
+      character: meta.character || "Unknown",
+      result: "in_progress",
+      floor:
+        Number.isInteger(runContext?.total_floor) && runContext.total_floor >= 0
+          ? runContext.total_floor
+          : 0,
+      summary: "",
+      started_at: nowIso,
+      updated_at: nowIso
+    });
+    writeMeta(meta);
+    return {
+      meta,
+      filePath,
+      runContext,
+      created: true
+    };
+  }
+
+  if (meta.active_run !== null && filePath !== null) {
+    let changed = false;
+    const normalizedCharacter =
+      typeof runContext?.character === "string" && runContext.character.trim()
+        ? runContext.character.trim()
+        : null;
+    const existingRunEntry =
+      meta.runs.find((entry) => entry.file === meta.active_run) ?? null;
+    const previousFloor = Number.isInteger(existingRunEntry?.floor) ? existingRunEntry.floor : null;
+
+    if (normalizedCharacter !== null && meta.character !== normalizedCharacter) {
+      meta.character = normalizedCharacter;
+      changed = true;
+    }
+
+    const runEntry = upsertJournalRunEntry(meta, meta.active_run, {
+      character: normalizedCharacter ?? undefined,
+      floor:
+        Number.isInteger(runContext?.total_floor) && runContext.total_floor >= 0
+          ? runContext.total_floor
+          : undefined,
+      updated_at: nowIso
+    });
+    if (existingRunEntry === null) {
+      changed = true;
+    } else if (
+      runEntry !== null &&
+      Number.isInteger(runContext?.total_floor) &&
+      runContext.total_floor !== previousFloor
+    ) {
+      changed = true;
+    }
+
+    if (meta.active_run_closed === true && runContext !== null && runContext.is_game_over === true) {
+      // Keep the current closed run selected while still allowing post-mortem notes.
+      changed = changed || false;
+    }
+
+    if (changed) {
+      writeMeta(meta);
+    }
+  }
+
+  return {
+    meta,
+    filePath,
+    runContext,
+    created: false
+  };
+}
+
+function normalizeJournalTags(tags) {
+  return Array.isArray(tags)
+    ? tags
+      .filter((tag) => typeof tag === "string" && tag.trim().length > 0)
+      .map((tag) => tag.trim())
+    : [];
+}
+
+function buildJournalEntrySection(entry, options = {}) {
+  const normalizedTags = normalizeJournalTags(options.tags);
+  const floor = Number.isInteger(options.floor) && options.floor >= 0 ? options.floor : null;
+  const timestamp =
+    typeof options.timestamp === "string" && options.timestamp.trim()
+      ? options.timestamp.trim()
+      : new Date().toISOString().slice(0, 16).replace("T", " ");
+  const metadata = JSON.stringify({
+    floor,
+    tags: normalizedTags,
+    timestamp
+  });
+  const floorLabel = floor !== null ? `F${floor}` : "F?";
+  const tagLabel = normalizedTags.length > 0 ? ` [${normalizedTags.join(", ")}]` : "";
+
+  return `\n${JOURNAL_ENTRY_START_MARKER} ${metadata} -->\n## ${floorLabel}${tagLabel} — ${timestamp}\n\n${entry}\n\n${JOURNAL_ENTRY_END_MARKER}\n`;
+}
+
+function parseLegacyJournalEntries(content) {
+  const normalizedContent = typeof content === "string" ? content.replace(/\r\n/g, "\n") : "";
+  const entries = [];
+  const entryRegex = /^## [\s\S]*?(?=^## |\Z)/gm;
+  let match;
+  while ((match = entryRegex.exec(normalizedContent)) !== null) {
+    const raw = match[0];
+    const firstLine = raw.split("\n", 1)[0] ?? "";
+    const headerMatch = firstLine.match(/^##\s+(F\??\d*)(?:\s+\[([^\]]+)\])?(?:\s+—\s+(.+))?$/);
+    const rawFloorLabel = headerMatch?.[1] ?? null;
+    const floor =
+      typeof rawFloorLabel === "string" && /^F\d+$/.test(rawFloorLabel)
+        ? Number.parseInt(rawFloorLabel.slice(1), 10)
+        : null;
+    const tags =
+      typeof headerMatch?.[2] === "string"
+        ? headerMatch[2]
+          .split(",")
+          .map((tag) => tag.trim())
+          .filter((tag) => tag.length > 0)
+        : [];
+    const timestamp = typeof headerMatch?.[3] === "string" ? headerMatch[3].trim() : null;
+
+    entries.push({
+      raw,
+      floor,
+      tags,
+      timestamp
+    });
+  }
+  return entries;
+}
+
+function parseJournalEntries(content) {
+  const normalizedContent = typeof content === "string" ? content.replace(/\r\n/g, "\n") : "";
+  const entries = [];
+  const markerRegex =
+    /<!-- sts2-journal-entry (\{[^\n]*\}) -->\n([\s\S]*?)\n<!-- \/sts2-journal-entry -->/g;
+  let match;
+
+  while ((match = markerRegex.exec(normalizedContent)) !== null) {
+    let metadata = {};
+    try {
+      metadata = JSON.parse(match[1]);
+    } catch (error) {
+      metadata = {};
+    }
+
+    entries.push({
+      raw: match[0],
+      floor:
+        Number.isInteger(metadata.floor) && metadata.floor >= 0 ? metadata.floor : null,
+      tags: normalizeJournalTags(metadata.tags),
+      timestamp:
+        typeof metadata.timestamp === "string" && metadata.timestamp.trim()
+          ? metadata.timestamp.trim()
+          : null
+    });
+  }
+
+  return entries.length > 0 ? entries : parseLegacyJournalEntries(content);
+}
+
+function filterJournalEntries(entries, options = {}) {
+  const requestedTags = normalizeJournalTags(options.tags).map((tag) => tag.toLowerCase());
+  const lastN = Number.isInteger(options.last_n) && options.last_n > 0 ? options.last_n : 0;
+
+  let filteredEntries = Array.isArray(entries) ? entries : [];
+  if (requestedTags.length > 0) {
+    filteredEntries = filteredEntries.filter((entry) => {
+      const entryTags = normalizeJournalTags(entry?.tags).map((tag) => tag.toLowerCase());
+      return requestedTags.some((tag) => entryTags.includes(tag));
+    });
+  }
+
+  if (lastN > 0 && filteredEntries.length > lastN) {
+    filteredEntries = filteredEntries.slice(-lastN);
+  }
+
+  return filteredEntries;
+}
+
+async function journalWriteTool(args) {
+  try {
+    const entry = requireNonEmptyString(args.entry, "entry");
+    const tags = normalizeJournalTags(args.tags);
+    const providedFloor = typeof args.floor === "number" ? args.floor : null;
+    const prepared = await prepareActiveJournal();
+    if (prepared.meta.active_run === null || prepared.filePath === null) {
+      throw new ToolPayloadError(
+        "journal_unavailable",
+        "Unable to prepare an active journal file."
+      );
+    }
+
+    const floor =
+      providedFloor !== null
+        ? providedFloor
+        : Number.isInteger(prepared.runContext?.total_floor)
+          ? prepared.runContext.total_floor
+          : null;
+    const section = buildJournalEntrySection(entry, {
+      tags,
+      floor
+    });
+    fs.appendFileSync(prepared.filePath, section, "utf8");
+
+    upsertJournalRunEntry(prepared.meta, prepared.meta.active_run, {
+      character: prepared.meta.character || "Unknown",
+      floor: floor ?? undefined,
+      updated_at: new Date().toISOString()
+    });
+    writeMeta(prepared.meta);
+
+    const floorLabel = floor !== null ? `F${floor}` : "F?";
+    logInfo(`journal_write floor=${floorLabel} tags=${tags.join(",")}`);
+    return asToolResult(
+      {
+        ok: true,
+        file: prepared.meta.active_run,
+        floor: floorLabel,
+        tags
+      },
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function journalReadTool(args) {
+  try {
+    const prepared = await prepareActiveJournal({
+      allowCreate: true
+    });
+    if (prepared.meta.active_run === null || prepared.filePath === null) {
+      return asToolResult(
+        {
+          ok: true,
+          content: "",
+          message: "No active run journal found."
+        },
+        false
+      );
+    }
+
+    if (!fs.existsSync(prepared.filePath)) {
+      return asToolResult(
+        {
+          ok: true,
+          content: "",
+          message: "Run journal file not found."
+        },
+        false
+      );
+    }
+
+    const content = fs.readFileSync(prepared.filePath, "utf8");
+    const lastN = typeof args.last_n === "number" ? args.last_n : 0;
+    const filterTags = Array.isArray(args.tags) ? args.tags : [];
+
+    if (lastN <= 0 && filterTags.length === 0) {
+      return asToolResult(
+        {
+          ok: true,
+          file: prepared.meta.active_run,
+          content
+        },
+        false
+      );
+    }
+
+    const entries = parseJournalEntries(content);
+    const filteredEntries = filterJournalEntries(entries, {
+      last_n: lastN,
+      tags: filterTags
+    });
+
+    return asToolResult(
+      {
+        ok: true,
+        file: prepared.meta.active_run,
+        entry_count: filteredEntries.length,
+        content: filteredEntries.map((entry) => entry.raw).join("\n")
+      },
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function journalSummarizeTool(args) {
+  try {
+    const summary = requireNonEmptyString(args.summary, "summary");
+    const result =
+      args.result === "death" || args.result === "victory" || args.result === "in_progress"
+        ? args.result
+        : "in_progress";
+    const runContext = await tryGetCurrentRunContext();
+    const floor =
+      typeof args.floor === "number"
+        ? args.floor
+        : Number.isInteger(runContext?.total_floor)
+          ? runContext.total_floor
+          : null;
+    const prepared = await prepareActiveJournal({
+      allowCreate: true,
+      createWithoutRunContext: true,
+      runContext
+    });
+
+    if (prepared.meta.active_run === null) {
+      throw new ToolPayloadError(
+        "journal_unavailable",
+        "Unable to prepare an active journal file."
+      );
+    }
+
+    prepared.meta.summary = summary;
+    if (typeof runContext?.character === "string" && runContext.character.trim()) {
+      prepared.meta.character = runContext.character.trim();
+    }
+    prepared.meta.active_run_closed = result === "death" || result === "victory";
+
+    upsertJournalRunEntry(prepared.meta, prepared.meta.active_run, {
+      character: prepared.meta.character || "Unknown",
+      result,
+      floor: floor ?? undefined,
+      summary,
+      updated_at: new Date().toISOString()
+    });
+
+    writeMeta(prepared.meta);
+    logInfo(`journal_summarize result=${result} floor=${floor}`);
+    return asToolResult(
+      {
+        ok: true,
+        summary,
+        result,
+        floor
+      },
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function journalGetSummaryTool(args) {
+  try {
+    const prepared = await prepareActiveJournal({
+      allowCreate: true
+    });
+    return asToolResult(
+      {
+        ok: true,
+        active_run: prepared.meta.active_run,
+        active_run_closed: prepared.meta.active_run_closed === true,
+        summary: prepared.meta.summary || "(no summary yet)",
+        character: prepared.meta.character || "Unknown",
+        total_runs: prepared.meta.runs.length
+      },
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function journalListRunsTool(args) {
+  try {
+    const meta = readMeta();
+    let runs = meta.runs || [];
+    const lastN = typeof args.last_n === "number" ? args.last_n : 0;
+    if (lastN > 0 && runs.length > lastN) {
+      runs = runs.slice(-lastN);
+    }
+    return asToolResult(
+      {
+        ok: true,
+        active_run: meta.active_run,
+        active_run_closed: meta.active_run_closed === true,
+        total_runs: meta.runs.length,
+        runs
+      },
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+const OBSERVATION_ENTRY_START_MARKER = "<!-- sts2-observation-entry";
+const OBSERVATION_ENTRY_END_MARKER = "<!-- /sts2-observation-entry -->";
+
+function getKnowledgeObservationDir() {
+  if (process.env.STS2_KNOWLEDGE_OBSERVATION_DIR) {
+    return path.resolve(process.env.STS2_KNOWLEDGE_OBSERVATION_DIR);
+  }
+
+  const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  return path.join(appData, "SlayTheSpire2", "bridge", "knowledge-observations");
+}
+
+function normalizeObservationDomain(value, fieldName = "domain") {
+  const domain = requireNonEmptyString(value, fieldName);
+  if (!OBSERVATION_DOMAIN_ENUM.includes(domain)) {
+    throw new ToolPayloadError(
+      "invalid_arguments",
+      `${fieldName} must be one of: ${OBSERVATION_DOMAIN_ENUM.join(", ")}`,
+      {
+        field: fieldName,
+        valid_domains: OBSERVATION_DOMAIN_ENUM
+      }
+    );
+  }
+
+  return domain;
+}
+
+function normalizeObservationSourceType(value, fieldName = "source_type") {
+  const sourceType = optionalString(value, fieldName) ?? "observed";
+  const validSourceTypes = ["observed", "journaled", "inferred", "external"];
+  if (!validSourceTypes.includes(sourceType)) {
+    throw new ToolPayloadError(
+      "invalid_arguments",
+      `${fieldName} must be one of: ${validSourceTypes.join(", ")}`,
+      {
+        field: fieldName,
+        valid_source_types: validSourceTypes
+      }
+    );
+  }
+
+  return sourceType;
+}
+
+function normalizeObservationConfidence(value, fieldName = "confidence") {
+  const confidence = optionalString(value, fieldName) ?? "medium";
+  const validConfidenceValues = ["low", "medium", "high"];
+  if (!validConfidenceValues.includes(confidence)) {
+    throw new ToolPayloadError(
+      "invalid_arguments",
+      `${fieldName} must be one of: ${validConfidenceValues.join(", ")}`,
+      {
+        field: fieldName,
+        valid_confidence_values: validConfidenceValues
+      }
+    );
+  }
+
+  return confidence;
+}
+
+function sanitizeObservationFileSegment(value) {
+  const normalized = requireNonEmptyString(value, "entity_name")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[. ]+$/g, "")
+    .slice(0, 80);
+
+  return normalized || "entity";
+}
+
+function getObservationDomainDir(domain) {
+  return path.join(getKnowledgeObservationDir(), domain);
+}
+
+function buildObservationPreamble(domain, entityName, createdAt) {
+  return [
+    `# Observation: ${entityName}`,
+    "",
+    `Domain: ${domain}`,
+    `Entity: ${entityName}`,
+    `Created: ${createdAt}`,
+    "",
+    "> Observation logs are evidence-first working notes. Promote only verified conclusions into canonical knowledge.",
+    "",
+    ""
+  ].join("\n");
+}
+
+function buildObservationEntrySection(observation, options = {}) {
+  const timestamp =
+    typeof options.timestamp === "string" && options.timestamp.trim()
+      ? options.timestamp.trim()
+      : new Date().toISOString();
+  const metadata = {
+    timestamp,
+    source_type: normalizeObservationSourceType(options.source_type),
+    confidence: normalizeObservationConfidence(options.confidence),
+    source_tool: optionalString(options.source_tool, "source_tool") ?? null,
+    source_ref: optionalString(options.source_ref, "source_ref") ?? null,
+    state_version: Number.isInteger(options.state_version) ? options.state_version : null,
+    tags: normalizeJournalTags(options.tags)
+  };
+  const headingParts = [timestamp];
+  if (metadata.source_type) {
+    headingParts.push(metadata.source_type);
+  }
+  if (metadata.confidence) {
+    headingParts.push(metadata.confidence);
+  }
+
+  return `\n${OBSERVATION_ENTRY_START_MARKER} ${JSON.stringify(metadata)} -->\n## ${headingParts.join(" | ")}\n\n${observation}\n\n${OBSERVATION_ENTRY_END_MARKER}\n`;
+}
+
+function parseObservationHeader(content) {
+  const normalizedContent = typeof content === "string" ? content.replace(/\r\n/g, "\n") : "";
+  const lines = normalizedContent.split("\n");
+  let entityName = null;
+  let domain = null;
+  let createdAt = null;
+
+  for (const line of lines.slice(0, 12)) {
+    if (entityName === null) {
+      const headingMatch = line.match(/^# Observation:\s+(.+?)\s*$/);
+      if (headingMatch) {
+        entityName = headingMatch[1].trim();
+        continue;
+      }
+    }
+    if (domain === null) {
+      const domainMatch = line.match(/^Domain:\s+(.+?)\s*$/);
+      if (domainMatch) {
+        domain = domainMatch[1].trim();
+        continue;
+      }
+    }
+    if (createdAt === null) {
+      const createdMatch = line.match(/^Created:\s+(.+?)\s*$/);
+      if (createdMatch) {
+        createdAt = createdMatch[1].trim();
+      }
+    }
+  }
+
+  return {
+    domain,
+    entity_name: entityName,
+    created_at: createdAt
+  };
+}
+
+function parseObservationEntries(content) {
+  const normalizedContent = typeof content === "string" ? content.replace(/\r\n/g, "\n") : "";
+  const entries = [];
+  const markerRegex =
+    /<!-- sts2-observation-entry (\{[^\n]*\}) -->\n([\s\S]*?)\n<!-- \/sts2-observation-entry -->/g;
+  let match;
+
+  while ((match = markerRegex.exec(normalizedContent)) !== null) {
+    let metadata = {};
+    try {
+      metadata = JSON.parse(match[1]);
+    } catch (error) {
+      metadata = {};
+    }
+
+    entries.push({
+      raw: match[0],
+      body: match[2],
+      timestamp:
+        typeof metadata.timestamp === "string" && metadata.timestamp.trim()
+          ? metadata.timestamp.trim()
+          : null,
+      source_type:
+        typeof metadata.source_type === "string" && metadata.source_type.trim()
+          ? metadata.source_type.trim()
+          : null,
+      confidence:
+        typeof metadata.confidence === "string" && metadata.confidence.trim()
+          ? metadata.confidence.trim()
+          : null,
+      source_tool:
+        typeof metadata.source_tool === "string" && metadata.source_tool.trim()
+          ? metadata.source_tool.trim()
+          : null,
+      source_ref:
+        typeof metadata.source_ref === "string" && metadata.source_ref.trim()
+          ? metadata.source_ref.trim()
+          : null,
+      state_version: Number.isInteger(metadata.state_version) ? metadata.state_version : null,
+      tags: normalizeJournalTags(metadata.tags)
+    });
+  }
+
+  return entries;
+}
+
+function findObservationEntityFilePath(domain, entityName) {
+  const directPath = path.join(getObservationDomainDir(domain), `${sanitizeObservationFileSegment(entityName)}.md`);
+  if (fs.existsSync(directPath)) {
+    return directPath;
+  }
+
+  const domainDir = getObservationDomainDir(domain);
+  if (!fs.existsSync(domainDir)) {
+    return null;
+  }
+
+  const requestedKey = normalizeTextComparisonKey(entityName);
+  if (requestedKey === null) {
+    return null;
+  }
+
+  for (const entry of fs.readdirSync(domainDir, { withFileTypes: true })) {
+    if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== ".md") {
+      continue;
+    }
+
+    const filePath = path.join(domainDir, entry.name);
+    const header = parseObservationHeader(fs.readFileSync(filePath, "utf8"));
+    if (normalizeTextComparisonKey(header.entity_name) === requestedKey) {
+      return filePath;
+    }
+  }
+
+  return null;
+}
+
+function ensureObservationEntityDocument(domain, entityName) {
+  const filePath =
+    findObservationEntityFilePath(domain, entityName) ??
+    path.join(getObservationDomainDir(domain), `${sanitizeObservationFileSegment(entityName)}.md`);
+  const exists = fs.existsSync(filePath);
+
+  if (!exists) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(
+      filePath,
+      buildObservationPreamble(domain, entityName, new Date().toISOString()),
+      "utf8"
+    );
+  }
+
+  const content = fs.readFileSync(filePath, "utf8");
+  const header = parseObservationHeader(content);
+  const entries = parseObservationEntries(content);
+  return {
+    file_path: filePath,
+    content,
+    header,
+    entries
+  };
+}
+
+function readObservationEntityDocument(domain, entityName) {
+  const filePath = findObservationEntityFilePath(domain, entityName);
+  if (filePath === null || !fs.existsSync(filePath)) {
+    return null;
+  }
+
+  const content = fs.readFileSync(filePath, "utf8");
+  const header = parseObservationHeader(content);
+  const entries = parseObservationEntries(content);
+  return {
+    file_path: filePath,
+    content,
+    header,
+    entries
+  };
+}
+
+function summarizeObservationEntityDocument(domain, document) {
+  if (!document || !isPlainObject(document)) {
+    return null;
+  }
+
+  const stat = fs.statSync(document.file_path);
+  const lastEntry = document.entries.length > 0 ? document.entries[document.entries.length - 1] : null;
+  return {
+    domain,
+    entity_name: document.header?.entity_name ?? null,
+    file_path: document.file_path,
+    entry_count: document.entries.length,
+    created_at: document.header?.created_at ?? null,
+    updated_at: stat.mtime.toISOString(),
+    last_source_type: lastEntry?.source_type ?? null,
+    last_confidence: lastEntry?.confidence ?? null,
+    last_tags: Array.isArray(lastEntry?.tags) ? lastEntry.tags : []
+  };
+}
+
+async function recordObservationTool(args) {
+  try {
+    const domain = normalizeObservationDomain(args.domain);
+    const entityName = requireNonEmptyString(args.entity_name, "entity_name");
+    const observation = requireNonEmptyString(args.observation, "observation");
+    const sourceType = normalizeObservationSourceType(args.source_type);
+    const confidence = normalizeObservationConfidence(args.confidence);
+    const sourceTool = optionalString(args.source_tool, "source_tool");
+    const sourceRef = optionalString(args.source_ref, "source_ref");
+    const stateVersion = optionalInteger(args.state_version, "state_version");
+    const tags = normalizeJournalTags(args.tags);
+
+    const document = ensureObservationEntityDocument(domain, entityName);
+    const entrySection = buildObservationEntrySection(observation, {
+      source_type: sourceType,
+      confidence,
+      source_tool: sourceTool,
+      source_ref: sourceRef,
+      state_version: stateVersion,
+      tags
+    });
+    fs.appendFileSync(document.file_path, entrySection, "utf8");
+
+    const updatedDocument = readObservationEntityDocument(domain, entityName);
+    const summary = summarizeObservationEntityDocument(domain, updatedDocument);
+    return asToolResult(
+      {
+        ok: true,
+        domain,
+        entity_name: entityName,
+        source_type: sourceType,
+        confidence,
+        file_path: document.file_path,
+        entry_count: updatedDocument?.entries.length ?? 0,
+        summary
+      },
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function listObservationEntitiesTool(args) {
+  try {
+    const requestedDomain =
+      args.domain === undefined || args.domain === null
+        ? null
+        : normalizeObservationDomain(args.domain);
+    const query = optionalString(args.query, "query");
+    const queryKey = normalizeTextComparisonKey(query);
+    const maxResults = clampInteger(args.max_results, 50, 1, 200, "max_results");
+    const domains = requestedDomain ? [requestedDomain] : OBSERVATION_DOMAIN_ENUM;
+    const entities = [];
+
+    for (const domain of domains) {
+      const domainDir = getObservationDomainDir(domain);
+      if (!fs.existsSync(domainDir)) {
+        continue;
+      }
+
+      for (const entry of fs.readdirSync(domainDir, { withFileTypes: true })) {
+        if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== ".md") {
+          continue;
+        }
+
+        const filePath = path.join(domainDir, entry.name);
+        const content = fs.readFileSync(filePath, "utf8");
+        const document = {
+          file_path: filePath,
+          content,
+          header: parseObservationHeader(content),
+          entries: parseObservationEntries(content)
+        };
+        const summary = summarizeObservationEntityDocument(domain, document);
+        if (summary === null) {
+          continue;
+        }
+
+        if (
+          queryKey !== null &&
+          normalizeTextComparisonKey(summary.entity_name) !== queryKey &&
+          !(normalizeTextComparisonKey(summary.entity_name)?.includes(queryKey))
+        ) {
+          continue;
+        }
+
+        entities.push(summary);
+      }
+    }
+
+    entities.sort((left, right) => {
+      const leftTime = Date.parse(left.updated_at || "") || 0;
+      const rightTime = Date.parse(right.updated_at || "") || 0;
+      if (leftTime !== rightTime) {
+        return rightTime - leftTime;
+      }
+      return String(left.entity_name ?? "").localeCompare(String(right.entity_name ?? ""), "zh-Hans-CN");
+    });
+
+    return asToolResult(
+      {
+        ok: true,
+        domain: requestedDomain,
+        query: query ?? null,
+        entity_count: entities.length,
+        entities: entities.slice(0, maxResults)
+      },
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function readObservationEntityTool(args) {
+  try {
+    const domain = normalizeObservationDomain(args.domain);
+    const entityName = requireNonEmptyString(args.entity_name, "entity_name");
+    const lastN = optionalInteger(args.last_n, "last_n");
+    const document = readObservationEntityDocument(domain, entityName);
+    if (document === null) {
+      return asToolResult(
+        {
+          ok: false,
+          error: "observation_not_found",
+          domain,
+          entity_name: entityName
+        },
+        true
+      );
+    }
+
+    const selectedEntries =
+      Number.isInteger(lastN) && lastN > 0 && document.entries.length > lastN
+        ? document.entries.slice(-lastN)
+        : document.entries;
+    const preamble = buildObservationPreamble(
+      document.header?.domain ?? domain,
+      document.header?.entity_name ?? entityName,
+      document.header?.created_at ?? ""
+    );
+    return asToolResult(
+      {
+        ok: true,
+        domain,
+        entity_name: document.header?.entity_name ?? entityName,
+        file_path: document.file_path,
+        entry_count_total: document.entries.length,
+        entry_count_returned: selectedEntries.length,
+        content: `${preamble}${selectedEntries.map((entry) => entry.raw).join("\n")}`.trim()
+      },
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+function getKnowledgeDir() {
+  return path.join(__dirname, "knowledge");
+}
+
+const KNOWLEDGE_CANONICAL_TOPICS = [
+  "route-planning",
+  "deck-building",
+  "card-tier-list",
+  "combat-tips",
+  "boss-guide",
+  "enemy-patterns",
+  "relics",
+  "events",
+  "knowledge-authoring"
+];
+
+const VALID_KNOWLEDGE_TOPICS = [
+  ...KNOWLEDGE_CANONICAL_TOPICS,
+  "regent",
+  "routes",
+  "decks",
+  "cards",
+  "combat",
+  "bosses",
+  "enemies",
+  "templates",
+  "authoring"
+];
+
+const KNOWLEDGE_TOPIC_ALIASES = {
+  regent: "card-tier-list",
+  routes: "route-planning",
+  decks: "deck-building",
+  cards: "card-tier-list",
+  combat: "combat-tips",
+  bosses: "boss-guide",
+  enemies: "enemy-patterns",
+  templates: "knowledge-authoring",
+  authoring: "knowledge-authoring"
+};
+
+const KNOWLEDGE_TOPIC_METADATA = {
+  "route-planning": {
+    domain: "routes",
+    description: "Pathing priorities, node valuation, and act-level routing heuristics.",
+    decision_focus: "Choose routes by current deck weakness, recovery windows, and elite tolerance."
+  },
+  "deck-building": {
+    domain: "decks",
+    description: "How to shape a deck across offense, defense, draw, energy, and scaling.",
+    decision_focus: "Fill missing combat roles before adding narrow payoff or win-more cards."
+  },
+  "card-tier-list": {
+    domain: "cards",
+    description: "Role-based card evaluations and when to pick, skip, or upgrade them.",
+    decision_focus: "Judge cards by role fit, landing speed, and near-term matchup impact."
+  },
+  "combat-tips": {
+    domain: "combat",
+    description: "Turn planning, potion timing, lethal checks, and common combat heuristics.",
+    decision_focus: "Decide each turn by incoming damage, lethal windows, and future safety."
+  },
+  "boss-guide": {
+    domain: "enemies",
+    description: "Boss-by-boss preparation, danger windows, and matchup-specific tactics.",
+    decision_focus: "Prepare specific answers for each boss instead of relying on generic strength."
+  },
+  "enemy-patterns": {
+    domain: "enemies",
+    description: "Enemy intent patterns, breakpoints, and fight-specific execution notes.",
+    decision_focus: "Classify fights by threat model, then choose kill order and resource timing."
+  },
+  relics: {
+    domain: "relics",
+    description: "Relic evaluation rules, synergy buckets, and route/shop implications.",
+    decision_focus: "Evaluate relics by tempo, economy, scaling, and what route choices they unlock."
+  },
+  events: {
+    domain: "events",
+    description: "Event risk-reward patterns, sacrifice rules, and decision heuristics.",
+    decision_focus: "Take events by current HP, deck stability, and whether the upside solves a real problem."
+  },
+  "knowledge-authoring": {
+    domain: "authoring",
+    description: "Template rules and observation-first workflow for MCP-managed knowledge authoring.",
+    decision_focus: "Record evidence first, then promote only verified conclusions into canonical knowledge."
+  }
+};
+
+function resolveKnowledgeTopic(topic, fieldName = "topic") {
+  const rawTopic = requireNonEmptyString(topic, fieldName);
+  if (!VALID_KNOWLEDGE_TOPICS.includes(rawTopic)) {
+    throw new ToolPayloadError(
+      "invalid_arguments",
+      `${fieldName} must be one of: ${VALID_KNOWLEDGE_TOPICS.join(", ")}`,
+      {
+        field: fieldName,
+        valid_topics: VALID_KNOWLEDGE_TOPICS
+      }
+    );
+  }
+
+  return KNOWLEDGE_TOPIC_ALIASES[rawTopic] ?? rawTopic;
+}
+
+function normalizeKnowledgeTopics(topics, fieldName = "topics") {
+  if (topics === undefined || topics === null) {
+    return [...KNOWLEDGE_CANONICAL_TOPICS];
+  }
+
+  const rawTopics = requireNonEmptyStringArray(topics, fieldName);
+  const normalizedTopics = [];
+  for (const rawTopic of rawTopics) {
+    const topic = resolveKnowledgeTopic(rawTopic, fieldName);
+    if (!normalizedTopics.includes(topic)) {
+      normalizedTopics.push(topic);
+    }
+  }
+
+  return normalizedTopics;
+}
+
+function readKnowledgeDocumentByTopic(topic) {
+  const filePath = path.join(getKnowledgeDir(), `${topic}.md`);
+  if (!fs.existsSync(filePath)) {
+    throw new ToolPayloadError(
+      "knowledge_not_found",
+      `Knowledge file not found: ${topic}.md. Create it at ${filePath}`,
+      {
+        topic,
+        file_path: filePath
+      }
+    );
+  }
+
+  const content = fs.readFileSync(filePath, "utf8");
+  const lines = content.split(/\r?\n/);
+  const sections = parseKnowledgeSections(lines);
+
+  return {
+    topic,
+    file_path: filePath,
+    content,
+    lines,
+    sections
+  };
+}
+
+function getKnowledgeTopicAliases(topic) {
+  return Object.entries(KNOWLEDGE_TOPIC_ALIASES)
+    .filter(([, canonicalTopic]) => canonicalTopic === topic)
+    .map(([alias]) => alias);
+}
+
+function parseKnowledgeSections(lines) {
+  const sections = [];
+  const pathStack = [];
+  let inFence = false;
+  let fenceMarker = null;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    const fenceMatch = trimmed.match(/^(```+|~~~+)/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1][0];
+      if (!inFence) {
+        inFence = true;
+        fenceMarker = marker;
+      } else if (fenceMarker === marker) {
+        inFence = false;
+        fenceMarker = null;
+      }
+      continue;
+    }
+
+    if (inFence) {
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (!headingMatch) {
+      continue;
+    }
+
+    const level = headingMatch[1].length;
+    const title = headingMatch[2].replace(/\s+#+\s*$/, "").trim();
+    if (!title) {
+      continue;
+    }
+
+    pathStack[level - 1] = title;
+    pathStack.length = level;
+
+    sections.push({
+      level,
+      title,
+      start_line: index + 1,
+      end_line: lines.length,
+      path: [...pathStack],
+      path_text: pathStack.join(" > ")
+    });
+  }
+
+  const openSectionIndexes = [];
+  for (let index = 0; index < sections.length; index += 1) {
+    const current = sections[index];
+    while (
+      openSectionIndexes.length > 0 &&
+      sections[openSectionIndexes[openSectionIndexes.length - 1]].level >= current.level
+    ) {
+      const previousIndex = openSectionIndexes.pop();
+      sections[previousIndex].end_line = current.start_line - 1;
+    }
+    openSectionIndexes.push(index);
+  }
+
+  while (openSectionIndexes.length > 0) {
+    const previousIndex = openSectionIndexes.pop();
+    sections[previousIndex].end_line = lines.length;
+  }
+
+  return sections;
+}
+
+function getKnowledgeSectionForLine(sections, lineNumber) {
+  if (!Array.isArray(sections) || !Number.isInteger(lineNumber) || lineNumber <= 0) {
+    return null;
+  }
+
+  let matchedSection = null;
+  for (const section of sections) {
+    if (
+      Number.isInteger(section.start_line) &&
+      Number.isInteger(section.end_line) &&
+      section.start_line <= lineNumber &&
+      section.end_line >= lineNumber
+    ) {
+      if (matchedSection === null || section.level >= matchedSection.level) {
+        matchedSection = section;
+      }
+    }
+  }
+
+  return matchedSection;
+}
+
+function buildKnowledgeSectionPreview(lines, section) {
+  if (!Array.isArray(lines) || !isPlainObject(section)) {
+    return null;
+  }
+
+  const startIndex = Math.max(0, section.start_line);
+  const endIndex = Math.min(lines.length, section.end_line);
+  for (let index = startIndex; index < endIndex; index += 1) {
+    const line = typeof lines[index] === "string" ? lines[index].trim() : "";
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+    return line.length > 160 ? `${line.slice(0, 157)}...` : line;
+  }
+
+  return null;
+}
+
+function buildKnowledgeDocumentSummary(lines) {
+  if (!Array.isArray(lines)) {
+    return null;
+  }
+
+  let inFence = false;
+  let fenceMarker = null;
+  for (const rawLine of lines) {
+    const trimmed = typeof rawLine === "string" ? rawLine.trim() : "";
+    if (!trimmed) {
+      continue;
+    }
+
+    const fenceMatch = trimmed.match(/^(```+|~~~+)/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1][0];
+      if (!inFence) {
+        inFence = true;
+        fenceMarker = marker;
+      } else if (fenceMarker === marker) {
+        inFence = false;
+        fenceMarker = null;
+      }
+      continue;
+    }
+
+    if (inFence || /^#{1,6}\s+/.test(trimmed)) {
+      continue;
+    }
+
+    const normalized = trimmed.replace(/^[-*+]\s+/, "").replace(/^\d+\.\s+/, "");
+    if (!normalized) {
+      continue;
+    }
+
+    return normalized.length > 200 ? `${normalized.slice(0, 197)}...` : normalized;
+  }
+
+  return null;
+}
+
+function matchKnowledgeHeading(section, heading, caseSensitive) {
+  if (!isPlainObject(section) || typeof heading !== "string") {
+    return false;
+  }
+
+  const target = caseSensitive ? heading : heading.toLowerCase();
+  const title = caseSensitive ? section.title : section.title.toLowerCase();
+  const pathText = caseSensitive ? section.path_text : section.path_text.toLowerCase();
+  return title === target || pathText === target;
+}
+
+function matchKnowledgeSectionPath(section, sectionPath, caseSensitive) {
+  if (!isPlainObject(section) || !Array.isArray(sectionPath) || !Array.isArray(section.path)) {
+    return false;
+  }
+
+  if (section.path.length !== sectionPath.length) {
+    return false;
+  }
+
+  for (let index = 0; index < sectionPath.length; index += 1) {
+    const expected = caseSensitive ? sectionPath[index] : sectionPath[index].toLowerCase();
+    const actual = caseSensitive ? section.path[index] : section.path[index].toLowerCase();
+    if (expected !== actual) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function summarizeKnowledgeSection(section, lines) {
+  return {
+    level: section.level,
+    title: section.title,
+    path: section.path,
+    path_text: section.path_text,
+    start_line: section.start_line,
+    end_line: section.end_line,
+    line_count:
+      Number.isInteger(section.start_line) && Number.isInteger(section.end_line)
+        ? section.end_line - section.start_line + 1
+        : null,
+    preview: buildKnowledgeSectionPreview(lines, section)
+  };
+}
+
+function summarizeKnowledgeTopic(document) {
+  const metadata = KNOWLEDGE_TOPIC_METADATA[document.topic] ?? {};
+  const topLevelSections = document.sections.filter((section) => section.level === 1);
+  const previewSections =
+    topLevelSections.length > 0 ? topLevelSections : document.sections;
+
+  return {
+    topic: document.topic,
+    file_path: document.file_path,
+    domain: metadata.domain ?? null,
+    aliases: getKnowledgeTopicAliases(document.topic),
+    description: metadata.description ?? null,
+    decision_focus: metadata.decision_focus ?? null,
+    summary: buildKnowledgeDocumentSummary(document.lines),
+    line_count: document.lines.length,
+    section_count: document.sections.length,
+    top_level_sections: previewSections
+      .slice(0, 5)
+      .map((section) => summarizeKnowledgeSection(section, document.lines))
+  };
+}
+
+function summarizeKnowledgeDomains(topics) {
+  const domainMap = new Map();
+  for (const topic of Array.isArray(topics) ? topics : []) {
+    if (!isPlainObject(topic) || typeof topic.topic !== "string") {
+      continue;
+    }
+
+    const domain =
+      typeof topic.domain === "string" && topic.domain.trim() ? topic.domain.trim() : "other";
+    const current = domainMap.get(domain) ?? [];
+    current.push(topic.topic);
+    domainMap.set(domain, current);
+  }
+
+  return [...domainMap.entries()]
+    .map(([domain, topicNames]) => ({
+      domain,
+      topics: topicNames
+    }))
+    .sort((left, right) => left.domain.localeCompare(right.domain));
+}
+
+async function getKnowledgeTool(args) {
+  try {
+    const rawTopic = requireNonEmptyString(args.topic, "topic");
+    if (!VALID_KNOWLEDGE_TOPICS.includes(rawTopic)) {
+      return asToolResult({
+        ok: false,
+        error: "invalid_topic",
+        message: `Unknown topic '${rawTopic}'. Valid: ${VALID_KNOWLEDGE_TOPICS.join(", ")}`,
+        valid_topics: VALID_KNOWLEDGE_TOPICS
+      }, true);
+    }
+
+    const topic = KNOWLEDGE_TOPIC_ALIASES[rawTopic] ?? rawTopic;
+    const document = readKnowledgeDocumentByTopic(topic);
+    return asToolResult({ ok: true, topic, content: document.content }, false);
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function getKnowledgeTopicsTool() {
+  try {
+    const topics = KNOWLEDGE_CANONICAL_TOPICS.map((topic) =>
+      summarizeKnowledgeTopic(readKnowledgeDocumentByTopic(topic))
+    );
+    return asToolResult(
+      {
+        ok: true,
+        topic_count: topics.length,
+        canonical_topics: KNOWLEDGE_CANONICAL_TOPICS,
+        accepted_topics: VALID_KNOWLEDGE_TOPICS,
+        aliases: KNOWLEDGE_TOPIC_ALIASES,
+        domains: summarizeKnowledgeDomains(topics),
+        topics
+      },
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function searchKnowledgeTool(args) {
+  try {
+    const query = requireNonEmptyString(args.query, "query");
+    const topics = normalizeKnowledgeTopics(args.topics, "topics");
+    const caseSensitive = optionalBoolean(args.case_sensitive, "case_sensitive") ?? false;
+    const useRegex = optionalBoolean(args.regex, "regex") ?? false;
+    const contextBefore = clampInteger(args.context_before, 1, 0, 20, "context_before");
+    const contextAfter = clampInteger(args.context_after, 1, 0, 20, "context_after");
+    const maxResults = clampInteger(args.max_results, 20, 1, 100, "max_results");
+
+    let regex = null;
+    if (useRegex) {
+      try {
+        regex = new RegExp(query, caseSensitive ? "" : "i");
+      } catch (error) {
+        throw new ToolPayloadError(
+          "invalid_arguments",
+          `query must be a valid regular expression when regex=true: ${error instanceof Error ? error.message : String(error)}`,
+          {
+            field: "query"
+          }
+        );
+      }
+    }
+
+    const results = [];
+    let truncated = false;
+
+    outer: for (const topic of topics) {
+      const document = readKnowledgeDocumentByTopic(topic);
+      for (let index = 0; index < document.lines.length; index += 1) {
+        const line = document.lines[index];
+        const haystack = caseSensitive ? line : line.toLowerCase();
+        const needle = caseSensitive ? query : query.toLowerCase();
+        const matchIndex = useRegex
+          ? line.search(regex)
+          : haystack.indexOf(needle);
+
+        if (matchIndex < 0) {
+          continue;
+        }
+
+        const lineNumber = index + 1;
+        const section = getKnowledgeSectionForLine(document.sections, lineNumber);
+        const contextStartLine = Math.max(1, lineNumber - contextBefore);
+        const contextEndLine = Math.min(document.lines.length, lineNumber + contextAfter);
+
+        results.push({
+          topic,
+          line: lineNumber,
+          column: matchIndex + 1,
+          heading_path: section?.path ?? [],
+          heading_path_text: section?.path_text ?? null,
+          section_start_line: section?.start_line ?? null,
+          section_end_line: section?.end_line ?? null,
+          match_text: line,
+          context: {
+            start_line: contextStartLine,
+            end_line: contextEndLine,
+            text: document.lines
+              .slice(contextStartLine - 1, contextEndLine)
+              .join("\n")
+          }
+        });
+
+        if (results.length >= maxResults) {
+          truncated = true;
+          break outer;
+        }
+      }
+    }
+
+    return asToolResult(
+      {
+        ok: true,
+        query,
+        regex: useRegex,
+        case_sensitive: caseSensitive,
+        searched_topics: topics,
+        result_count: results.length,
+        truncated,
+        results
+      },
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function readKnowledgeSliceTool(args) {
+  try {
+    const topic = resolveKnowledgeTopic(args.topic, "topic");
+    const heading = optionalString(args.heading, "heading");
+    const sectionPath =
+      args.section_path === undefined || args.section_path === null
+        ? undefined
+        : requireNonEmptyStringArray(args.section_path, "section_path");
+    const occurrence = clampInteger(args.occurrence, 1, 1, 50, "occurrence");
+    const caseSensitive = optionalBoolean(args.case_sensitive, "case_sensitive") ?? false;
+    const startLine = optionalInteger(args.start_line, "start_line");
+    const endLine = optionalInteger(args.end_line, "end_line");
+    const maxLines = clampInteger(args.max_lines, undefined, 1, 400, "max_lines");
+
+    const usingHeading = heading !== undefined && heading !== null;
+    const usingSectionPath = Array.isArray(sectionPath) && sectionPath.length > 0;
+    const usingLineRange = startLine !== undefined || endLine !== undefined;
+
+    const selectorCount =
+      (usingHeading ? 1 : 0) + (usingSectionPath ? 1 : 0) + (usingLineRange ? 1 : 0);
+
+    if (selectorCount > 1) {
+      throw new ToolPayloadError(
+        "invalid_arguments",
+        "Use exactly one selector: section_path, heading, or start_line/end_line.",
+        {
+          fields: ["section_path", "heading", "start_line", "end_line"]
+        }
+      );
+    }
+
+    if (selectorCount <= 0) {
+      throw new ToolPayloadError(
+        "invalid_arguments",
+        "Provide exactly one selector: section_path, heading, or a start_line/end_line line range.",
+        {
+          fields: ["section_path", "heading", "start_line", "end_line"]
+        }
+      );
+    }
+
+    if (!usingHeading && !usingSectionPath && startLine === undefined) {
+      throw new ToolPayloadError(
+        "invalid_arguments",
+        "start_line is required for line-range reads.",
+        {
+          field: "start_line"
+        }
+      );
+    }
+
+    const document = readKnowledgeDocumentByTopic(topic);
+
+    let sliceStartLine;
+    let sliceEndLine;
+    let availableStartLine;
+    let availableEndLine;
+    let matchedSection = null;
+    let mode = null;
+
+    if (usingHeading) {
+      const matchingSections = document.sections.filter((section) =>
+        matchKnowledgeHeading(section, heading, caseSensitive)
+      );
+      if (matchingSections.length < occurrence) {
+        return asToolResult(
+          {
+            ok: false,
+            error: "knowledge_heading_not_found",
+            topic,
+            heading,
+            occurrence,
+            available_sections: document.sections.map((section) => section.path_text)
+          },
+          true
+        );
+      }
+
+      matchedSection = matchingSections[occurrence - 1];
+      availableStartLine = matchedSection.start_line;
+      availableEndLine = matchedSection.end_line;
+      mode = "heading";
+    } else if (usingSectionPath) {
+      const matchingSections = document.sections.filter((section) =>
+        matchKnowledgeSectionPath(section, sectionPath, caseSensitive)
+      );
+      if (matchingSections.length < occurrence) {
+        return asToolResult(
+          {
+            ok: false,
+            error: "knowledge_section_path_not_found",
+            topic,
+            section_path: sectionPath,
+            occurrence,
+            available_sections: document.sections.map((section) => ({
+              path: section.path,
+              path_text: section.path_text
+            }))
+          },
+          true
+        );
+      }
+
+      matchedSection = matchingSections[occurrence - 1];
+      availableStartLine = matchedSection.start_line;
+      availableEndLine = matchedSection.end_line;
+      mode = "section_path";
+    } else {
+      availableStartLine = startLine;
+      if (availableStartLine < 1 || availableStartLine > document.lines.length) {
+        throw new ToolPayloadError(
+          "invalid_arguments",
+          `start_line must be between 1 and ${document.lines.length}.`,
+          {
+            field: "start_line",
+            max_line: document.lines.length
+          }
+        );
+      }
+      availableEndLine =
+        endLine ??
+        (maxLines === undefined
+          ? availableStartLine
+          : Math.min(document.lines.length, availableStartLine + maxLines - 1));
+      if (availableEndLine < availableStartLine || availableEndLine > document.lines.length) {
+        throw new ToolPayloadError(
+          "invalid_arguments",
+          `end_line must be between start_line and ${document.lines.length}.`,
+          {
+            field: "end_line",
+            max_line: document.lines.length
+          }
+        );
+      }
+
+      matchedSection = getKnowledgeSectionForLine(document.sections, availableStartLine);
+      mode = "line_range";
+    }
+
+    sliceStartLine = availableStartLine;
+    sliceEndLine =
+      maxLines === undefined
+        ? availableEndLine
+        : Math.min(availableEndLine, availableStartLine + maxLines - 1);
+    const truncated = sliceEndLine < availableEndLine;
+
+    return asToolResult(
+      {
+        ok: true,
+        topic,
+        mode,
+        section_path: matchedSection?.path ?? null,
+        requested_section_path: sectionPath ?? null,
+        heading: matchedSection ? summarizeKnowledgeSection(matchedSection, document.lines) : null,
+        section: matchedSection ? summarizeKnowledgeSection(matchedSection, document.lines) : null,
+        start_line: sliceStartLine,
+        end_line: sliceEndLine,
+        available_start_line: availableStartLine,
+        available_end_line: availableEndLine,
+        max_lines: maxLines ?? null,
+        truncated,
+        content: document.lines
+          .slice(sliceStartLine - 1, sliceEndLine)
+          .join("\n")
+      },
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function listKnowledgeSectionsTool(args) {
+  try {
+    const topics = normalizeKnowledgeTopics(args.topics, "topics");
+    const maxSectionsPerTopic = clampInteger(
+      args.max_sections_per_topic,
+      200,
+      1,
+      200,
+      "max_sections_per_topic"
+    );
+
+    const topicSections = topics.map((topic) => {
+      const document = readKnowledgeDocumentByTopic(topic);
+      return {
+        topic,
+        section_count: document.sections.length,
+        sections: document.sections
+          .slice(0, maxSectionsPerTopic)
+          .map((section) => summarizeKnowledgeSection(section, document.lines))
+      };
+    });
+
+    return asToolResult(
+      {
+        ok: true,
+        topics: topicSections,
+        max_sections_per_topic: maxSectionsPerTopic
+      },
+      false
+    );
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
   }
 }
 

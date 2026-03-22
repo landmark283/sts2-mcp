@@ -4,11 +4,14 @@ using System.Globalization;
 using System.Linq;
 using System.Net;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Threading.Channels;
 using Godot;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Cards;
@@ -17,6 +20,7 @@ using MegaCrit.Sts2.Core.Entities.Merchant;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Entities.RestSite;
 using MegaCrit.Sts2.Core.Events;
+using MegaCrit.Sts2.Core.Events.Custom.CrystalSphereEvent;
 using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.Localization;
 using MegaCrit.Sts2.Core.Localization.DynamicVars;
@@ -30,6 +34,7 @@ using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
 using MegaCrit.Sts2.Core.Nodes.Combat;
 using MegaCrit.Sts2.Core.Nodes.CommonUi;
 using MegaCrit.Sts2.Core.Nodes.Events;
+using MegaCrit.Sts2.Core.Nodes.Events.Custom.CrystalSphere;
 using MegaCrit.Sts2.Core.Nodes.Rewards;
 using MegaCrit.Sts2.Core.Nodes.RestSite;
 using MegaCrit.Sts2.Core.Nodes.Rooms;
@@ -55,7 +60,7 @@ internal sealed class BridgeActionRequest
     public string? LegacyActionId { get; set; }
 
     [JsonPropertyName("expected_state_version")]
-    public int? ExpectedStateVersion { get; set; }
+    public long? ExpectedStateVersion { get; set; }
 
     [JsonPropertyName("wait_after_ms")]
     public int? WaitAfterMs { get; set; }
@@ -87,52 +92,61 @@ internal sealed class BridgeRequestException : Exception
 
 internal static class BridgeGameApi
 {
-    private const int PostActionSnapshotPumpTicks = 4;
-    private const int SnapshotSettlePollIntervalMs = 200;
-    private const int SnapshotSettleTimeoutMs = 5000;
-    private const int ObservationStablePollTarget = 1;
-    private const int CombatActionStablePollTarget = 3;
-    private const int EndTurnStablePollTarget = 6;
+    private const int NextFrontierWaitTimeoutMs = 5000;
+    private const int PassiveFrontierWaitTimeoutMs = 1000;
 
     private static readonly JsonSerializerOptions HashJsonOptions = new()
     {
         WriteIndented = false
     };
-
-    private enum SnapshotSettleKind
+    private static readonly HashSet<string> SemanticStateExcludedPropertyNames = new(StringComparer.Ordinal)
     {
-        Observe,
-        CombatAction,
-        EndTurn,
-        MapTravel
-    }
-
-    private readonly record struct SnapshotSettlementVerdict(bool Settled, string Reason);
-
-    private readonly record struct SnapshotSettleResult(
-        BridgeSnapshot Snapshot,
-        bool Settled,
-        string Reason,
-        int PollCount);
+        "automation",
+        "available_actions",
+        "description",
+        "effect_preview",
+        "dynamic_vars",
+        "texts",
+        "prompt",
+        "label",
+        "visible_glossary_source",
+        "visible_glossary_texts",
+        "visible_glossary",
+        "selection_screen_prompt",
+        "watchdog_dump"
+    };
 
     public static async Task<object> GetStateResponseAsync(CancellationToken cancellationToken = default)
     {
         EnsureDispatcherReady();
         BridgeDebugTrace.Write("get_state requested");
 
-        var snapshot = await CaptureObservedSnapshotAsync(cancellationToken);
-        BridgeDebugTrace.Write($"get_state completed state_version={snapshot.StateVersion}");
-        return snapshot.StatePayload;
+        var frontier = await ObserveFrontierAsync(cancellationToken);
+        BridgeDebugTrace.Write($"get_state completed state_version={frontier.Sequence}");
+        return frontier.StatePayload;
     }
 
-    public static async Task<object> GetActionsResponseAsync(CancellationToken cancellationToken = default)
+    public static void NotifyFrontierPumpTick()
+    {
+        if (!BridgeCoordinator.IsReady)
+        {
+            return;
+        }
+
+        BridgeFrontierStore.OnPumpTick();
+    }
+
+    public static void ResetFrontierState()
+    {
+        BridgeFrontierStore.Reset();
+    }
+
+    public static async Task StreamFrontierEventsAsync(
+        HttpListenerResponse response,
+        CancellationToken cancellationToken = default)
     {
         EnsureDispatcherReady();
-        BridgeDebugTrace.Write("get_actions requested");
-
-        var snapshot = await CaptureObservedSnapshotAsync(cancellationToken);
-        BridgeDebugTrace.Write($"get_actions completed count={snapshot.ActionPayloads.Count}");
-        return CreateActionsPayload(snapshot);
+        await BridgeFrontierStore.StreamEventsAsync(response, cancellationToken);
     }
 
     public static async Task<object> PerformActionResponseAsync(
@@ -152,28 +166,28 @@ internal static class BridgeGameApi
                 "Request body must include a non-empty action_id.");
         }
 
-        var before = await CaptureObservedSnapshotAsync(cancellationToken);
-        BridgeDebugTrace.Write($"perform_action snapshot_before action={actionId} version={before.StateVersion}");
+        var before = await ObserveFrontierAsync(cancellationToken);
+        BridgeDebugTrace.Write($"perform_action snapshot_before action={actionId} version={before.Sequence}");
 
-        if (request.ExpectedStateVersion is int expectedStateVersion &&
-            expectedStateVersion != before.StateVersion)
+        if (request.ExpectedStateVersion is long expectedStateVersion &&
+            expectedStateVersion != before.Sequence)
         {
             throw new BridgeRequestException(
                 HttpStatusCode.Conflict,
                 "state_version_conflict",
-                $"Expected state_version {expectedStateVersion}, but the current state_version is {before.StateVersion}.",
+                $"Expected state_version {expectedStateVersion}, but the current state_version is {before.Sequence}.",
                 new
                 {
                     action_id = actionId,
                     expected_state_version = expectedStateVersion,
-                    current_state_version = before.StateVersion,
-                    current_state_hash = before.StateHash,
-                    current_screen = before.Fields.Screen,
-                    available_actions = before.ActionPayloads
+                    current_state_version = before.Sequence,
+                    current_state_hash = before.FrontierHash,
+                    current_screen = before.Snapshot.Fields.Screen,
+                    available_actions = before.Snapshot.ActionPayloads
                 });
         }
 
-        if (!before.ActionLookup.TryGetValue(actionId, out var action))
+        if (!before.Snapshot.ActionLookup.TryGetValue(actionId, out var action))
         {
             throw new BridgeRequestException(
                 HttpStatusCode.Conflict,
@@ -182,25 +196,20 @@ internal static class BridgeGameApi
                 new
                 {
                     action_id = actionId,
-                    current_state_version = before.StateVersion,
-                    current_state_hash = before.StateHash,
-                    current_screen = before.Fields.Screen,
-                    available_actions = before.ActionPayloads
+                    current_state_version = before.Sequence,
+                    current_state_hash = before.FrontierHash,
+                    current_screen = before.Snapshot.Fields.Screen,
+                    available_actions = before.Snapshot.ActionPayloads
                 });
         }
 
-        await BridgeCoordinator.RunOnMainThreadAsync(() =>
-        {
-            BridgeDebugTrace.Write($"perform_action executing action={actionId}");
-            action.Execute();
-            return true;
-        });
-
         var waitAfterMs = Math.Clamp(request.WaitAfterMs ?? 0, 0, 5000);
-        await WaitForSnapshotBarrierAsync(waitAfterMs, cancellationToken);
-
-        var after = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
-        after = await MaybeWaitForStablePostActionSnapshotAsync(actionId, after, cancellationToken);
+        var after = await ExecuteActionAndWaitForFrontierAsync(
+            before,
+            actionId,
+            action,
+            waitAfterMs,
+            cancellationToken);
         var autoExecutedActions = new List<object>();
 
         if (IsRewardResolutionAction(actionId))
@@ -212,416 +221,201 @@ internal static class BridgeGameApi
             (after, autoExecutedActions) = await MaybeAutoCompleteCardSelectionAsync(after, cancellationToken);
         }
 
-        BridgeDebugTrace.Write($"perform_action snapshot_after action={actionId} version={after.StateVersion}");
+        BridgeDebugTrace.Write($"perform_action snapshot_after action={actionId} version={after.Sequence}");
 
         return new
         {
             ok = true,
             action_id = actionId,
-            matched_action = action.Payload,
-            wait_after_ms = waitAfterMs,
-            state_version_before = before.StateVersion,
-            state_hash_before = before.StateHash,
-            state_version_after = after.StateVersion,
-            state_hash_after = after.StateHash,
-            state_changed = before.StateVersion != after.StateVersion || before.StateHash != after.StateHash,
+            matched_action = BuildResolvedActionAckPayload(action.Payload),
+            state_version_before = before.Sequence,
+            state_version_after = after.Sequence,
+            screen_after = after.Snapshot.Fields.Screen,
             auto_executed_actions = autoExecutedActions,
-            actions = after.ActionPayloads,
-            state = after.StatePayload
+            state_changed = HasFrontierChanged(before, after)
         };
     }
 
-    private static async Task WaitForSnapshotBarrierAsync(int waitAfterMs, CancellationToken cancellationToken)
+    private static async Task<ObservedFrontier> ObserveFrontierAsync(CancellationToken cancellationToken)
     {
+        BridgeDebugTrace.Write("observe_frontier executing on main thread");
+        var snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
+        var frontier = PublishFrontier(snapshot);
+        BridgeDebugTrace.Write($"observe_frontier completed version={frontier.Sequence}");
+        return frontier;
+    }
+
+    private static ObservedFrontier PublishFrontier(BridgeSnapshot snapshot)
+    {
+        return BridgeFrontierStore.PublishSnapshot(snapshot);
+    }
+
+    private static async Task<ObservedFrontier> ExecuteActionAndWaitForFrontierAsync(
+        ObservedFrontier before,
+        string actionId,
+        BridgeResolvedAction action,
+        int waitAfterMs,
+        CancellationToken cancellationToken)
+    {
+        await BridgeCoordinator.RunOnMainThreadAsync(() =>
+        {
+            BridgeDebugTrace.Write($"perform_action executing action={actionId}");
+            action.Execute();
+            return true;
+        });
+
         if (waitAfterMs > 0)
         {
             await Task.Delay(waitAfterMs, cancellationToken);
         }
 
-        await BridgeCoordinator.WaitForPumpTicksAsync(PostActionSnapshotPumpTicks, cancellationToken);
-    }
-
-    private static async Task<BridgeSnapshot> CaptureObservedSnapshotAsync(CancellationToken cancellationToken)
-    {
-        BridgeDebugTrace.Write("observe_snapshot executing on main thread");
-        var snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
-        var settleResult = await WaitForSettledSnapshotAsync(
-            SnapshotSettleKind.Observe,
-            actionId: null,
-            snapshot,
-            cancellationToken);
-
-        BridgeDebugTrace.Write(
-            $"observe_snapshot settled={settleResult.Settled} reason={settleResult.Reason} polls={settleResult.PollCount} version={settleResult.Snapshot.StateVersion}");
-        return settleResult.Snapshot;
-    }
-
-    private static async Task<BridgeSnapshot> MaybeWaitForStablePostActionSnapshotAsync(
-        string actionId,
-        BridgeSnapshot snapshot,
-        CancellationToken cancellationToken)
-    {
-        var settleKind = GetPostActionSettleKind(actionId);
-        var settleResult = await WaitForSettledSnapshotAsync(
-            settleKind,
-            actionId,
-            snapshot,
-            cancellationToken);
-
-        BridgeDebugTrace.Write(
-            $"post_action_settle action={actionId} kind={settleKind} settled={settleResult.Settled} reason={settleResult.Reason} polls={settleResult.PollCount} version={settleResult.Snapshot.StateVersion}");
-        return settleResult.Snapshot;
-    }
-
-    private static SnapshotSettleKind GetPostActionSettleKind(string actionId)
-    {
-        if (actionId.Equals("end_turn", StringComparison.Ordinal))
+        if (ShouldTryImmediateObservedFrontier(actionId))
         {
-            return SnapshotSettleKind.EndTurn;
-        }
-
-        if (actionId.StartsWith("map:", StringComparison.Ordinal))
-        {
-            return SnapshotSettleKind.MapTravel;
-        }
-
-        if (actionId.StartsWith("play_card:", StringComparison.Ordinal) ||
-            actionId.StartsWith("card_selection:", StringComparison.Ordinal) ||
-            actionId.StartsWith("use_potion:", StringComparison.Ordinal))
-        {
-            return SnapshotSettleKind.CombatAction;
-        }
-
-        return SnapshotSettleKind.Observe;
-    }
-
-    private static async Task<SnapshotSettleResult> WaitForSettledSnapshotAsync(
-        SnapshotSettleKind settleKind,
-        string? actionId,
-        BridgeSnapshot snapshot,
-        CancellationToken cancellationToken)
-    {
-        var stablePolls = 0;
-        var previousStateHash = snapshot.StateHash;
-        var verdict = GetSnapshotSettlementVerdict(settleKind, actionId, snapshot, stablePolls);
-        if (verdict.Settled)
-        {
-            return new SnapshotSettleResult(snapshot, true, verdict.Reason, 0);
-        }
-
-        var startedAt = DateTime.UtcNow;
-        var pollCount = 0;
-        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < SnapshotSettleTimeoutMs)
-        {
-            await Task.Delay(SnapshotSettlePollIntervalMs, cancellationToken);
-            await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
-            snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
-            pollCount++;
-
-            stablePolls = snapshot.StateHash.Equals(previousStateHash, StringComparison.Ordinal)
-                ? stablePolls + 1
-                : 0;
-            previousStateHash = snapshot.StateHash;
-
-            verdict = GetSnapshotSettlementVerdict(settleKind, actionId, snapshot, stablePolls);
-            if (verdict.Settled)
+            var immediateFrontier = await ObserveFrontierAsync(cancellationToken);
+            if (HasFrontierChanged(before, immediateFrontier))
             {
-                return new SnapshotSettleResult(snapshot, true, verdict.Reason, pollCount);
+                BridgeDebugTrace.Write(
+                    $"perform_action immediate_frontier action={actionId} version={immediateFrontier.Sequence}");
+                return immediateFrontier;
             }
         }
 
-        return new SnapshotSettleResult(snapshot, false, verdict.Reason, pollCount);
+        var frontier = await BridgeFrontierStore.WaitForNextFrontierAsync(
+            before.Sequence,
+            NextFrontierWaitTimeoutMs,
+            cancellationToken);
+        if (frontier is not null)
+        {
+            return frontier;
+        }
+
+        BridgeDebugTrace.Write(
+            $"perform_action frontier_wait_timeout action={actionId} after_version={before.Sequence}");
+        return await ObserveFrontierAsync(cancellationToken);
     }
 
-    private static SnapshotSettlementVerdict GetSnapshotSettlementVerdict(
-        SnapshotSettleKind settleKind,
-        string? actionId,
-        BridgeSnapshot snapshot,
-        int stablePolls)
+    private static async Task<ObservedFrontier> WaitForNextObservedFrontierAsync(
+        ObservedFrontier before,
+        int timeoutMs,
+        CancellationToken cancellationToken)
     {
-        return settleKind switch
+        var frontier = await BridgeFrontierStore.WaitForNextFrontierAsync(
+            before.Sequence,
+            timeoutMs,
+            cancellationToken);
+        return frontier ?? await ObserveFrontierAsync(cancellationToken);
+    }
+
+    private static bool ShouldTryImmediateObservedFrontier(string actionId)
+    {
+        return actionId.StartsWith("play_card:", StringComparison.Ordinal) ||
+               actionId.StartsWith("card_selection:", StringComparison.Ordinal) ||
+               actionId.StartsWith("use_potion:", StringComparison.Ordinal);
+    }
+
+    private static bool HasFrontierChanged(ObservedFrontier before, ObservedFrontier after)
+    {
+        return before.Sequence != after.Sequence ||
+               !before.FrontierHash.Equals(after.FrontierHash, StringComparison.Ordinal);
+    }
+
+    private static object BuildResolvedActionAckPayload(object? payload)
+    {
+        var targetPayload = ReadPayloadPropertyValue(payload, "target");
+        var targetMappingPayload = ReadPayloadPropertyValue(payload, "target_mapping");
+        return new
         {
-            SnapshotSettleKind.Observe => GetObservationSettlementVerdict(snapshot, stablePolls),
-            SnapshotSettleKind.CombatAction => GetCombatActionSettlementVerdict(snapshot, stablePolls),
-            SnapshotSettleKind.EndTurn => GetEndTurnSettlementVerdict(snapshot, stablePolls),
-            SnapshotSettleKind.MapTravel => GetMapTravelSettlementVerdict(snapshot, stablePolls),
-            _ => GetObservationSettlementVerdict(snapshot, stablePolls)
+            action_id = ReadPayloadStringProperty(payload, "action_id"),
+            kind = ReadPayloadStringProperty(payload, "kind"),
+            label = ReadPayloadStringProperty(payload, "label"),
+            target_action_suffix = ReadPayloadStringProperty(payload, "target_action_suffix"),
+            target_combat_id = ReadPayloadIntegerProperty(payload, "target_combat_id")
+                               ?? ReadPayloadIntegerProperty(targetPayload, "combat_id")
+                               ?? ReadPayloadIntegerProperty(targetMappingPayload, "combat_id"),
+            target_name = ReadPayloadStringProperty(payload, "target_name")
+                          ?? ReadPayloadStringProperty(targetPayload, "name")
+                          ?? ReadPayloadStringProperty(targetMappingPayload, "name"),
+            target_side = ReadPayloadStringProperty(payload, "target_side")
+                          ?? ReadPayloadStringProperty(targetPayload, "side")
+                          ?? ReadPayloadStringProperty(targetMappingPayload, "side")
         };
     }
 
-    private static SnapshotSettlementVerdict GetObservationSettlementVerdict(
-        BridgeSnapshot snapshot,
-        int stablePolls)
+    private static string? ReadPayloadStringProperty(object? payload, string propertyName)
     {
-        var decisionSurfaceReadyReason = GetDecisionSurfaceReadyReason(snapshot);
-        if (decisionSurfaceReadyReason is not null)
-        {
-            return stablePolls >= ObservationStablePollTarget
-                ? new SnapshotSettlementVerdict(true, decisionSurfaceReadyReason)
-                : new SnapshotSettlementVerdict(false, $"waiting_for_stable_surface:{decisionSurfaceReadyReason}");
-        }
-
-        if (snapshot.Fields.Screen.Equals("COMBAT", StringComparison.Ordinal) ||
-            IsBooleanPropertyTrue(snapshot.Fields.Combat, "in_progress"))
-        {
-            return GetCombatActionSettlementVerdict(snapshot, stablePolls);
-        }
-
-        var nonAutomationActions = GetNonAutomationActions(snapshot);
-        if (nonAutomationActions.Length == 1 &&
-            nonAutomationActions[0].ActionId.Equals("proceed", StringComparison.Ordinal))
-        {
-            return stablePolls >= ObservationStablePollTarget
-                ? new SnapshotSettlementVerdict(true, "proceed_ready")
-                : new SnapshotSettlementVerdict(false, "waiting_for_stable_surface:proceed_ready");
-        }
-
-        return new SnapshotSettlementVerdict(
-            false,
-            $"waiting_for_decision_surface:{snapshot.Fields.Screen}");
+        var value = ReadPayloadPropertyValue(payload, propertyName);
+        return value as string;
     }
 
-    private static SnapshotSettlementVerdict GetCombatActionSettlementVerdict(
-        BridgeSnapshot snapshot,
-        int stablePolls)
+    private static int? ReadPayloadIntegerProperty(object? payload, string propertyName)
     {
-        var decisionSurfaceReadyReason = GetDecisionSurfaceReadyReason(snapshot);
-        if (decisionSurfaceReadyReason is not null)
+        var value = ReadPayloadPropertyValue(payload, propertyName);
+        if (value is byte byteValue)
         {
-            return new SnapshotSettlementVerdict(true, decisionSurfaceReadyReason);
+            return byteValue;
         }
 
-        if (!snapshot.Fields.Screen.Equals("COMBAT", StringComparison.Ordinal))
+        if (value is sbyte sbyteValue)
         {
-            return new SnapshotSettlementVerdict(
-                false,
-                $"waiting_for_room_transition:{snapshot.Fields.Screen}");
+            return sbyteValue;
         }
 
-        if (!IsBooleanPropertyTrue(snapshot.Fields.Combat, "in_progress"))
+        if (value is short shortValue)
         {
-            return new SnapshotSettlementVerdict(false, "waiting_for_room_transition");
+            return shortValue;
         }
 
-        var currentSide = GetHiddenPropertyObjectValue(snapshot.Fields.Combat, "current_side")?.ToString();
-        if (!string.Equals(currentSide, "Player", StringComparison.Ordinal) ||
-            !IsBooleanPropertyTrue(snapshot.Fields.Combat, "is_play_phase") ||
-            IsBooleanPropertyTrue(snapshot.Fields.Combat, "player_actions_disabled"))
+        if (value is ushort ushortValue)
         {
-            return new SnapshotSettlementVerdict(false, "waiting_for_combat_resolution");
+            return ushortValue;
         }
 
-        var nonAutomationActions = GetNonAutomationActions(snapshot);
-        if (nonAutomationActions.Length <= 0)
+        if (value is int intValue)
         {
-            return new SnapshotSettlementVerdict(false, "waiting_for_action_list");
+            return intValue;
         }
 
-        var hasMeaningfulCombatAction =
-            nonAutomationActions.Any(action => !action.ActionId.Equals("end_turn", StringComparison.Ordinal));
-        if (stablePolls >= CombatActionStablePollTarget)
+        if (value is uint uintValue && uintValue <= int.MaxValue)
         {
-            return new SnapshotSettlementVerdict(
-                true,
-                hasMeaningfulCombatAction
-                    ? "player_turn_stable"
-                    : "player_turn_stable_end_turn_only");
+            return (int)uintValue;
         }
 
-        return new SnapshotSettlementVerdict(false, "waiting_for_stable_player_turn");
+        if (value is long longValue && longValue >= int.MinValue && longValue <= int.MaxValue)
+        {
+            return (int)longValue;
+        }
+
+        if (value is ulong ulongValue && ulongValue <= int.MaxValue)
+        {
+            return (int)ulongValue;
+        }
+
+        if (value is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return Convert.ToInt32(value, CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
-    private static SnapshotSettlementVerdict GetEndTurnSettlementVerdict(
-        BridgeSnapshot snapshot,
-        int stablePolls)
+    private static object? ReadPayloadPropertyValue(object? payload, string propertyName)
     {
-        var decisionSurfaceReadyReason = GetDecisionSurfaceReadyReason(snapshot);
-        if (decisionSurfaceReadyReason is not null)
+        if (payload is null || string.IsNullOrWhiteSpace(propertyName))
         {
-            return new SnapshotSettlementVerdict(true, decisionSurfaceReadyReason);
+            return null;
         }
 
-        if (!snapshot.Fields.Screen.Equals("COMBAT", StringComparison.Ordinal))
-        {
-            return new SnapshotSettlementVerdict(
-                false,
-                $"waiting_for_room_transition:{snapshot.Fields.Screen}");
-        }
-
-        if (!IsBooleanPropertyTrue(snapshot.Fields.Combat, "in_progress"))
-        {
-            return new SnapshotSettlementVerdict(false, "waiting_for_room_transition");
-        }
-
-        var currentSide = GetHiddenPropertyObjectValue(snapshot.Fields.Combat, "current_side")?.ToString();
-        if (!string.Equals(currentSide, "Player", StringComparison.Ordinal) ||
-            !IsBooleanPropertyTrue(snapshot.Fields.Combat, "is_play_phase") ||
-            IsBooleanPropertyTrue(snapshot.Fields.Combat, "player_actions_disabled"))
-        {
-            return new SnapshotSettlementVerdict(false, "waiting_for_player_turn");
-        }
-
-        var handCount = GetFirstPlayerCombatPileCount(snapshot, "hand");
-        var drawCount = GetFirstPlayerCombatPileCount(snapshot, "draw_pile");
-        var discardCount = GetFirstPlayerCombatPileCount(snapshot, "discard_pile");
-        var totalDrawableCount =
-            handCount.HasValue && drawCount.HasValue && discardCount.HasValue
-                ? handCount.Value + drawCount.Value + discardCount.Value
-                : (int?)null;
-        var targetHandCount = totalDrawableCount.HasValue
-            ? Math.Min(5, totalDrawableCount.Value)
-            : (int?)null;
-        var nonAutomationActions = GetNonAutomationActions(snapshot);
-        var hasMeaningfulCombatAction =
-            nonAutomationActions.Any(action => !action.ActionId.Equals("end_turn", StringComparison.Ordinal));
-
-        if (handCount.HasValue &&
-            targetHandCount.HasValue &&
-            handCount.Value >= targetHandCount.Value &&
-            (hasMeaningfulCombatAction || nonAutomationActions.Length > 0))
-        {
-            return new SnapshotSettlementVerdict(true, "player_turn_ready");
-        }
-
-        if (stablePolls >= EndTurnStablePollTarget &&
-            handCount.HasValue &&
-            handCount.Value > 0 &&
-            (hasMeaningfulCombatAction || nonAutomationActions.Length > 0))
-        {
-            return new SnapshotSettlementVerdict(true, "player_turn_stable_fallback");
-        }
-
-        return new SnapshotSettlementVerdict(false, "waiting_for_hand_fill");
-    }
-
-    private static SnapshotSettlementVerdict GetMapTravelSettlementVerdict(
-        BridgeSnapshot snapshot,
-        int stablePolls)
-    {
-        if (snapshot.Fields.Screen.Equals("MAP", StringComparison.Ordinal))
-        {
-            var waitingReason = IsBooleanPropertyTrue(snapshot.Fields.Map, "is_traveling")
-                ? "waiting_for_map_travel_finish"
-                : "waiting_for_room_entry";
-            return new SnapshotSettlementVerdict(false, waitingReason);
-        }
-
-        var decisionSurfaceReadyReason = GetDecisionSurfaceReadyReason(snapshot);
-        if (decisionSurfaceReadyReason is not null &&
-            !decisionSurfaceReadyReason.Equals("map_ready", StringComparison.Ordinal))
-        {
-            return stablePolls >= ObservationStablePollTarget
-                ? new SnapshotSettlementVerdict(true, decisionSurfaceReadyReason)
-                : new SnapshotSettlementVerdict(false, $"waiting_for_stable_surface:{decisionSurfaceReadyReason}");
-        }
-
-        if (snapshot.Fields.Screen.Equals("COMBAT", StringComparison.Ordinal) ||
-            IsBooleanPropertyTrue(snapshot.Fields.Combat, "in_progress"))
-        {
-            return GetCombatActionSettlementVerdict(snapshot, stablePolls);
-        }
-
-        return new SnapshotSettlementVerdict(
-            false,
-            $"waiting_for_room_entry:{snapshot.Fields.Screen}");
-    }
-
-    private static string? GetDecisionSurfaceReadyReason(BridgeSnapshot snapshot)
-    {
-        var nonAutomationActions = GetNonAutomationActions(snapshot);
-
-        if (snapshot.Fields.Screen.Equals("MAIN_MENU", StringComparison.Ordinal) &&
-            nonAutomationActions.Any(action => action.ActionId.StartsWith("main_menu:", StringComparison.Ordinal)))
-        {
-            return "main_menu_ready";
-        }
-
-        if (snapshot.Fields.Screen.Equals("RUN_MODE_SELECTION", StringComparison.Ordinal) &&
-            nonAutomationActions.Any(action => action.ActionId.StartsWith("run_mode:", StringComparison.Ordinal)))
-        {
-            return "run_mode_selection_ready";
-        }
-
-        if (snapshot.Fields.Screen.Equals("CHARACTER_SELECT", StringComparison.Ordinal) &&
-            nonAutomationActions.Any(action => action.ActionId.StartsWith("character_select:", StringComparison.Ordinal)))
-        {
-            return "character_select_ready";
-        }
-
-        if (snapshot.Fields.Screen.Equals("ABANDON_RUN_CONFIRM", StringComparison.Ordinal) &&
-            nonAutomationActions.Any(action => action.ActionId.StartsWith("main_menu:", StringComparison.Ordinal)))
-        {
-            return "abandon_run_confirm_ready";
-        }
-
-        if (IsBooleanPropertyTrue(snapshot.Fields.CardSelection, "visible") &&
-            nonAutomationActions.Any(action => action.ActionId.StartsWith("card_selection:", StringComparison.Ordinal)))
-        {
-            return "card_selection_ready";
-        }
-
-        if (IsBooleanPropertyTrue(snapshot.Fields.CardRewardSelection, "visible") &&
-            nonAutomationActions.Any(action => action.ActionId.StartsWith("card_reward:", StringComparison.Ordinal)))
-        {
-            return "reward_card_selection_ready";
-        }
-
-        if ((IsBooleanPropertyTrue(snapshot.Fields.Rewards, "visible") ||
-             IsBooleanPropertyTrue(snapshot.Fields.Rewards, "terminal_proceed_visible")) &&
-            nonAutomationActions.Any(action =>
-                action.ActionId.StartsWith("reward:", StringComparison.Ordinal) ||
-                action.ActionId.Equals("proceed", StringComparison.Ordinal) ||
-                action.ActionId.StartsWith("discard_potion:", StringComparison.Ordinal)))
-        {
-            return "reward_flow_ready";
-        }
-
-        if (IsBooleanPropertyTrue(snapshot.Fields.DeckUpgradeSelection, "visible") &&
-            nonAutomationActions.Any(action => action.ActionId.StartsWith("deck_upgrade:", StringComparison.Ordinal)))
-        {
-            return "rest_site_upgrade_ready";
-        }
-
-        if ((IsBooleanPropertyTrue(snapshot.Fields.RestSite, "visible") ||
-             IsBooleanPropertyTrue(snapshot.Fields.RestSite, "proceed_visible")) &&
-            nonAutomationActions.Any(action => action.ActionId.StartsWith("rest_site:", StringComparison.Ordinal)))
-        {
-            return "rest_site_ready";
-        }
-
-        if (IsBooleanPropertyTrue(snapshot.Fields.EventOptions, "visible") &&
-            nonAutomationActions.Any(action => action.ActionId.StartsWith("event_option:", StringComparison.Ordinal)))
-        {
-            return "event_ready";
-        }
-
-        if ((IsBooleanPropertyTrue(snapshot.Fields.Shop, "visible") ||
-             IsBooleanPropertyTrue(snapshot.Fields.Shop, "is_open")) &&
-            nonAutomationActions.Any(action => action.ActionId.StartsWith("shop:", StringComparison.Ordinal)))
-        {
-            return "shop_ready";
-        }
-
-        if (nonAutomationActions.Any(action =>
-                action.ActionId.StartsWith("treasure:", StringComparison.Ordinal) ||
-                action.ActionId.StartsWith("treasure_relic:", StringComparison.Ordinal)))
-        {
-            return "treasure_ready";
-        }
-
-        if (IsMapReadySnapshot(snapshot))
-        {
-            return "map_ready";
-        }
-
-        return null;
-    }
-
-    private static bool IsMapReadySnapshot(BridgeSnapshot snapshot)
-    {
-        return IsBooleanPropertyTrue(snapshot.Fields.Map, "is_open") &&
-               !IsBooleanPropertyTrue(snapshot.Fields.Map, "is_traveling") &&
-               GetNonAutomationActions(snapshot).Any(action => action.ActionId.StartsWith("map:", StringComparison.Ordinal));
+        var property = payload.GetType().GetProperty(
+            propertyName,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
+        return property?.GetValue(payload);
     }
 
     private static BridgeResolvedAction[] GetNonAutomationActions(BridgeSnapshot snapshot)
@@ -631,47 +425,386 @@ internal static class BridgeGameApi
             .ToArray();
     }
 
-    private static bool IsBooleanPropertyTrue(object? target, string propertyName)
-    {
-        return GetHiddenPropertyValue<bool>(target, propertyName) ?? false;
-    }
-
-    private static int? GetFirstPlayerCombatPileCount(BridgeSnapshot snapshot, string pilePropertyName)
-    {
-        if (snapshot.Fields.Players.Length == 0)
-        {
-            return null;
-        }
-
-        var playerCombat = GetHiddenPropertyObjectValue(snapshot.Fields.Players[0], "combat");
-        var pile = GetHiddenPropertyObjectValue(playerCombat, pilePropertyName);
-        return GetHiddenPropertyValue<int>(pile, "count");
-    }
-
     private static BridgeSnapshot CaptureSnapshot()
     {
-        BridgeDebugTrace.Write("capture_snapshot start");
+        return HydrateSnapshot(CaptureFrontierCandidate());
+    }
+
+    private static BridgeFrontierCandidate CaptureFrontierCandidate()
+    {
+        BridgeDebugTrace.Write("capture_frontier_candidate start");
         var context = CaptureContext();
-        BridgeDebugTrace.Write($"capture_snapshot context screen={context.Screen}");
+        BridgeDebugTrace.Write($"capture_frontier_candidate context screen={context.Screen}");
         var actions = BuildResolvedActions(context);
-        BridgeDebugTrace.Write($"capture_snapshot actions={actions.Count}");
-        var actionPayloads = actions.Select(static action => action.Payload).ToArray();
-        var fields = BuildStateFields(context, actionPayloads);
-        var corePayload = CreateStateCore(fields);
-        var stateHash = ComputeStateHash(corePayload);
-        var stateVersion = ComputeStateVersion(stateHash);
-        var statePayload = CreateStatePayload(fields, stateVersion, stateHash);
-        BridgeDebugTrace.Write($"capture_snapshot complete version={stateVersion}");
+        BridgeDebugTrace.Write($"capture_frontier_candidate actions={actions.Count}");
+        var frontierHash = ComputeFrontierHash(BuildFrontierProbePayload(context, actions));
+        BridgeDebugTrace.Write($"capture_frontier_candidate complete hash={frontierHash}");
+
+        return new BridgeFrontierCandidate
+        {
+            Context = context,
+            Actions = actions,
+            FrontierHash = frontierHash
+        };
+    }
+
+    private static BridgeSnapshot HydrateSnapshot(BridgeFrontierCandidate candidate)
+    {
+        BridgeDebugTrace.Write($"hydrate_snapshot start frontier_hash={candidate.FrontierHash}");
+        var actionPayloads = candidate.Actions.Select(static action => action.Payload).ToArray();
+        var fields = BuildStateFields(candidate.Context, actionPayloads);
+        var corePayload = CreateSemanticStateCore(fields);
+        var semanticStateHash = ComputeStateHash(corePayload);
+        var statePayload = CreateStatePayload(fields, 0, candidate.FrontierHash, semanticStateHash);
+        BridgeDebugTrace.Write(
+            $"hydrate_snapshot complete frontier_hash={candidate.FrontierHash} semantic_hash={semanticStateHash}");
 
         return new BridgeSnapshot
         {
             Fields = fields,
-            StateHash = stateHash,
+            FrontierHash = candidate.FrontierHash,
+            StateHash = semanticStateHash,
             StatePayload = statePayload,
-            StateVersion = stateVersion,
-            Actions = actions,
+            StateVersion = 0,
+            Actions = candidate.Actions,
             ActionPayloads = actionPayloads,
-            ActionLookup = actions.ToDictionary(static action => action.ActionId, StringComparer.Ordinal)
+            ActionLookup = candidate.Actions.ToDictionary(static action => action.ActionId, StringComparer.Ordinal)
+        };
+    }
+
+    private static object BuildFrontierProbePayload(
+        BridgeWorldContext context,
+        IReadOnlyList<BridgeResolvedAction> actions)
+    {
+        return new
+        {
+            screen = context.Screen,
+            action_ids = actions.Select(static action => action.ActionId).ToArray(),
+            combat = BuildCombatFrontierPayload(context.CombatManager, context.CombatState),
+            rewards = BuildRewardsFrontierPayload(context),
+            card_reward_selection = BuildCardRewardSelectionFrontierPayload(
+                context.CardRewardScreen,
+                context.CardRewardOptions,
+                context.CardRewardSkipButton),
+            card_selection = BuildCardSelectionFrontierPayload(
+                context.CardSelectionScreen,
+                context.CardSelectionOptions,
+                context.CardSelectionConfirmButton,
+                context.CardSelectionCancelButton,
+                context.CardSelectionCloseButton,
+                context.CardSelectionSkipButton),
+            crystal_sphere = BuildCrystalSphereFrontierPayload(
+                context.CrystalSphereScreen,
+                context.CrystalSphereCells),
+            map = BuildMapFrontierPayload(context.RunState, context.MapScreen),
+            rest_site = BuildRestSiteFrontierPayload(
+                context.MapScreen,
+                context.RestSiteRoom,
+                context.RestSiteButtons,
+                context.RestSiteProceedButton),
+            deck_upgrade_selection = BuildDeckUpgradeSelectionFrontierPayload(
+                context.DeckUpgradeScreen,
+                context.DeckUpgradeOptions,
+                context.DeckUpgradeConfirmButton,
+                context.DeckUpgradeCancelButton,
+                context.DeckUpgradeCloseButton),
+            shop = BuildShopFrontierPayload(
+                context.MerchantRoom,
+                context.MerchantInventory,
+                context.MerchantSlots,
+                context.MerchantButton,
+                context.MerchantProceedButton,
+                context.MerchantBackButton)
+        };
+    }
+
+    private static object BuildCombatFrontierPayload(CombatManager? combatManager, CombatState? combatState)
+    {
+        if (combatManager is null || combatState is null || !combatManager.IsInProgress)
+        {
+            return new
+            {
+                in_progress = false
+            };
+        }
+
+        return new
+        {
+            in_progress = combatManager.IsInProgress,
+            is_play_phase = combatManager.IsPlayPhase,
+            is_paused = combatManager.IsPaused,
+            is_ending = combatManager.IsEnding,
+            player_actions_disabled = combatManager.PlayerActionsDisabled,
+            round_number = combatState.RoundNumber,
+            current_side = combatState.CurrentSide.ToString(),
+            players = combatState.Players.Select(player => new
+            {
+                net_id = player.NetId,
+                energy = player.PlayerCombatState?.Energy,
+                max_energy = player.PlayerCombatState?.MaxEnergy,
+                stars = player.PlayerCombatState?.Stars,
+                creature = BuildCreatureFrontierPayload(player.Creature)
+            }).ToArray(),
+            enemies = combatState.Creatures
+                .Where(static creature => creature.IsEnemy)
+                .Select(BuildCreatureFrontierPayload)
+                .ToArray()
+        };
+    }
+
+    private static object BuildCreatureFrontierPayload(Creature? creature)
+    {
+        if (creature is null)
+        {
+            return new
+            {
+                missing = true
+            };
+        }
+
+        return new
+        {
+            combat_id = creature.CombatId,
+            current_hp = creature.CurrentHp,
+            max_hp = creature.MaxHp,
+            block = creature.Block,
+            is_alive = creature.IsAlive,
+            is_hittable = SafeGetCreatureIsHittable(creature),
+            powers = creature.Powers.Select(BuildPowerFrontierPayload).ToArray(),
+            intent = creature.IsEnemy ? BuildEnemyIntentFrontierPayload(creature) : null
+        };
+    }
+
+    private static object BuildPowerFrontierPayload(PowerModel power)
+    {
+        return new
+        {
+            title = TextOf(power.Title),
+            amount = power.Amount,
+            display_amount = power.DisplayAmount
+        };
+    }
+
+    private static object? BuildEnemyIntentFrontierPayload(Creature creature)
+    {
+        var monster = creature.Monster;
+        if (monster is null)
+        {
+            return null;
+        }
+
+        var targets = ResolveMonsterIntentTargets(creature);
+        var nextMove = monster.NextMove;
+        return new
+        {
+            state_id = nextMove?.StateId,
+            follow_up_state_id = nextMove?.FollowUpStateId,
+            intents = SafeGetMonsterIntents(monster, nextMove)
+                .Select(intent =>
+                {
+                    var repeats = intent switch
+                    {
+                        SingleAttackIntent singleAttackIntent => singleAttackIntent.Repeats,
+                        MultiAttackIntent multiAttackIntent => multiAttackIntent.Repeats,
+                        _ => 1
+                    };
+
+                    var totalDamage = intent switch
+                    {
+                        SingleAttackIntent singleAttackIntent =>
+                            SafeGetIntentTotalDamage(singleAttackIntent, targets, creature),
+                        MultiAttackIntent multiAttackIntent =>
+                            SafeGetIntentTotalDamage(multiAttackIntent, targets, creature),
+                        _ => null
+                    };
+
+                    return new
+                    {
+                        intent_type = intent.IntentType.ToString(),
+                        repeats,
+                        total_damage = totalDamage
+                    };
+                })
+                .ToArray()
+        };
+    }
+
+    private static object BuildRewardsFrontierPayload(BridgeWorldContext context)
+    {
+        var visible = IsRewardsScreenVisible(
+            context.RewardsScreen,
+            context.ProceedButton,
+            context.RewardProceedButton,
+            context.MapScreen,
+            context.RewardButtons);
+        return new
+        {
+            visible,
+            terminal_proceed_visible = visible &&
+                                       context.RewardProceedButton is not null &&
+                                       IsNodeVisible(context.RewardProceedButton),
+            reward_count = context.RewardButtons.Count
+        };
+    }
+
+    private static object BuildCardRewardSelectionFrontierPayload(
+        NCardRewardSelectionScreen? cardRewardScreen,
+        IReadOnlyList<NCardHolder> cardRewardOptions,
+        Node? cardRewardSkipButton)
+    {
+        return new
+        {
+            visible = cardRewardScreen is not null && IsNodeVisible(cardRewardScreen),
+            skip_visible = cardRewardSkipButton is not null &&
+                           IsNodeVisible(cardRewardSkipButton) &&
+                           IsButtonEnabled(cardRewardSkipButton),
+            option_count = cardRewardOptions.Count
+        };
+    }
+
+    private static object BuildCardSelectionFrontierPayload(
+        Node? cardSelectionScreen,
+        IReadOnlyList<NCardHolder> cardSelectionOptions,
+        Node? cardSelectionConfirmButton,
+        Node? cardSelectionCancelButton,
+        Node? cardSelectionCloseButton,
+        Node? cardSelectionSkipButton)
+    {
+        var visible = cardSelectionScreen is not null && IsNodeVisible(cardSelectionScreen);
+        var prefs = GetHiddenFieldValue(cardSelectionScreen, "_prefs");
+
+        return new
+        {
+            visible,
+            screen_type = visible ? cardSelectionScreen!.GetType().Name : null,
+            selected_count = CountSelectedCardSelectionCards(cardSelectionScreen),
+            min_select = GetHiddenPropertyValue<int>(prefs, "MinSelect"),
+            max_select = GetHiddenPropertyValue<int>(prefs, "MaxSelect"),
+            confirm_visible = cardSelectionConfirmButton is not null &&
+                              IsNodeVisible(cardSelectionConfirmButton) &&
+                              IsButtonEnabled(cardSelectionConfirmButton),
+            cancel_visible = cardSelectionCancelButton is not null &&
+                             IsNodeVisible(cardSelectionCancelButton) &&
+                             IsButtonEnabled(cardSelectionCancelButton),
+            close_visible = cardSelectionCloseButton is not null &&
+                            IsNodeVisible(cardSelectionCloseButton) &&
+                            IsButtonEnabled(cardSelectionCloseButton),
+            skip_visible = cardSelectionSkipButton is not null &&
+                           IsNodeVisible(cardSelectionSkipButton) &&
+                           IsButtonEnabled(cardSelectionSkipButton),
+            option_keys = cardSelectionOptions.Select((holder, index) =>
+            {
+                var optionIndex = GetCardSelectionOptionIndex(cardSelectionScreen, holder, index);
+                return GetCardSelectionOptionSelectionId(cardSelectionScreen, holder, optionIndex) ??
+                       optionIndex.ToString(CultureInfo.InvariantCulture);
+            }).ToArray()
+        };
+    }
+
+    private static object BuildCrystalSphereFrontierPayload(
+        NCrystalSphereScreen? crystalSphereScreen,
+        IReadOnlyList<NCrystalSphereCell> crystalSphereCells)
+    {
+        var visible = crystalSphereScreen is not null && IsNodeVisible(crystalSphereScreen);
+        if (!visible)
+        {
+            return new
+            {
+                visible = false
+            };
+        }
+
+        var minigame = GetCrystalSphereMinigame(crystalSphereScreen);
+        return new
+        {
+            visible = true,
+            divinations_left = GetCrystalSphereDivinationCount(minigame),
+            current_tool = GetCrystalSphereToolName(minigame),
+            is_finished = GetCrystalSphereIsFinished(minigame),
+            cells = crystalSphereCells.Select(cell => new
+            {
+                x = cell.Entity?.X,
+                y = cell.Entity?.Y,
+                is_hidden = cell.Entity?.IsHidden ?? true,
+                is_highlighted = cell.Entity?.IsHighlighted ?? false
+            }).ToArray()
+        };
+    }
+
+    private static object BuildMapFrontierPayload(RunState? runState, NMapScreen? mapScreen)
+    {
+        return new
+        {
+            is_open = mapScreen?.IsOpen ?? false,
+            is_travel_enabled = mapScreen?.IsTravelEnabled ?? false,
+            is_traveling = mapScreen?.IsTraveling ?? false,
+            current_coord = BuildMapCoord(runState?.CurrentMapCoord)
+        };
+    }
+
+    private static object BuildRestSiteFrontierPayload(
+        NMapScreen? mapScreen,
+        NRestSiteRoom? restSiteRoom,
+        IReadOnlyList<NRestSiteButton> restSiteButtons,
+        NProceedButton? restSiteProceedButton)
+    {
+        var visible = mapScreen?.IsOpen != true &&
+                      restSiteRoom is not null &&
+                      IsNodeVisible(restSiteRoom);
+        return new
+        {
+            visible,
+            proceed_visible = visible &&
+                              !HasVisibleEnabledRestSiteOptions(restSiteButtons) &&
+                              restSiteProceedButton is not null &&
+                              IsNodeVisible(restSiteProceedButton) &&
+                              IsButtonEnabled(restSiteProceedButton),
+            option_count = visible ? restSiteButtons.Count(IsNodeVisible) : 0
+        };
+    }
+
+    private static object BuildDeckUpgradeSelectionFrontierPayload(
+        NDeckUpgradeSelectScreen? deckUpgradeScreen,
+        IReadOnlyList<NCardHolder> deckUpgradeOptions,
+        NConfirmButton? deckUpgradeConfirmButton,
+        NBackButton? deckUpgradeCancelButton,
+        NBackButton? deckUpgradeCloseButton)
+    {
+        var visible = deckUpgradeScreen is not null && IsNodeVisible(deckUpgradeScreen);
+        return new
+        {
+            visible,
+            selected_count = CountSelectedDeckUpgradeCards(deckUpgradeScreen),
+            confirm_visible = deckUpgradeConfirmButton is not null &&
+                              IsNodeVisible(deckUpgradeConfirmButton) &&
+                              IsButtonEnabled(deckUpgradeConfirmButton),
+            cancel_visible = deckUpgradeCancelButton is not null &&
+                             IsNodeVisible(deckUpgradeCancelButton) &&
+                             IsButtonEnabled(deckUpgradeCancelButton),
+            close_visible = deckUpgradeCloseButton is not null &&
+                            IsNodeVisible(deckUpgradeCloseButton) &&
+                            IsButtonEnabled(deckUpgradeCloseButton),
+            option_count = visible ? deckUpgradeOptions.Count : 0
+        };
+    }
+
+    private static object BuildShopFrontierPayload(
+        NMerchantRoom? merchantRoom,
+        NMerchantInventory? merchantInventory,
+        IReadOnlyList<NMerchantSlot> merchantSlots,
+        NMerchantButton? merchantButton,
+        NProceedButton? merchantProceedButton,
+        NBackButton? merchantBackButton)
+    {
+        return new
+        {
+            visible = (merchantRoom is not null && IsNodeVisible(merchantRoom)) ||
+                      (merchantInventory is not null && IsNodeVisible(merchantInventory)),
+            is_open = merchantInventory?.IsOpen ?? false,
+            merchant_button_visible = merchantButton is not null && IsNodeVisible(merchantButton),
+            back_button_visible = merchantBackButton is not null && IsNodeVisible(merchantBackButton),
+            proceed_visible = merchantProceedButton is not null && IsNodeVisible(merchantProceedButton),
+            item_count = merchantSlots.Count
         };
     }
 
@@ -716,6 +849,7 @@ internal static class BridgeGameApi
         var proceedButton = ResolveVisibleProceedButton(
             game,
             combatRoom?.ProceedButton,
+            treasureRoom?.ProceedButton,
             restSiteProceedButton,
             merchantProceedButton);
         var merchantSlots = merchantInventory is null
@@ -759,14 +893,24 @@ internal static class BridgeGameApi
             GetHiddenFieldValue(deckUpgradeScreen, "_singlePreviewConfirmButton") as NConfirmButton,
             GetHiddenFieldValue(deckUpgradeScreen, "_multiPreviewConfirmButton") as NConfirmButton);
         var deckUpgradeCloseButton = GetHiddenFieldValue(deckUpgradeScreen, "_closeButton") as NBackButton;
-        var cardSelectionConfirmButton = ResolveFirstVisibleNode(
-            GetHiddenFieldValue(cardSelectionScreen, "_confirmButton") as Node,
-            GetHiddenFieldValue(cardSelectionScreen, "_previewConfirmButton") as Node,
-            GetHiddenFieldValue(cardSelectionScreen, "_selectModeConfirmButton") as Node);
+        var cardSelectionConfirmButton = ResolveCardSelectionConfirmButton(cardSelectionScreen);
         var cardSelectionCancelButton = GetHiddenFieldValue(cardSelectionScreen, "_previewCancelButton") as Node;
         var cardSelectionCloseButton = GetHiddenFieldValue(cardSelectionScreen, "_closeButton") as Node;
         var cardSelectionSkipButton = GetHiddenFieldValue(cardSelectionScreen, "_skipButton") as Node;
         var eventRoom = FindFirstVisibleDescendant<NEventRoom>(game);
+        var crystalSphereScreen = FindFirstVisibleDescendant<NCrystalSphereScreen>(game);
+        var crystalSphereCells = crystalSphereScreen is null
+            ? new List<NCrystalSphereCell>()
+            : FindVisibleDescendants<NCrystalSphereCell>(crystalSphereScreen)
+                .OrderBy(static cell => cell.Entity?.Y ?? int.MaxValue)
+                .ThenBy(static cell => cell.Entity?.X ?? int.MaxValue)
+                .ToList();
+        var crystalSphereSmallDivinationButton =
+            GetHiddenFieldValue(crystalSphereScreen, "_smallDivinationButton") as NDivinationButton;
+        var crystalSphereBigDivinationButton =
+            GetHiddenFieldValue(crystalSphereScreen, "_bigDivinationButton") as NDivinationButton;
+        var crystalSphereProceedButton =
+            GetHiddenFieldValue(crystalSphereScreen, "_proceedButton") as NProceedButton;
         var hoverTipSet = FindFirstVisibleDescendant(
             game,
             static node => IsTypeFullName(node, "MegaCrit.Sts2.Core.Nodes.HoverTips.NHoverTipSet"));
@@ -826,6 +970,7 @@ internal static class BridgeGameApi
                 cardSelectionScreen,
                 characterSelectScreen,
                 deckUpgradeScreen,
+                crystalSphereScreen,
                 eventOptionButtons,
                 mainMenuRoot,
                 runModeSubmenu,
@@ -861,6 +1006,11 @@ internal static class BridgeGameApi
             CharacterButtons = characterButtons,
             EventOptionButtons = eventOptionButtons,
             EventRoom = eventRoom,
+            CrystalSphereScreen = crystalSphereScreen,
+            CrystalSphereCells = crystalSphereCells,
+            CrystalSphereSmallDivinationButton = crystalSphereSmallDivinationButton,
+            CrystalSphereBigDivinationButton = crystalSphereBigDivinationButton,
+            CrystalSphereProceedButton = crystalSphereProceedButton,
             HoverTipSet = hoverTipSet,
             MapPoints = mapPoints,
             RestSiteButtons = restSiteButtons,
@@ -928,7 +1078,18 @@ internal static class BridgeGameApi
                 context.EventOptionButtons,
                 context.MapScreen,
                 context.EventRoom,
-                context.HoverTipSet),
+                context.HoverTipSet,
+                context.CrystalSphereScreen,
+                context.CrystalSphereCells,
+                context.CrystalSphereSmallDivinationButton,
+                context.CrystalSphereBigDivinationButton,
+                context.CrystalSphereProceedButton),
+            CrystalSphere = BuildCrystalSpherePayload(
+                context.CrystalSphereScreen,
+                context.CrystalSphereCells,
+                context.CrystalSphereSmallDivinationButton,
+                context.CrystalSphereBigDivinationButton,
+                context.CrystalSphereProceedButton),
             Map = BuildMapPayload(context.RunState, context.MapScreen, context.MapPoints),
             RestSite = BuildRestSitePayload(
                 context.MapScreen,
@@ -959,13 +1120,14 @@ internal static class BridgeGameApi
         };
     }
 
-    private static object CreateStateCore(BridgeStateFields fields)
+    private static object CreateSemanticStateCore(BridgeStateFields fields)
     {
-        return new
+        // Keep state_version/state_hash tied to the semantic game state rather
+        // than transient automation metadata or fully-expanded action payloads.
+        var rawCore = new
         {
             schema_version = BridgeRuntime.StateSchemaVersion,
             screen = fields.Screen,
-            automation = fields.Automation,
             run = fields.Run,
             combat = fields.Combat,
             players = fields.Players,
@@ -975,16 +1137,22 @@ internal static class BridgeGameApi
             character_selection = fields.CharacterSelection,
             run_mode_selection = fields.RunModeSelection,
             event_options = fields.EventOptions,
+            crystal_sphere = fields.CrystalSphere,
             map = fields.Map,
             rest_site = fields.RestSite,
             deck_upgrade_selection = fields.DeckUpgradeSelection,
             shop = fields.Shop,
-            main_menu = fields.MainMenu,
-            available_actions = fields.AvailableActions
+            main_menu = fields.MainMenu
         };
+
+        return PruneSemanticStateNode(JsonSerializer.SerializeToNode(rawCore, HashJsonOptions)) ?? new JsonObject();
     }
 
-    private static object CreateStatePayload(BridgeStateFields fields, int stateVersion, string stateHash)
+    private static object CreateStatePayload(
+        BridgeStateFields fields,
+        long stateVersion,
+        string stateHash,
+        string semanticStateHash)
     {
         return new
         {
@@ -993,6 +1161,7 @@ internal static class BridgeGameApi
             schema_version = BridgeRuntime.StateSchemaVersion,
             state_version = stateVersion,
             state_hash = stateHash,
+            semantic_state_hash = semanticStateHash,
             captured_at_utc = DateTimeOffset.UtcNow,
             screen = fields.Screen,
             automation = fields.Automation,
@@ -1005,26 +1174,13 @@ internal static class BridgeGameApi
             character_selection = fields.CharacterSelection,
             run_mode_selection = fields.RunModeSelection,
             event_options = fields.EventOptions,
+            crystal_sphere = fields.CrystalSphere,
             map = fields.Map,
             rest_site = fields.RestSite,
             deck_upgrade_selection = fields.DeckUpgradeSelection,
             shop = fields.Shop,
             main_menu = fields.MainMenu,
             available_actions = fields.AvailableActions
-        };
-    }
-
-    private static object CreateActionsPayload(BridgeSnapshot snapshot)
-    {
-        return new
-        {
-            ok = true,
-            schema_version = BridgeRuntime.StateSchemaVersion,
-            state_version = snapshot.StateVersion,
-            state_hash = snapshot.StateHash,
-            captured_at_utc = DateTimeOffset.UtcNow,
-            screen = snapshot.Fields.Screen,
-            actions = snapshot.ActionPayloads
         };
     }
 
@@ -1139,6 +1295,7 @@ internal static class BridgeGameApi
         else if (context.MapScreen?.IsOpen != true &&
                  context.ProceedButton is not null &&
                  IsNodeVisible(context.ProceedButton) &&
+                 IsButtonEnabled(context.ProceedButton) &&
                  !ShouldSuppressGenericRoomProceed(context))
         {
             var label = context.ProceedButton.IsSkip ? "Skip" : "Proceed";
@@ -1264,6 +1421,8 @@ internal static class BridgeGameApi
                     Execute = () => InvokeButtonAction(button, "OnRelease")
                 });
             }
+
+            AddCrystalSphereEventActions(actions, context, context.EventOptionButtons.Count);
         }
 
         if (context.MapScreen is not null &&
@@ -1418,13 +1577,13 @@ internal static class BridgeGameApi
             return;
         }
 
-        var canProceed = !HasVisibleRestSiteOptions(context.RestSiteButtons);
+        var canProceed = !HasVisibleEnabledRestSiteOptions(context.RestSiteButtons);
 
         for (var index = 0; index < context.RestSiteButtons.Count; index++)
         {
             var button = context.RestSiteButtons[index];
             var option = button.Option;
-            if (!IsNodeVisible(button) || option is null)
+            if (!IsNodeVisible(button) || option is null || !option.IsEnabled)
             {
                 continue;
             }
@@ -1448,7 +1607,8 @@ internal static class BridgeGameApi
 
         if (canProceed &&
             context.RestSiteProceedButton is not null &&
-            IsNodeVisible(context.RestSiteProceedButton))
+            IsNodeVisible(context.RestSiteProceedButton) &&
+            IsButtonEnabled(context.RestSiteProceedButton))
         {
             actions.Add(new BridgeResolvedAction
             {
@@ -1580,7 +1740,11 @@ internal static class BridgeGameApi
                 continue;
             }
 
-            var actionId = $"card_selection:select:{index}";
+            var optionIndex = GetCardSelectionOptionIndex(context.CardSelectionScreen, cardHolder, index);
+            var selectionId = GetCardSelectionOptionSelectionId(context.CardSelectionScreen, cardHolder, optionIndex);
+            var actionId = selectionId is not null
+                ? $"card_selection:select:{selectionId}"
+                : $"card_selection:select:{optionIndex}";
             actions.Add(new BridgeResolvedAction
             {
                 ActionId = actionId,
@@ -1589,8 +1753,9 @@ internal static class BridgeGameApi
                     action_id = actionId,
                     kind = "card_selection",
                     selection_action = "select",
-                    index,
-                    label = $"Select card {index}: {cardHolder.CardModel?.Title ?? "<missing>"}",
+                    index = optionIndex,
+                    selection_id = selectionId,
+                    label = $"Select card {optionIndex}: {cardHolder.CardModel?.Title ?? "<missing>"}",
                     card = BuildCardPayload(cardHolder.CardModel),
                     screen = context.Screen,
                     screen_type = context.CardSelectionScreen?.GetType().Name
@@ -1700,7 +1865,8 @@ internal static class BridgeGameApi
 
         if (!inventoryIsOpen &&
             context.MerchantButton is not null &&
-            IsNodeVisible(context.MerchantButton))
+            IsNodeVisible(context.MerchantButton) &&
+            IsButtonEnabled(context.MerchantButton))
         {
             actions.Add(new BridgeResolvedAction
             {
@@ -1747,7 +1913,9 @@ internal static class BridgeGameApi
             }
         }
 
-        if (context.MerchantBackButton is not null && IsNodeVisible(context.MerchantBackButton))
+        if (context.MerchantBackButton is not null &&
+            IsNodeVisible(context.MerchantBackButton) &&
+            IsButtonEnabled(context.MerchantBackButton))
         {
             actions.Add(new BridgeResolvedAction
             {
@@ -1760,11 +1928,13 @@ internal static class BridgeGameApi
                     label = "Close merchant inventory",
                     screen = context.Screen
                 },
-                Execute = () => InvokeButtonAction(context.MerchantBackButton, "OnPress")
+                Execute = () => InvokeMerchantBackAction(context.MerchantInventory, context.MerchantBackButton)
             });
         }
 
-        if (context.MerchantProceedButton is not null && IsNodeVisible(context.MerchantProceedButton))
+        if (context.MerchantProceedButton is not null &&
+            IsNodeVisible(context.MerchantProceedButton) &&
+            IsButtonEnabled(context.MerchantProceedButton))
         {
             actions.Add(new BridgeResolvedAction
             {
@@ -1991,9 +2161,10 @@ internal static class BridgeGameApi
                     continue;
                 }
 
+                var cardRef = GetCardReference(card);
                 foreach (var resolvedTarget in ResolvePlayableCardTargets(context, player, card))
                 {
-                    var actionId = $"play_card:{playerIndex}:{handIndex}";
+                    var actionId = $"play_card:{playerIndex}:{cardRef}";
                     if (!string.IsNullOrEmpty(resolvedTarget.ActionSuffix))
                     {
                         actionId += $":{resolvedTarget.ActionSuffix}";
@@ -2016,6 +2187,7 @@ internal static class BridgeGameApi
                             player_index = playerIndex,
                             player_net_id = player.NetId,
                             hand_index = handIndex,
+                            card_ref = cardRef,
                             card = BuildCardPayload(card, resolvedTarget.Target),
                             target = resolvedTarget.Target is null ? null : BuildCreaturePayload(resolvedTarget.Target),
                             target_action_suffix = resolvedTarget.ActionSuffix,
@@ -2939,7 +3111,13 @@ internal static class BridgeGameApi
 
         try
         {
-            var upgradedCard = card.CardScope.CloneCard(card);
+            var cardScope = card.CardScope;
+            if (cardScope is null)
+            {
+                return null;
+            }
+
+            var upgradedCard = cardScope.CloneCard(card);
             upgradedCard.UpgradeInternal();
             upgradedCard.UpgradePreviewType = card.Pile?.IsCombatPile == true
                 ? CardUpgradePreviewType.Combat
@@ -3630,11 +3808,20 @@ internal static class BridgeGameApi
             skip_visible = cardSelectionSkipButton is not null &&
                            IsNodeVisible(cardSelectionSkipButton) &&
                            IsButtonEnabled(cardSelectionSkipButton),
-            options = cardSelectionOptions.Select((holder, index) => new
+            options = cardSelectionOptions.Select((holder, index) =>
             {
-                index,
-                card = BuildCardPayload(holder.CardModel),
-                is_selected = IsCardSelectionCardSelected(cardSelectionScreen, holder.CardModel)
+                var optionIndex = GetCardSelectionOptionIndex(cardSelectionScreen, holder, index);
+                var selectionId = GetCardSelectionOptionSelectionId(cardSelectionScreen, holder, optionIndex);
+                return new
+                {
+                    index = optionIndex,
+                    selection_id = selectionId,
+                    action_id = selectionId is not null
+                        ? $"card_selection:select:{selectionId}"
+                        : $"card_selection:select:{optionIndex}",
+                    card = BuildCardPayload(holder.CardModel),
+                    is_selected = IsCardSelectionCardSelected(cardSelectionScreen, holder.CardModel)
+                };
             }).ToArray()
         };
     }
@@ -3726,7 +3913,12 @@ internal static class BridgeGameApi
         IReadOnlyList<NEventOptionButton> eventOptionButtons,
         NMapScreen? mapScreen,
         NEventRoom? eventRoom,
-        Node? hoverTipSet)
+        Node? hoverTipSet,
+        NCrystalSphereScreen? crystalSphereScreen,
+        IReadOnlyList<NCrystalSphereCell> crystalSphereCells,
+        NDivinationButton? crystalSphereSmallDivinationButton,
+        NDivinationButton? crystalSphereBigDivinationButton,
+        NProceedButton? crystalSphereProceedButton)
     {
         if (mapScreen is not null && mapScreen.IsOpen)
         {
@@ -3745,17 +3937,480 @@ internal static class BridgeGameApi
             eventRoom,
             hoverTipSet);
         var currentEventModel = GetHiddenFieldValue(eventRoom, "_event") as EventModel;
+        var options = new List<object>(eventOptionButtons.Count + crystalSphereCells.Count + 4);
+        options.AddRange(eventOptionButtons.Select((button, index) => BuildEventOptionPayload(button, index, currentEventModel)));
+        options.AddRange(
+            BuildCrystalSphereEventOptionPayloads(
+                crystalSphereScreen,
+                crystalSphereCells,
+                crystalSphereSmallDivinationButton,
+                crystalSphereBigDivinationButton,
+                crystalSphereProceedButton,
+                eventOptionButtons.Count));
+        var isCrystalSphereVisible = crystalSphereScreen is not null && IsNodeVisible(crystalSphereScreen);
 
         return new
         {
-            visible = eventOptionButtons.Count > 0,
+            visible = eventOptionButtons.Count > 0 || options.Count > 0 || isCrystalSphereVisible || glossaryTexts.Count > 0,
             visible_glossary_source = glossarySource,
             visible_glossary_texts = glossaryTexts.ToArray(),
             visible_glossary = BuildVisibleGlossaryPayload(glossaryTexts),
-            options = eventOptionButtons
-                .Select((button, index) => BuildEventOptionPayload(button, index, currentEventModel))
+            options = options.ToArray()
+        };
+    }
+
+    private static object BuildCrystalSpherePayload(
+        NCrystalSphereScreen? crystalSphereScreen,
+        IReadOnlyList<NCrystalSphereCell> crystalSphereCells,
+        NDivinationButton? crystalSphereSmallDivinationButton,
+        NDivinationButton? crystalSphereBigDivinationButton,
+        NProceedButton? crystalSphereProceedButton)
+    {
+        var visible = crystalSphereScreen is not null && IsNodeVisible(crystalSphereScreen);
+        if (!visible)
+        {
+            return new
+            {
+                visible = false,
+                cells = Array.Empty<object>()
+            };
+        }
+
+        var minigame = GetCrystalSphereMinigame(crystalSphereScreen);
+        var currentTool = GetCrystalSphereToolName(minigame);
+        var divinationsLeft = GetCrystalSphereDivinationCount(minigame);
+        var isFinished = GetCrystalSphereIsFinished(minigame);
+        var canRevealHiddenCells =
+            divinationsLeft.GetValueOrDefault() > 0 &&
+            !isFinished &&
+            !string.IsNullOrWhiteSpace(currentTool) &&
+            !string.Equals(currentTool, "none", StringComparison.OrdinalIgnoreCase);
+        var divinationsLeftLabel =
+            TryGetNodeText(GetHiddenFieldValue(crystalSphereScreen, "_divinationsLeftLabel") as Node);
+        var instructionsTitle =
+            TryGetNodeText(GetHiddenFieldValue(crystalSphereScreen, "_instructionsTitleLabel") as Node);
+        var instructionsDescription =
+            TryGetNodeText(GetHiddenFieldValue(crystalSphereScreen, "_instructionsDescriptionLabel") as Node);
+
+        return new
+        {
+            visible = true,
+            divinations_left = divinationsLeft,
+            divinations_left_text = divinationsLeftLabel,
+            current_tool = currentTool,
+            is_finished = isFinished,
+            grid_size = BuildCrystalSphereGridPayload(minigame, crystalSphereCells),
+            instructions_title = instructionsTitle,
+            instructions_description = instructionsDescription,
+            small_divination = BuildCrystalSphereDivinationButtonPayload(
+                crystalSphereSmallDivinationButton,
+                expectedTool: "small",
+                currentTool,
+                divinationSize: "1x1",
+                fallbackLabel: "Small Divination"),
+            big_divination = BuildCrystalSphereDivinationButtonPayload(
+                crystalSphereBigDivinationButton,
+                expectedTool: "big",
+                currentTool,
+                divinationSize: "3x3",
+                fallbackLabel: "Big Divination"),
+            proceed = BuildCrystalSphereProceedPayload(crystalSphereProceedButton),
+            cells = crystalSphereCells
+                .Select(cell => BuildCrystalSphereCellPayload(cell, canRevealHiddenCells))
                 .ToArray()
         };
+    }
+
+    private static object[] BuildCrystalSphereEventOptionPayloads(
+        NCrystalSphereScreen? crystalSphereScreen,
+        IReadOnlyList<NCrystalSphereCell> crystalSphereCells,
+        NDivinationButton? crystalSphereSmallDivinationButton,
+        NDivinationButton? crystalSphereBigDivinationButton,
+        NProceedButton? crystalSphereProceedButton,
+        int startingIndex)
+    {
+        return GetCrystalSphereEventOptionDescriptors(
+                crystalSphereScreen,
+                crystalSphereCells,
+                crystalSphereSmallDivinationButton,
+                crystalSphereBigDivinationButton,
+                crystalSphereProceedButton,
+                startingIndex)
+            .Select(BuildCrystalSphereEventOptionPayload)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<CrystalSphereEventOptionDescriptor> GetCrystalSphereEventOptionDescriptors(
+        NCrystalSphereScreen? crystalSphereScreen,
+        IReadOnlyList<NCrystalSphereCell> crystalSphereCells,
+        NDivinationButton? crystalSphereSmallDivinationButton,
+        NDivinationButton? crystalSphereBigDivinationButton,
+        NProceedButton? crystalSphereProceedButton,
+        int startingIndex)
+    {
+        var descriptors = new List<CrystalSphereEventOptionDescriptor>();
+        if (crystalSphereScreen is null || !IsNodeVisible(crystalSphereScreen))
+        {
+            return descriptors;
+        }
+
+        var minigame = GetCrystalSphereMinigame(crystalSphereScreen);
+        var currentTool = GetCrystalSphereToolName(minigame);
+        var divinationsLeft = GetCrystalSphereDivinationCount(minigame).GetValueOrDefault();
+        var isFinished = GetCrystalSphereIsFinished(minigame);
+        var canRevealHiddenCells =
+            divinationsLeft > 0 &&
+            !isFinished &&
+            !string.IsNullOrWhiteSpace(currentTool) &&
+            !string.Equals(currentTool, "none", StringComparison.OrdinalIgnoreCase);
+
+        void AddDescriptor(CrystalSphereEventOptionDescriptor descriptor)
+        {
+            descriptors.Add(descriptor with { Index = startingIndex + descriptors.Count });
+        }
+
+        var smallVisible = crystalSphereSmallDivinationButton is not null && IsNodeVisible(crystalSphereSmallDivinationButton);
+        var smallEnabled = smallVisible && IsButtonEnabled(crystalSphereSmallDivinationButton);
+        var smallSelected = string.Equals(currentTool, "small", StringComparison.OrdinalIgnoreCase);
+        if (smallVisible)
+        {
+            AddDescriptor(new CrystalSphereEventOptionDescriptor
+            {
+                Index = 0,
+                OptionType = "crystal_sphere_small_divination",
+                OptionId = "crystal_sphere:small_divination",
+                Title = GetCrystalSphereControlLabel(crystalSphereSmallDivinationButton, "Small Divination"),
+                Description = "Select 1x1 divination.",
+                DivinationSize = "1x1",
+                IsSelected = smallSelected,
+                IsEnabled = smallEnabled,
+                ActionAvailable = smallEnabled && !smallSelected,
+                Execute = () => InvokeCrystalSphereDivinationAction(
+                    crystalSphereScreen,
+                    crystalSphereSmallDivinationButton!,
+                    useBigDivination: false)
+            });
+        }
+
+        var bigVisible = crystalSphereBigDivinationButton is not null && IsNodeVisible(crystalSphereBigDivinationButton);
+        var bigEnabled = bigVisible && IsButtonEnabled(crystalSphereBigDivinationButton);
+        var bigSelected = string.Equals(currentTool, "big", StringComparison.OrdinalIgnoreCase);
+        if (bigVisible)
+        {
+            AddDescriptor(new CrystalSphereEventOptionDescriptor
+            {
+                Index = 0,
+                OptionType = "crystal_sphere_big_divination",
+                OptionId = "crystal_sphere:big_divination",
+                Title = GetCrystalSphereControlLabel(crystalSphereBigDivinationButton, "Big Divination"),
+                Description = "Select 3x3 divination.",
+                DivinationSize = "3x3",
+                IsSelected = bigSelected,
+                IsEnabled = bigEnabled,
+                ActionAvailable = bigEnabled && !bigSelected,
+                Execute = () => InvokeCrystalSphereDivinationAction(
+                    crystalSphereScreen,
+                    crystalSphereBigDivinationButton!,
+                    useBigDivination: true)
+            });
+        }
+
+        if (canRevealHiddenCells)
+        {
+            foreach (var cell in crystalSphereCells)
+            {
+                var entity = cell.Entity;
+                if (entity is null || !entity.IsHidden)
+                {
+                    continue;
+                }
+
+                var x = entity.X;
+                var y = entity.Y;
+                AddDescriptor(new CrystalSphereEventOptionDescriptor
+                {
+                    Index = 0,
+                    OptionType = "crystal_sphere_cell",
+                    OptionId = $"crystal_sphere:cell:{x},{y}",
+                    Title = $"Reveal cell ({x}, {y})",
+                    Description = "Use the selected divination on this cell.",
+                    X = x,
+                    Y = y,
+                    IsHighlighted = entity.IsHighlighted,
+                    IsEnabled = true,
+                    ActionAvailable = true,
+                    Execute = () => InvokeCrystalSphereCellAction(crystalSphereScreen, cell)
+                });
+            }
+        }
+
+        var proceedVisible = crystalSphereProceedButton is not null && IsNodeVisible(crystalSphereProceedButton);
+        var proceedEnabled = proceedVisible && IsButtonEnabled(crystalSphereProceedButton);
+        if (proceedVisible)
+        {
+            AddDescriptor(new CrystalSphereEventOptionDescriptor
+            {
+                Index = 0,
+                OptionType = "crystal_sphere_proceed",
+                OptionId = "crystal_sphere:proceed",
+                Title = GetCrystalSphereControlLabel(crystalSphereProceedButton, "Proceed"),
+                IsProceed = true,
+                IsEnabled = proceedEnabled,
+                ActionAvailable = proceedEnabled,
+                Execute = () => InvokeCrystalSphereProceedAction(
+                    crystalSphereScreen,
+                    crystalSphereProceedButton!)
+            });
+        }
+
+        return descriptors;
+    }
+
+    private static object BuildCrystalSphereEventOptionPayload(CrystalSphereEventOptionDescriptor descriptor)
+    {
+        return new
+        {
+            index = descriptor.Index,
+            option_type = descriptor.OptionType,
+            option_id = descriptor.OptionId,
+            title = descriptor.Title,
+            description = descriptor.Description,
+            is_locked = !descriptor.IsEnabled,
+            is_proceed = descriptor.IsProceed,
+            is_selected = descriptor.IsSelected,
+            is_enabled = descriptor.IsEnabled,
+            action_available = descriptor.ActionAvailable,
+            divination_size = descriptor.DivinationSize,
+            coord = BuildCrystalSphereCoordPayload(descriptor.X, descriptor.Y),
+            is_highlighted = descriptor.IsHighlighted
+        };
+    }
+
+    private static void AddCrystalSphereEventActions(
+        List<BridgeResolvedAction> actions,
+        BridgeWorldContext context,
+        int startingIndex)
+    {
+        foreach (var descriptor in GetCrystalSphereEventOptionDescriptors(
+                     context.CrystalSphereScreen,
+                     context.CrystalSphereCells,
+                     context.CrystalSphereSmallDivinationButton,
+                     context.CrystalSphereBigDivinationButton,
+                     context.CrystalSphereProceedButton,
+                     startingIndex))
+        {
+            if (!descriptor.ActionAvailable || descriptor.Execute is null)
+            {
+                continue;
+            }
+
+            var actionId = $"event_option:{descriptor.Index}";
+            actions.Add(new BridgeResolvedAction
+            {
+                ActionId = actionId,
+                Payload = new
+                {
+                    action_id = actionId,
+                    kind = "event_option",
+                    index = descriptor.Index,
+                    label = $"Choose option {descriptor.Index}: {descriptor.Title}",
+                    option = BuildCrystalSphereEventOptionPayload(descriptor),
+                    screen = context.Screen
+                },
+                Execute = descriptor.Execute
+            });
+        }
+    }
+
+    private static object BuildCrystalSphereDivinationButtonPayload(
+        Node? button,
+        string expectedTool,
+        string? currentTool,
+        string divinationSize,
+        string fallbackLabel)
+    {
+        var visible = button is not null && IsNodeVisible(button);
+        var enabled = visible && IsButtonEnabled(button);
+        var isSelected = string.Equals(currentTool, expectedTool, StringComparison.OrdinalIgnoreCase);
+
+        return new
+        {
+            visible,
+            enabled,
+            is_selected = isSelected,
+            action_available = enabled && !isSelected,
+            label = GetCrystalSphereControlLabel(button, fallbackLabel),
+            divination_size = divinationSize
+        };
+    }
+
+    private static object BuildCrystalSphereProceedPayload(Node? button)
+    {
+        var visible = button is not null && IsNodeVisible(button);
+        var enabled = visible && IsButtonEnabled(button);
+        return new
+        {
+            visible,
+            enabled,
+            action_available = enabled,
+            label = GetCrystalSphereControlLabel(button, "Proceed")
+        };
+    }
+
+    private static object BuildCrystalSphereCellPayload(NCrystalSphereCell cell, bool canRevealHiddenCells)
+    {
+        var entity = cell.Entity;
+        var isHidden = entity?.IsHidden ?? true;
+        return new
+        {
+            x = entity?.X,
+            y = entity?.Y,
+            is_hidden = isHidden,
+            is_highlighted = entity?.IsHighlighted ?? false,
+            is_hovered = entity?.IsHovered ?? false,
+            can_reveal = canRevealHiddenCells && isHidden,
+            revealed_item = isHidden
+                ? null
+                : BuildCrystalSphereRevealedItemPayload(GetHiddenPropertyObjectValue(entity, "Item"))
+        };
+    }
+
+    private static object? BuildCrystalSphereRevealedItemPayload(object? item)
+    {
+        if (item is null)
+        {
+            return null;
+        }
+
+        var itemTypeName = item.GetType().Name;
+        var itemType = itemTypeName switch
+        {
+            "CrystalSphereGold" => "gold",
+            "CrystalSpherePotion" => "potion",
+            "CrystalSphereRelic" => "relic",
+            "CrystalSphereCardReward" => "card_reward",
+            "CrystalSphereCurse" => "curse",
+            _ => NormalizeComparableText(itemTypeName).Replace("-", "_", StringComparison.Ordinal)
+        };
+
+        var potionModel = GetHiddenPropertyObjectValue(item, "Potion") as PotionModel ??
+                          GetHiddenFieldValue(item, "_potion") as PotionModel;
+        var relicModel = GetHiddenPropertyObjectValue(item, "Relic") as RelicModel ??
+                         GetHiddenPropertyObjectValue(item, "Model") as RelicModel;
+
+        string? title = itemType switch
+        {
+            "gold" => "Gold",
+            "potion" when potionModel is not null => TryGetTitle(potionModel),
+            "relic" when relicModel is not null => TryGetTitle(relicModel),
+            "curse" => "Curse",
+            _ => null
+        };
+
+        var amount = itemType == "gold"
+            ? TryGetIntFromPropertyOrField(item, "Amount")
+            : null;
+        var rarity = itemType == "card_reward"
+            ? TextOf(GetHiddenPropertyObjectValue(item, "Rarity") ?? GetHiddenFieldValue(item, "_rarity"))
+            : null;
+
+        return new
+        {
+            item_type = itemType,
+            title,
+            amount,
+            rarity,
+            is_good = TryGetBoolFromPropertyOrField(item, "IsGood") ?? false
+        };
+    }
+
+    private static object? BuildCrystalSphereGridPayload(
+        object? minigame,
+        IReadOnlyList<NCrystalSphereCell> crystalSphereCells)
+    {
+        int? width = null;
+        int? height = null;
+
+        if (crystalSphereCells.Count > 0)
+        {
+            width = crystalSphereCells.Max(static cell => cell.Entity?.X ?? -1) + 1;
+            height = crystalSphereCells.Max(static cell => cell.Entity?.Y ?? -1) + 1;
+        }
+
+        var gridSize = GetHiddenPropertyObjectValue(minigame, "GridSize") ?? GetHiddenFieldValue(minigame, "_gridSize");
+        if (gridSize is not null)
+        {
+            width ??= TryConvertToInt(gridSize) ??
+                      TryGetIntFromPropertyOrField(gridSize, "X", "Width", "Columns", "Col");
+            height ??= TryConvertToInt(gridSize) ??
+                       TryGetIntFromPropertyOrField(gridSize, "Y", "Height", "Rows", "Row");
+        }
+
+        if (!width.HasValue && !height.HasValue)
+        {
+            return null;
+        }
+
+        width ??= height;
+        height ??= width;
+        return new
+        {
+            width,
+            height
+        };
+    }
+
+    private static object? BuildCrystalSphereCoordPayload(int? x, int? y)
+    {
+        return x.HasValue && y.HasValue
+            ? new
+            {
+                x,
+                y
+            }
+            : null;
+    }
+
+    private static object? GetCrystalSphereMinigame(NCrystalSphereScreen? crystalSphereScreen)
+    {
+        return GetHiddenFieldValue(crystalSphereScreen, "_entity") ??
+               GetHiddenPropertyObjectValue(crystalSphereScreen, "Entity");
+    }
+
+    private static int? GetCrystalSphereDivinationCount(object? minigame)
+    {
+        return TryGetIntFromPropertyOrField(minigame, "DivinationCount", "_divinationCount");
+    }
+
+    private static bool GetCrystalSphereIsFinished(object? minigame)
+    {
+        return TryGetBoolFromPropertyOrField(minigame, "IsFinished", "_isFinished") ?? false;
+    }
+
+    private static string? GetCrystalSphereToolName(object? minigame)
+    {
+        var rawTool = GetHiddenPropertyObjectValue(minigame, "CrystalSphereTool") ??
+                      GetHiddenFieldValue(minigame, "_crystalSphereTool") ??
+                      GetHiddenFieldValue(minigame, "_currentTool");
+        var toolText = rawTool?.ToString();
+        if (string.IsNullOrWhiteSpace(toolText))
+        {
+            return null;
+        }
+
+        return toolText.Trim().ToLowerInvariant() switch
+        {
+            "none" => "none",
+            "small" => "small",
+            "big" => "big",
+            _ => toolText.Trim()
+        };
+    }
+
+    private static string GetCrystalSphereControlLabel(Node? button, string fallbackLabel)
+    {
+        var label = TryGetNodeText(button);
+        return string.IsNullOrWhiteSpace(label) ? fallbackLabel : label;
     }
 
     private static object BuildDeckUpgradeSelectionPayload(
@@ -4138,9 +4793,10 @@ internal static class BridgeGameApi
                 ? TryGetNodeText(GetHiddenFieldValue(restSiteRoom, "<Description>k__BackingField") as Node)
                 : null,
             proceed_visible = visible &&
-                              !HasVisibleRestSiteOptions(restSiteButtons) &&
+                              !HasVisibleEnabledRestSiteOptions(restSiteButtons) &&
                               restSiteProceedButton is not null &&
-                              IsNodeVisible(restSiteProceedButton),
+                              IsNodeVisible(restSiteProceedButton) &&
+                              IsButtonEnabled(restSiteProceedButton),
             options
         };
     }
@@ -4438,6 +5094,7 @@ internal static class BridgeGameApi
         Node? cardSelectionScreen,
         NCharacterSelectScreen? characterSelectScreen,
         NDeckUpgradeSelectScreen? deckUpgradeScreen,
+        NCrystalSphereScreen? crystalSphereScreen,
         IReadOnlyList<NEventOptionButton> eventOptionButtons,
         Node? mainMenuRoot,
         Node? runModeSubmenu,
@@ -4458,6 +5115,7 @@ internal static class BridgeGameApi
         var isDeckUpgradeVisible = deckUpgradeScreen is not null && IsNodeVisible(deckUpgradeScreen);
         var isRunModeVisible = runModeSubmenu is not null && IsNodeVisible(runModeSubmenu);
         var isCharacterSelectVisible = characterSelectScreen is not null && IsNodeVisible(characterSelectScreen);
+        var isCrystalSphereVisible = crystalSphereScreen is not null && IsNodeVisible(crystalSphereScreen);
         var currentScreen = InvokeParameterless(screenStateTracker, "GetCurrentScreen");
         if (currentScreen is not null)
         {
@@ -4490,6 +5148,11 @@ internal static class BridgeGameApi
             if (isMapOpen)
             {
                 return "MAP";
+            }
+
+            if (isCrystalSphereVisible)
+            {
+                return "EVENT_CRYSTAL_SPHERE";
             }
 
             if (isCharacterSelectVisible)
@@ -4559,6 +5222,11 @@ internal static class BridgeGameApi
         if (mainMenuRoot is not null && IsNodeVisible(mainMenuRoot))
         {
             return "MAIN_MENU";
+        }
+
+        if (isCrystalSphereVisible)
+        {
+            return "EVENT_CRYSTAL_SPHERE";
         }
 
         if (isMapOpen)
@@ -4696,9 +5364,11 @@ internal static class BridgeGameApi
         return GetHiddenPropertyValue<bool>(pointNode, "IsTravelable") ?? false;
     }
 
-    private static bool HasVisibleRestSiteOptions(IReadOnlyList<NRestSiteButton> restSiteButtons)
+    private static bool HasVisibleEnabledRestSiteOptions(IReadOnlyList<NRestSiteButton> restSiteButtons)
     {
-        return restSiteButtons.Any(static button => IsNodeVisible(button) && button.Option is not null);
+        return restSiteButtons.Any(static button =>
+            IsNodeVisible(button) &&
+            button.Option is { IsEnabled: true });
     }
 
     private static bool IsButtonEnabled(object? target)
@@ -4779,8 +5449,8 @@ internal static class BridgeGameApi
         return actionId.StartsWith("card_selection:select:", StringComparison.Ordinal);
     }
 
-    private static async Task<(BridgeSnapshot Snapshot, List<object> AutoExecutedActions)> MaybeAutoProceedAfterRewardActionAsync(
-        BridgeSnapshot snapshot,
+    private static async Task<(ObservedFrontier Frontier, List<object> AutoExecutedActions)> MaybeAutoProceedAfterRewardActionAsync(
+        ObservedFrontier frontier,
         CancellationToken cancellationToken)
     {
         var autoExecutedActions = new List<object>();
@@ -4788,45 +5458,36 @@ internal static class BridgeGameApi
 
         for (var attempt = 0; attempt < 12; attempt++)
         {
-            var nonAutomationActions = snapshot.Actions
-                .Where(action => !action.ActionId.StartsWith("automation:", StringComparison.Ordinal))
-                .ToArray();
+            var nonAutomationActions = GetNonAutomationActions(frontier.Snapshot);
 
             if (nonAutomationActions.Length == 1 &&
                 nonAutomationActions[0].ActionId.Equals("proceed", StringComparison.Ordinal))
             {
                 if (autoProceedCount >= 3)
                 {
-                    return (snapshot, autoExecutedActions);
+                    return (frontier, autoExecutedActions);
                 }
 
-                await BridgeCoordinator.RunOnMainThreadAsync(() =>
-                {
-                    nonAutomationActions[0].Execute();
-                    return true;
-                });
-
-                const int autoProceedWaitMs = 2200;
-                var stateVersionBeforeAutoProceed = snapshot.StateVersion;
-                var stateHashBeforeAutoProceed = snapshot.StateHash;
-                await WaitForSnapshotBarrierAsync(autoProceedWaitMs, cancellationToken);
-                snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
-                snapshot = await MaybeWaitForStablePostActionSnapshotAsync("proceed", snapshot, cancellationToken);
+                var beforeAutoProceed = frontier;
+                frontier = await ExecuteActionAndWaitForFrontierAsync(
+                    frontier,
+                    "proceed",
+                    nonAutomationActions[0],
+                    waitAfterMs: 0,
+                    cancellationToken);
                 autoProceedCount++;
-                var stateChanged =
-                    snapshot.StateVersion != stateVersionBeforeAutoProceed ||
-                    !snapshot.StateHash.Equals(stateHashBeforeAutoProceed, StringComparison.Ordinal);
+                var stateChanged = HasFrontierChanged(beforeAutoProceed, frontier);
                 autoExecutedActions.Add(new
                 {
                     action_id = "proceed",
                     source = "auto_after_reward",
-                    wait_after_ms = autoProceedWaitMs,
+                    wait_after_ms = 0,
                     state_changed = stateChanged
                 });
 
                 if (!stateChanged)
                 {
-                    return (snapshot, autoExecutedActions);
+                    return (frontier, autoExecutedActions);
                 }
 
                 continue;
@@ -4834,7 +5495,7 @@ internal static class BridgeGameApi
 
             if (nonAutomationActions.Length > 0)
             {
-                return (snapshot, autoExecutedActions);
+                return (frontier, autoExecutedActions);
             }
 
             if (attempt >= 11)
@@ -4842,47 +5503,50 @@ internal static class BridgeGameApi
                 break;
             }
 
-            await WaitForSnapshotBarrierAsync(500, cancellationToken);
-            snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
+            var beforePassiveWait = frontier;
+            frontier = await WaitForNextObservedFrontierAsync(
+                frontier,
+                PassiveFrontierWaitTimeoutMs,
+                cancellationToken);
+            if (!HasFrontierChanged(beforePassiveWait, frontier))
+            {
+                break;
+            }
         }
 
-        return (snapshot, autoExecutedActions);
+        return (frontier, autoExecutedActions);
     }
 
-    private static async Task<(BridgeSnapshot Snapshot, List<object> AutoExecutedActions)> MaybeAutoCompleteCardSelectionAsync(
-        BridgeSnapshot snapshot,
+    private static async Task<(ObservedFrontier Frontier, List<object> AutoExecutedActions)> MaybeAutoCompleteCardSelectionAsync(
+        ObservedFrontier frontier,
         CancellationToken cancellationToken)
     {
         var autoExecutedActions = new List<object>();
 
-        if (!ShouldAutoCompleteCardSelection(snapshot))
+        if (!ShouldAutoCompleteCardSelection(frontier.Snapshot))
         {
-            return (snapshot, autoExecutedActions);
+            return (frontier, autoExecutedActions);
         }
 
-        if (!snapshot.ActionLookup.TryGetValue("card_selection:confirm", out var confirmAction))
+        if (!frontier.Snapshot.ActionLookup.TryGetValue("card_selection:confirm", out var confirmAction))
         {
-            return (snapshot, autoExecutedActions);
+            return (frontier, autoExecutedActions);
         }
 
-        await BridgeCoordinator.RunOnMainThreadAsync(() =>
-        {
-            confirmAction.Execute();
-            return true;
-        });
-
-        const int autoConfirmWaitMs = 1800;
-        await WaitForSnapshotBarrierAsync(autoConfirmWaitMs, cancellationToken);
-        snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
-        snapshot = await MaybeWaitForStablePostActionSnapshotAsync("card_selection:confirm", snapshot, cancellationToken);
+        frontier = await ExecuteActionAndWaitForFrontierAsync(
+            frontier,
+            "card_selection:confirm",
+            confirmAction,
+            waitAfterMs: 0,
+            cancellationToken);
         autoExecutedActions.Add(new
         {
             action_id = "card_selection:confirm",
             source = "auto_after_card_selection",
-            wait_after_ms = autoConfirmWaitMs
+            wait_after_ms = 0
         });
 
-        return (snapshot, autoExecutedActions);
+        return (frontier, autoExecutedActions);
     }
 
     private static bool ShouldAutoCompleteCardSelection(BridgeSnapshot snapshot)
@@ -5102,6 +5766,49 @@ internal static class BridgeGameApi
         InvokeClickablePressAndRelease(button);
     }
 
+    private static void InvokeCrystalSphereDivinationAction(
+        NCrystalSphereScreen? crystalSphereScreen,
+        NDivinationButton button,
+        bool useBigDivination)
+    {
+        if (crystalSphereScreen is not null)
+        {
+            InvokeSingleArgumentAction(
+                crystalSphereScreen,
+                useBigDivination ? "SetBigDivination" : "SetSmallDivination",
+                button);
+            return;
+        }
+
+        InvokeButtonAction(button, "OnRelease", "OnPress");
+    }
+
+    private static void InvokeCrystalSphereCellAction(
+        NCrystalSphereScreen? crystalSphereScreen,
+        NCrystalSphereCell cell)
+    {
+        if (crystalSphereScreen is not null)
+        {
+            InvokeSingleArgumentAction(crystalSphereScreen, "OnCellClicked", cell);
+            return;
+        }
+
+        InvokeButtonAction(cell, "EntityClicked");
+    }
+
+    private static void InvokeCrystalSphereProceedAction(
+        NCrystalSphereScreen? crystalSphereScreen,
+        NProceedButton button)
+    {
+        if (crystalSphereScreen is not null &&
+            TryInvokeSingleArgument(crystalSphereScreen, "OnProceedButtonPressed", button))
+        {
+            return;
+        }
+
+        InvokeProceedButtonAction(button);
+    }
+
     private static void InvokeRoomProceedAction(BridgeWorldContext context)
     {
         if (context.ProceedButton is null)
@@ -5157,6 +5864,16 @@ internal static class BridgeGameApi
         }
 
         InvokeProceedButtonAction(button);
+    }
+
+    private static void InvokeMerchantBackAction(NMerchantInventory? merchantInventory, NBackButton button)
+    {
+        if (TryInvokeParameterless(merchantInventory, "Close"))
+        {
+            return;
+        }
+
+        InvokeButtonAction(button, "OnPress");
     }
 
     private static void InvokeTreasureChestAction(NTreasureRoom? treasureRoom, NTreasureButton chestButton)
@@ -5252,16 +5969,18 @@ internal static class BridgeGameApi
 
     private static void TryAutoConfirmSelectedCardSelection(Node? cardSelectionScreen)
     {
+        if (cardSelectionScreen is NSimpleCardSelectScreen)
+        {
+            return;
+        }
+
         if (!ShouldAutoConfirmSingleCardSelection(cardSelectionScreen) ||
             CountSelectedCardSelectionCards(cardSelectionScreen) <= 0)
         {
             return;
         }
 
-        var confirmButton =
-            GetHiddenFieldValue(cardSelectionScreen, "_confirmButton") as Node ??
-            GetHiddenFieldValue(cardSelectionScreen, "_previewConfirmButton") as Node ??
-            GetHiddenFieldValue(cardSelectionScreen, "_selectModeConfirmButton") as Node;
+        var confirmButton = ResolveCardSelectionConfirmButton(cardSelectionScreen);
         if (confirmButton is null)
         {
             return;
@@ -5279,7 +5998,7 @@ internal static class BridgeGameApi
             return;
         }
 
-        if (TryInvokeParameterless(cardSelectionScreen, "CompleteSelection"))
+        if (TryInvokeCardSelectionCompleteSelection(cardSelectionScreen))
         {
             return;
         }
@@ -5582,6 +6301,38 @@ internal static class BridgeGameApi
         return true;
     }
 
+    private static bool TryInvokeCardSelectionCompleteSelection(Node? cardSelectionScreen)
+    {
+        if (cardSelectionScreen is null)
+        {
+            return false;
+        }
+
+        var method = FindMethod(cardSelectionScreen.GetType(), "CompleteSelection", 0);
+        if (method is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            method.Invoke(cardSelectionScreen, Array.Empty<object>());
+            return true;
+        }
+        catch (TargetInvocationException ex) when (IsBenignCardSelectionCompletionException(ex.InnerException))
+        {
+            return true;
+        }
+    }
+
+    private static bool IsBenignCardSelectionCompletionException(Exception? exception)
+    {
+        return exception is InvalidOperationException invalidOperationException &&
+               invalidOperationException.Message.Contains(
+                   "transition a task to a final state",
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool TryInvokeSingleArgument(object? target, string methodName, object argument)
     {
         if (target is null)
@@ -5722,6 +6473,39 @@ internal static class BridgeGameApi
         return candidates.FirstOrDefault(IsNodeVisible);
     }
 
+    private static Node? ResolveCardSelectionConfirmButton(Node? cardSelectionScreen)
+    {
+        if (cardSelectionScreen is null)
+        {
+            return null;
+        }
+
+        if (cardSelectionScreen is NDeckCardSelectScreen)
+        {
+            var previewContainer = GetHiddenFieldValue(cardSelectionScreen, "_previewContainer") as Node;
+            if (previewContainer is not null && IsNodeVisible(previewContainer))
+            {
+                var previewConfirmButton =
+                    GetHiddenFieldValue(cardSelectionScreen, "_previewConfirmButton") as Node;
+                if (previewConfirmButton is not null && IsNodeVisible(previewConfirmButton))
+                {
+                    return previewConfirmButton;
+                }
+            }
+
+            var confirmButton = GetHiddenFieldValue(cardSelectionScreen, "_confirmButton") as Node;
+            if (confirmButton is not null && IsNodeVisible(confirmButton))
+            {
+                return confirmButton;
+            }
+        }
+
+        return ResolveFirstVisibleNode(
+            GetHiddenFieldValue(cardSelectionScreen, "_confirmButton") as Node,
+            GetHiddenFieldValue(cardSelectionScreen, "_previewConfirmButton") as Node,
+            GetHiddenFieldValue(cardSelectionScreen, "_selectModeConfirmButton") as Node);
+    }
+
     private static Node? ResolveCombatHandSelectionNode(NPlayerHand? playerHand)
     {
         if (playerHand is null || !IsNodeVisible(playerHand))
@@ -5774,11 +6558,13 @@ internal static class BridgeGameApi
 
         if (cardSelectionScreen is NPlayerHand playerHand)
         {
-            return SortByVisualPosition(
-                    FindVisibleDescendants<NCardHolder>(playerHand)
-                        .Where(static holder =>
-                            holder.CardModel is not null &&
-                            holder is not NSelectedHandCardHolder))
+            return FindVisibleDescendants<NCardHolder>(playerHand)
+                    .Where(static holder =>
+                        holder.CardModel is not null &&
+                        holder is not NSelectedHandCardHolder)
+                    .OrderBy(holder => TryGetCombatHandCardSelectionIndex(holder.CardModel) ?? int.MaxValue)
+                    .ThenBy(static holder => holder is Control control ? control.GlobalPosition.Y : 0f)
+                    .ThenBy(static holder => holder is Control control ? control.GlobalPosition.X : 0f)
                 .DistinctBy(static holder => holder.CardModel, ReferenceEqualityComparer.Instance)
                 .ToArray();
         }
@@ -5793,15 +6579,30 @@ internal static class BridgeGameApi
     private static NProceedButton? ResolveVisibleProceedButton(
         Node? root,
         NProceedButton? preferredProceedButton,
+        NProceedButton? treasureProceedButton,
         NProceedButton? restSiteProceedButton,
         NProceedButton? merchantProceedButton)
     {
-        if (preferredProceedButton is not null && IsNodeVisible(preferredProceedButton))
+        if (preferredProceedButton is not null &&
+            IsNodeVisible(preferredProceedButton) &&
+            IsButtonEnabled(preferredProceedButton))
         {
             return preferredProceedButton;
         }
 
+        if (treasureProceedButton is not null &&
+            IsNodeVisible(treasureProceedButton) &&
+            IsButtonEnabled(treasureProceedButton))
+        {
+            return treasureProceedButton;
+        }
+
         var excludedButtons = new HashSet<IntPtr>();
+        if (treasureProceedButton is not null && GodotObject.IsInstanceValid(treasureProceedButton))
+        {
+            excludedButtons.Add(treasureProceedButton.NativeInstance);
+        }
+
         if (restSiteProceedButton is not null && GodotObject.IsInstanceValid(restSiteProceedButton))
         {
             excludedButtons.Add(restSiteProceedButton.NativeInstance);
@@ -5814,7 +6615,9 @@ internal static class BridgeGameApi
 
         return SortByVisualPosition(
                 FindVisibleDescendants<NProceedButton>(root)
-                    .Where(button => !excludedButtons.Contains(button.NativeInstance)))
+                    .Where(button =>
+                        !excludedButtons.Contains(button.NativeInstance) &&
+                        IsButtonEnabled(button)))
             .LastOrDefault();
     }
 
@@ -5837,7 +6640,8 @@ internal static class BridgeGameApi
     {
         if (context.TreasureRoom is null ||
             context.TreasureChestButton is null ||
-            !IsNodeVisible(context.TreasureChestButton))
+            !IsNodeVisible(context.TreasureChestButton) ||
+            !IsButtonEnabled(context.TreasureChestButton))
         {
             return false;
         }
@@ -5896,6 +6700,123 @@ internal static class BridgeGameApi
         }
 
         return false;
+    }
+
+    private static int GetCardSelectionOptionIndex(
+        Node? cardSelectionScreen,
+        NCardHolder cardHolder,
+        int fallbackIndex)
+    {
+        if (cardSelectionScreen is NPlayerHand &&
+            TryGetCombatHandCardSelectionIndex(cardHolder.CardModel) is int handIndex)
+        {
+            return handIndex;
+        }
+
+        return fallbackIndex;
+    }
+
+    private static string? GetCardSelectionOptionSelectionId(
+        Node? cardSelectionScreen,
+        NCardHolder cardHolder,
+        int optionIndex)
+    {
+        if (cardHolder.CardModel is null)
+        {
+            return null;
+        }
+
+        return GetCardReference(cardHolder.CardModel);
+    }
+
+    private static string GetCardReference(CardModel card)
+    {
+        return $"card-{RuntimeHelpers.GetHashCode(card):x8}";
+    }
+
+    private static int? TryGetIntFromPropertyOrField(object? target, params string[] memberNames)
+    {
+        foreach (var memberName in memberNames)
+        {
+            var value = GetHiddenPropertyObjectValue(target, memberName) ?? GetHiddenFieldValue(target, memberName);
+            if (TryConvertToInt(value) is int intValue)
+            {
+                return intValue;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool? TryGetBoolFromPropertyOrField(object? target, params string[] memberNames)
+    {
+        foreach (var memberName in memberNames)
+        {
+            var value = GetHiddenPropertyObjectValue(target, memberName) ?? GetHiddenFieldValue(target, memberName);
+            if (value is bool boolValue)
+            {
+                return boolValue;
+            }
+        }
+
+        return null;
+    }
+
+    private static int? TryConvertToInt(object? value)
+    {
+        try
+        {
+            return value switch
+            {
+                null => null,
+                byte byteValue => byteValue,
+                sbyte sbyteValue => sbyteValue,
+                short shortValue => shortValue,
+                ushort ushortValue => ushortValue,
+                int intValue => intValue,
+                uint uintValue when uintValue <= int.MaxValue => (int)uintValue,
+                long longValue when longValue >= int.MinValue && longValue <= int.MaxValue => (int)longValue,
+                ulong ulongValue when ulongValue <= int.MaxValue => (int)ulongValue,
+                Enum enumValue => Convert.ToInt32(enumValue, CultureInfo.InvariantCulture),
+                _ => null
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static int? TryGetCombatHandCardSelectionIndex(CardModel? card)
+    {
+        if (card?.Owner is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            var handPile = PileType.Hand.GetPile(card.Owner);
+            var cards = handPile?.Cards;
+            if (cards is null)
+            {
+                return null;
+            }
+
+            for (var index = 0; index < cards.Count; index++)
+            {
+                if (ReferenceEquals(cards[index], card))
+                {
+                    return index;
+                }
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static PropertyInfo? FindProperty(Type? type, string propertyName)
@@ -6232,7 +7153,7 @@ internal static class BridgeGameApi
         }
 
         var collapsed = CollapseKnownImageTagMarkers(text, "energy", "点能量", allowCountPrefix: true);
-        collapsed = CollapseKnownImageTagMarkers(collapsed, "star", "点星辉");
+        collapsed = CollapseKnownImageTagMarkers(collapsed, "star", "点星辉", allowCountPrefix: true);
 
         var unknownPattern =
             $"{Regex.Escape(ImageTagMarkerPrefix)}(?<token>[^>]+){Regex.Escape(ImageTagMarkerSuffix)}";
@@ -7531,6 +8452,48 @@ internal static class BridgeGameApi
         return string.Concat(text.Where(static character => !char.IsWhiteSpace(character))).ToLowerInvariant();
     }
 
+    private static JsonNode? PruneSemanticStateNode(JsonNode? node)
+    {
+        switch (node)
+        {
+            case null:
+                return null;
+            case JsonObject jsonObject:
+            {
+                var result = new JsonObject();
+                foreach (var property in jsonObject)
+                {
+                    if (SemanticStateExcludedPropertyNames.Contains(property.Key))
+                    {
+                        continue;
+                    }
+
+                    var prunedValue = PruneSemanticStateNode(property.Value);
+                    if (prunedValue is null)
+                    {
+                        continue;
+                    }
+
+                    result[property.Key] = prunedValue;
+                }
+
+                return result;
+            }
+            case JsonArray jsonArray:
+            {
+                var result = new JsonArray();
+                foreach (var item in jsonArray)
+                {
+                    result.Add(PruneSemanticStateNode(item));
+                }
+
+                return result;
+            }
+            default:
+                return node.DeepClone();
+        }
+    }
+
     private static string ComputeStateHash(object payload)
     {
         var json = JsonSerializer.Serialize(payload, HashJsonOptions);
@@ -7538,10 +8501,16 @@ internal static class BridgeGameApi
         return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 
-    private static int ComputeStateVersion(string stateHash)
+    private static string ComputeFrontierHash(object payload)
     {
-        var bytes = Convert.FromHexString(stateHash);
-        return unchecked((int)(BinaryPrimitives.ReadUInt32LittleEndian(bytes) & 0x7fffffff));
+        return ComputeStateHash(payload);
+    }
+
+    private static object BuildFrontierStatePayload(
+        BridgeSnapshot snapshot,
+        long sequence)
+    {
+        return CreateStatePayload(snapshot.Fields, sequence, snapshot.FrontierHash, snapshot.StateHash);
     }
 
     private sealed class BridgeWorldContext
@@ -7636,6 +8605,16 @@ internal static class BridgeGameApi
 
         public NEventRoom? EventRoom { get; init; }
 
+        public NCrystalSphereScreen? CrystalSphereScreen { get; init; }
+
+        public required IReadOnlyList<NCrystalSphereCell> CrystalSphereCells { get; init; }
+
+        public NDivinationButton? CrystalSphereSmallDivinationButton { get; init; }
+
+        public NDivinationButton? CrystalSphereBigDivinationButton { get; init; }
+
+        public NProceedButton? CrystalSphereProceedButton { get; init; }
+
         public Node? HoverTipSet { get; init; }
 
         public required IReadOnlyList<NMapPoint> MapPoints { get; init; }
@@ -7678,6 +8657,453 @@ internal static class BridgeGameApi
         public required Action Execute { get; init; }
     }
 
+    private sealed class ObservedFrontier
+    {
+        public required long Sequence { get; init; }
+
+        public required string FrontierHash { get; init; }
+
+        public required BridgeSnapshot Snapshot { get; init; }
+
+        public required object StatePayload { get; init; }
+    }
+
+    private sealed class BridgeFrontierCandidate
+    {
+        public required BridgeWorldContext Context { get; init; }
+
+        public required IReadOnlyList<BridgeResolvedAction> Actions { get; init; }
+
+        public required string FrontierHash { get; init; }
+    }
+
+    private sealed class FrontierWaiter
+    {
+        public required Guid Id { get; init; }
+
+        public required long AfterSequence { get; init; }
+
+        public required TaskCompletionSource<ObservedFrontier> Completion { get; init; }
+    }
+
+    private static class BridgeFrontierStore
+    {
+        private const int StreamStableTickTarget = 1;
+        private const int StreamHeartbeatIntervalMs = 15000;
+
+        private static readonly object Sync = new();
+        private static readonly Dictionary<Guid, Channel<ObservedFrontier>> Subscribers = new();
+        private static readonly Dictionary<Guid, FrontierWaiter> Waiters = new();
+        private static ObservedFrontier? _current;
+        private static string? _candidateFrontierHash;
+        private static BridgeFrontierCandidate? _candidate;
+        private static int _candidateStableTicks;
+        private static long _nextSequence = 1;
+
+        public static void Reset()
+        {
+            List<Channel<ObservedFrontier>> subscriberChannels;
+            List<TaskCompletionSource<ObservedFrontier>> waiterCompletions;
+            lock (Sync)
+            {
+                subscriberChannels = Subscribers.Values.ToList();
+                waiterCompletions = Waiters.Values
+                    .Select(static waiter => waiter.Completion)
+                    .ToList();
+                Subscribers.Clear();
+                Waiters.Clear();
+                _current = null;
+                _candidateFrontierHash = null;
+                _candidate = null;
+                _candidateStableTicks = 0;
+                _nextSequence = 1;
+            }
+
+            foreach (var channel in subscriberChannels)
+            {
+                channel.Writer.TryComplete();
+            }
+
+            foreach (var completion in waiterCompletions)
+            {
+                completion.TrySetCanceled();
+            }
+        }
+
+        public static ObservedFrontier PublishSnapshot(BridgeSnapshot snapshot)
+        {
+            ObservedFrontier frontier;
+            List<Channel<ObservedFrontier>> subscriberChannels = [];
+            List<TaskCompletionSource<ObservedFrontier>> waiterCompletions = [];
+            bool changed;
+
+            lock (Sync)
+            {
+                var previousFrontierHash = _current?.FrontierHash;
+                frontier = GetOrCreateFrontierLocked(snapshot);
+                _candidateFrontierHash = frontier.FrontierHash;
+                _candidate = null;
+                _candidateStableTicks = StreamStableTickTarget;
+                changed = !string.Equals(previousFrontierHash, frontier.FrontierHash, StringComparison.Ordinal);
+
+                if (changed)
+                {
+                    subscriberChannels = Subscribers.Values.ToList();
+                    waiterCompletions = CollectReadyWaitersLocked(frontier);
+                }
+            }
+
+            if (changed)
+            {
+                BroadcastFrontier(subscriberChannels, frontier);
+                CompleteWaiters(waiterCompletions, frontier);
+            }
+            return frontier;
+        }
+
+        public static async Task<ObservedFrontier?> WaitForNextFrontierAsync(
+            long afterSequence,
+            int timeoutMs,
+            CancellationToken cancellationToken)
+        {
+            if (timeoutMs <= 0)
+            {
+                lock (Sync)
+                {
+                    if (_current is not null && _current.Sequence > afterSequence)
+                    {
+                        return _current;
+                    }
+                }
+
+                return null;
+            }
+
+            FrontierWaiter waiter;
+            lock (Sync)
+            {
+                if (_current is not null && _current.Sequence > afterSequence)
+                {
+                    return _current;
+                }
+
+                waiter = new FrontierWaiter
+                {
+                    Id = Guid.NewGuid(),
+                    AfterSequence = afterSequence,
+                    Completion = new TaskCompletionSource<ObservedFrontier>(
+                        TaskCreationOptions.RunContinuationsAsynchronously)
+                };
+                Waiters[waiter.Id] = waiter;
+            }
+
+            try
+            {
+                var completedTask = await Task.WhenAny(
+                    waiter.Completion.Task,
+                    Task.Delay(timeoutMs, cancellationToken));
+                if (completedTask == waiter.Completion.Task)
+                {
+                    return await waiter.Completion.Task;
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                return null;
+            }
+            finally
+            {
+                lock (Sync)
+                {
+                    Waiters.Remove(waiter.Id);
+                }
+            }
+        }
+
+        public static void OnPumpTick()
+        {
+            bool shouldSample;
+            lock (Sync)
+            {
+                shouldSample = Subscribers.Count > 0 || Waiters.Count > 0;
+            }
+
+            if (!shouldSample)
+            {
+                return;
+            }
+
+            try
+            {
+                var candidate = CaptureFrontierCandidate();
+                ObservedFrontier? frontierToPublish = null;
+                List<Channel<ObservedFrontier>> subscriberChannels = [];
+                List<TaskCompletionSource<ObservedFrontier>> waiterCompletions = [];
+                BridgeFrontierCandidate? candidateToHydrate = null;
+
+                lock (Sync)
+                {
+                    if (_current is not null &&
+                        string.Equals(_current.FrontierHash, candidate.FrontierHash, StringComparison.Ordinal))
+                    {
+                        _candidateFrontierHash = candidate.FrontierHash;
+                        _candidate = null;
+                        _candidateStableTicks = StreamStableTickTarget;
+                        return;
+                    }
+
+                    if (string.Equals(_candidateFrontierHash, candidate.FrontierHash, StringComparison.Ordinal))
+                    {
+                        _candidateStableTicks++;
+                        _candidate = candidate;
+                    }
+                    else
+                    {
+                        _candidateFrontierHash = candidate.FrontierHash;
+                        _candidate = candidate;
+                        _candidateStableTicks = 0;
+                    }
+
+                    if (_candidateStableTicks < StreamStableTickTarget || _candidate is null)
+                    {
+                        return;
+                    }
+
+                    candidateToHydrate = _candidate;
+                }
+
+                if (candidateToHydrate is null)
+                {
+                    return;
+                }
+
+                var snapshot = HydrateSnapshot(candidateToHydrate);
+
+                lock (Sync)
+                {
+                    if (!string.Equals(_candidateFrontierHash, snapshot.FrontierHash, StringComparison.Ordinal))
+                    {
+                        return;
+                    }
+
+                    if (_current is not null &&
+                        string.Equals(_current.FrontierHash, snapshot.FrontierHash, StringComparison.Ordinal))
+                    {
+                        _candidate = null;
+                        _candidateStableTicks = StreamStableTickTarget;
+                        return;
+                    }
+
+                    frontierToPublish = GetOrCreateFrontierLocked(snapshot);
+                    _candidate = null;
+                    _candidateStableTicks = StreamStableTickTarget;
+                    subscriberChannels = Subscribers.Values.ToList();
+                    waiterCompletions = CollectReadyWaitersLocked(frontierToPublish);
+                }
+
+                if (frontierToPublish is not null)
+                {
+                    BroadcastFrontier(subscriberChannels, frontierToPublish);
+                    CompleteWaiters(waiterCompletions, frontierToPublish);
+                }
+            }
+            catch (Exception ex)
+            {
+                BridgeDebugTrace.Write($"frontier_pump_error: {ex}");
+            }
+        }
+
+        public static async Task StreamEventsAsync(
+            HttpListenerResponse response,
+            CancellationToken cancellationToken)
+        {
+            response.StatusCode = (int)HttpStatusCode.OK;
+            response.ContentType = "text/event-stream; charset=utf-8";
+            response.SendChunked = true;
+            response.KeepAlive = true;
+            response.Headers["Cache-Control"] = "no-cache";
+            response.Headers["X-Accel-Buffering"] = "no";
+
+            var subscriberId = Guid.NewGuid();
+            var channel = Channel.CreateUnbounded<ObservedFrontier>(new UnboundedChannelOptions
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                AllowSynchronousContinuations = false
+            });
+
+            lock (Sync)
+            {
+                Subscribers[subscriberId] = channel;
+            }
+
+            try
+            {
+                var initialFrontier = await ObserveFrontierAsync(cancellationToken);
+                await WriteFrontierEventAsync(response, initialFrontier, cancellationToken);
+                while (channel.Reader.TryRead(out _))
+                {
+                }
+
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var waitToReadTask = channel.Reader.WaitToReadAsync(cancellationToken).AsTask();
+                    var completedTask = await Task.WhenAny(
+                        waitToReadTask,
+                        Task.Delay(StreamHeartbeatIntervalMs, cancellationToken));
+
+                    if (completedTask != waitToReadTask)
+                    {
+                        await WriteSseCommentAsync(response, "heartbeat", cancellationToken);
+                        continue;
+                    }
+
+                    if (!await waitToReadTask)
+                    {
+                        break;
+                    }
+
+                    ObservedFrontier? latestFrontier = null;
+                    while (channel.Reader.TryRead(out var frontier))
+                    {
+                        latestFrontier = frontier;
+                    }
+
+                    if (latestFrontier is not null)
+                    {
+                        await WriteFrontierEventAsync(response, latestFrontier, cancellationToken);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (HttpListenerException)
+            {
+            }
+            catch (IOException)
+            {
+            }
+            finally
+            {
+                lock (Sync)
+                {
+                    Subscribers.Remove(subscriberId);
+                }
+
+                channel.Writer.TryComplete();
+
+                try
+                {
+                    response.OutputStream.Close();
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private static ObservedFrontier GetOrCreateFrontierLocked(BridgeSnapshot snapshot)
+        {
+            var frontierHash = snapshot.FrontierHash;
+            if (_current is not null &&
+                string.Equals(_current.FrontierHash, frontierHash, StringComparison.Ordinal))
+            {
+                return _current;
+            }
+
+            var sequence = _nextSequence++;
+            var payload = BuildFrontierStatePayload(snapshot, sequence);
+            _current = new ObservedFrontier
+            {
+                Sequence = sequence,
+                FrontierHash = frontierHash,
+                Snapshot = snapshot,
+                StatePayload = payload
+            };
+            return _current;
+        }
+
+        private static void BroadcastFrontier(
+            IEnumerable<Channel<ObservedFrontier>> subscriberChannels,
+            ObservedFrontier frontier)
+        {
+            foreach (var channel in subscriberChannels)
+            {
+                channel.Writer.TryWrite(frontier);
+            }
+        }
+
+        private static List<TaskCompletionSource<ObservedFrontier>> CollectReadyWaitersLocked(ObservedFrontier frontier)
+        {
+            var completions = new List<TaskCompletionSource<ObservedFrontier>>();
+            foreach (var waiter in Waiters.Values.ToArray())
+            {
+                if (frontier.Sequence <= waiter.AfterSequence)
+                {
+                    continue;
+                }
+
+                completions.Add(waiter.Completion);
+                Waiters.Remove(waiter.Id);
+            }
+
+            return completions;
+        }
+
+        private static void CompleteWaiters(
+            IEnumerable<TaskCompletionSource<ObservedFrontier>> waiterCompletions,
+            ObservedFrontier frontier)
+        {
+            foreach (var completion in waiterCompletions)
+            {
+                completion.TrySetResult(frontier);
+            }
+        }
+
+        private static async Task WriteFrontierEventAsync(
+            HttpListenerResponse response,
+            ObservedFrontier frontier,
+            CancellationToken cancellationToken)
+        {
+            var payload = JsonSerializer.Serialize(new
+            {
+                ok = true,
+                event_type = "frontier",
+                state = frontier.StatePayload
+            }, HashJsonOptions);
+            await WriteSseEventAsync(response, "frontier", payload, cancellationToken);
+        }
+
+        private static async Task WriteSseEventAsync(
+            HttpListenerResponse response,
+            string eventName,
+            string payload,
+            CancellationToken cancellationToken)
+        {
+            var builder = new StringBuilder();
+            builder.Append("event: ").Append(eventName).Append('\n');
+            foreach (var line in payload.ReplaceLineEndings("\n").Split('\n'))
+            {
+                builder.Append("data: ").Append(line).Append('\n');
+            }
+
+            builder.Append('\n');
+            var bytes = Encoding.UTF8.GetBytes(builder.ToString());
+            await response.OutputStream.WriteAsync(bytes, cancellationToken);
+            await response.OutputStream.FlushAsync(cancellationToken);
+        }
+
+        private static async Task WriteSseCommentAsync(
+            HttpListenerResponse response,
+            string comment,
+            CancellationToken cancellationToken)
+        {
+            var bytes = Encoding.UTF8.GetBytes($": {comment}\n\n");
+            await response.OutputStream.WriteAsync(bytes, cancellationToken);
+            await response.OutputStream.FlushAsync(cancellationToken);
+        }
+    }
+
     private sealed class ResolvedCardTarget
     {
         public string? ActionSuffix { get; init; }
@@ -7698,6 +9124,37 @@ internal static class BridgeGameApi
         public Creature? Target { get; init; }
 
         public required bool RequiresTargetSelection { get; init; }
+    }
+
+    private sealed record CrystalSphereEventOptionDescriptor
+    {
+        public required int Index { get; init; }
+
+        public required string OptionType { get; init; }
+
+        public string? OptionId { get; init; }
+
+        public required string Title { get; init; }
+
+        public string? Description { get; init; }
+
+        public bool IsProceed { get; init; }
+
+        public bool IsSelected { get; init; }
+
+        public bool IsEnabled { get; init; }
+
+        public bool ActionAvailable { get; init; }
+
+        public string? DivinationSize { get; init; }
+
+        public int? X { get; init; }
+
+        public int? Y { get; init; }
+
+        public bool? IsHighlighted { get; init; }
+
+        public Action? Execute { get; init; }
     }
 
     private sealed class BridgeStateFields
@@ -7724,6 +9181,8 @@ internal static class BridgeGameApi
 
         public required object EventOptions { get; init; }
 
+        public required object CrystalSphere { get; init; }
+
         public required object Map { get; init; }
 
         public required object RestSite { get; init; }
@@ -7739,7 +9198,9 @@ internal static class BridgeGameApi
 
     private sealed class BridgeSnapshot
     {
-        public required int StateVersion { get; init; }
+        public required long StateVersion { get; init; }
+
+        public required string FrontierHash { get; init; }
 
         public required string StateHash { get; init; }
 
