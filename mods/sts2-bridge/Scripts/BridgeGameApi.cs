@@ -69,6 +69,15 @@ internal sealed class BridgeActionRequest
     public string? RequestedActionId => ActionId ?? LegacyActionId;
 }
 
+/// <summary>
+/// POST /console 请求:透传任意游戏/模组控制台命令(如 partsplice shell)。
+/// </summary>
+internal sealed class BridgeConsoleRequest
+{
+    [JsonPropertyName("command")]
+    public string? Command { get; set; }
+}
+
 internal sealed class BridgeRequestException : Exception
 {
     public BridgeRequestException(
@@ -531,7 +540,8 @@ internal static class BridgeGameApi
         return new
         {
             in_progress = combatManager.IsInProgress,
-            is_play_phase = combatManager.IsPlayPhase,
+            // v0.110.1:玩家可行动 = 任一玩家处于 Play 阶段(CombatManager.IsPlayPhase 在新版本才存在)
+            is_play_phase = combatState.Players.Any(p => p.PlayerCombatState?.Phase == PlayerTurnPhase.Play),
             is_paused = combatManager.IsPaused,
             is_ending = combatManager.IsEnding,
             player_actions_disabled = combatManager.PlayerActionsDisabled,
@@ -2290,7 +2300,7 @@ internal static class BridgeGameApi
         {
             var player = players[playerIndex];
             var potionSlots = player.PotionSlots;
-            if (potionSlots is null || !player.CanRemovePotions)
+            if (potionSlots is null || !player.CanUseOrRemovePotions)
             {
                 continue;
             }
@@ -2317,7 +2327,7 @@ internal static class BridgeGameApi
                         player_net_id = player.NetId,
                         slot_index = slotIndex,
                         potion = BuildPotionPayload(potion),
-                        can_remove_potions = player.CanRemovePotions,
+                        can_remove_potions = player.CanUseOrRemovePotions,
                         screen = context.Screen
                     },
                     Execute = () => ExecutePotionDiscard(
@@ -2726,7 +2736,7 @@ internal static class BridgeGameApi
 
         try
         {
-            return player.CanRemovePotions && !potion.HasBeenRemovedFromState;
+            return player.CanUseOrRemovePotions && !potion.HasBeenRemovedFromState;
         }
         catch
         {
@@ -2843,7 +2853,8 @@ internal static class BridgeGameApi
         {
             has_run = true,
             is_game_over = runState.IsGameOver,
-            current_location = TextOf(runState.CurrentLocation),
+            // v0.110.1:RunState.CurrentLocation 已改名 RunLocation(struct,ToString 为 "{mapLocation} room {roomId}")
+            current_location = runState.RunLocation.ToString(),
             current_act_index = runState.CurrentActIndex,
             ascension_level = runState.AscensionLevel,
             act_floor = runState.ActFloor,
@@ -2877,7 +2888,8 @@ internal static class BridgeGameApi
         return new
         {
             in_progress = combatManager.IsInProgress,
-            is_play_phase = combatManager.IsPlayPhase,
+            // v0.110.1:玩家可行动 = 任一玩家处于 Play 阶段(CombatManager.IsPlayPhase 在新版本才存在)
+            is_play_phase = combatState.Players.Any(p => p.PlayerCombatState?.Phase == PlayerTurnPhase.Play),
             is_paused = combatManager.IsPaused,
             is_ending = combatManager.IsEnding,
             player_actions_disabled = combatManager.PlayerActionsDisabled,
@@ -6093,16 +6105,89 @@ internal static class BridgeGameApi
             .FirstOrDefault(IsCardRewardSkipAlternativeButton);
     }
 
-    private static void InvokeCardRewardSkipAction(NCardRewardSelectionScreen? cardRewardScreen, Node? skipButton)
+    /// <summary>
+    /// POST /console:执行任意游戏/模组控制台命令(如 partsplice shell),透传 DevConsole.ProcessCommand。
+    /// </summary>
+    internal static async Task<object> ExecuteConsoleCommandAsync(BridgeConsoleRequest request, CancellationToken cancellationToken)
     {
-        if (TryInvokeSingleArgument(
-                cardRewardScreen,
-                "OnAlternateRewardSelected",
-                MegaCrit.Sts2.Core.Entities.Rewards.PostAlternateCardRewardAction.DismissScreenAndKeepReward))
+        var command = request.Command;
+        if (string.IsNullOrWhiteSpace(command))
         {
-            return;
+            throw new BridgeRequestException(
+                HttpStatusCode.BadRequest,
+                "missing_command",
+                "Request body must include a non-empty 'command' string.");
         }
 
+        // NDevConsole._instance 是私有静态字段(单例),反射读取。
+        var consoleNodeType = typeof(MegaCrit.Sts2.Core.Nodes.Debug.NDevConsole);
+        var instanceField = consoleNodeType.GetField(
+            "_instance",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        var consoleNode = instanceField?.GetValue(null) as Godot.Node;
+        if (consoleNode is null)
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "console_not_available",
+                "Dev console has not been created yet in this game session.");
+        }
+
+        // NDevConsole._devConsole 是私有实例字段,类型 MegaCrit.Sts2.Core.DevConsole.DevConsole。
+        var devConsole = GetHiddenFieldValue(consoleNode, "_devConsole");
+        if (devConsole is null)
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "console_not_available",
+                "Dev console instance (_devConsole) not found on NDevConsole.");
+        }
+
+        var processMethod = devConsole.GetType().GetMethod(
+            "ProcessCommand",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
+        if (processMethod is null)
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "console_not_available",
+                "ProcessCommand method not found on DevConsole.");
+        }
+
+        object? result;
+        try
+        {
+            // 必须在主线程执行:ProcessCommand 里若有命令触发房间切换/场景实例化(fight、parttest room 等),
+            // 那些 Godot 节点操作在后台 HTTP 线程上跑会时好时坏(偶发 NCombatRoom UI 未加载/崩溃)。
+            // 与 /action 一致,统一用 BridgeCoordinator 排到主线程。
+            result = await BridgeCoordinator.RunOnMainThreadAsync(() =>
+                processMethod.Invoke(devConsole, new object[] { command }));
+        }
+        catch (System.Reflection.TargetInvocationException ex)
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.InternalServerError,
+                "console_command_exception",
+                $"Console command '{command}' threw: {ex.InnerException?.Message ?? ex.Message}");
+        }
+
+        // CmdResult 有 public readonly 字段 success / msg。
+        var ok = result?.GetType().GetField("success")?.GetValue(result) as bool? ?? false;
+        var output = result?.GetType().GetField("msg")?.GetValue(result) as string ?? "";
+
+        // async 方法里直接返回匿名对象(不要再包 Task.FromResult,否则 payload 会是一个 Task 被序列化成信封)。
+        return new
+        {
+            ok,
+            output,
+            command
+        };
+    }
+
+    private static void InvokeCardRewardSkipAction(NCardRewardSelectionScreen? _, Node? skipButton)
+    {
+        // v0.110.1:OnAlternateRewardSelected 是私有方法且参数为 index,不再接受 PostAlternateCardRewardAction,
+        // 因此直接走 UI 的 skip 按钮 fallback(新版本的 DismissScreenAndKeepReward 语义已被按钮点击覆盖)。
         if (skipButton is not null)
         {
             InvokeClickablePressAndRelease(skipButton);

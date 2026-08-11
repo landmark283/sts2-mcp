@@ -175,6 +175,19 @@ internal static class BridgeServer
                 return;
             }
 
+            if (method.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                path.Equals("/console", StringComparison.OrdinalIgnoreCase))
+            {
+                BridgeDebugTrace.Write("http POST /console authorize");
+                EnsureAuthorized(context.Request);
+                BridgeDebugTrace.Write("http POST /console authorized");
+                var request = await ReadJsonAsync<BridgeConsoleRequest>(context.Request, cancellationToken);
+                var payload = await BridgeGameApi.ExecuteConsoleCommandAsync(request, cancellationToken);
+                await WriteJsonAsync(context.Response, HttpStatusCode.OK, payload, cancellationToken);
+                BridgeDebugTrace.Write("http POST /console ok");
+                return;
+            }
+
             if (method.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 path.Equals("/events", StringComparison.OrdinalIgnoreCase))
             {
